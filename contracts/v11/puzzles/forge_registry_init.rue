@@ -1,0 +1,42 @@
+// forge_registry_init.rue -- the registry's one-shot `init` leaf. Testnet research only; unaudited.
+//
+// Creates the two sentinel slots that bracket every key -- 0x00..00 and
+// 0xff..ff, each pointing at the other -- and flips `initialized`. It can run
+// once: a second pair of sentinels would let the same key be inserted twice,
+// once between each pair, which is exactly what the sorted list exists to
+// prevent. The registry is minted with state (0 . 0); its first spend is this.
+//
+// solution: nil
+
+import upstream::action::StateTruth;
+import upstream::slot_helpers::*;
+import forge_action_common::*;
+import forge_registry_common::*;
+
+fn main(
+    CONSTANTS: RegistryConstants,
+    truth: StateTruth,
+) -> RegistryOutput {
+    let state = unchecked_cast::<RegistryState>(truth.actual_state);
+    assert state.initialized == 0;
+    assert state.pool_count == 0;
+
+    RegistryOutput {
+        state_truth: StateTruth {
+            ephemeral_state: truth.ephemeral_state,
+            actual_state: RegistryState { initialized: 1, pool_count: 0 },
+        },
+        conditions: [
+            create_slot_with_hint(
+                CONSTANTS.slot_1st_curry_hash,
+                slot_value_hash(min_key(), zero_bytes32(), min_key(), max_key()),
+                CONSTANTS.hint,
+            ),
+            create_slot_with_hint(
+                CONSTANTS.slot_1st_curry_hash,
+                slot_value_hash(max_key(), zero_bytes32(), min_key(), max_key()),
+                CONSTANTS.hint,
+            ),
+        ],
+    }
+}

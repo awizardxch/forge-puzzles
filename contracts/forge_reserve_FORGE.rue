@@ -1,0 +1,204 @@
+// Forge V10 reserve puzzle. Testnet research only; unaudited.
+//
+// V10 BINDS A RESERVE TO THE POOL THAT OWNS IT. Through V9 it was not bound at
+// all, and any reserve could be drained by anyone:
+//
+//   * `launcher_id` arrived in the SOLUTION and was asserted non-zero, then
+//     never used -- so it constrained nothing.
+//   * The only authorization was
+//         AssertCoinAnnouncement(sha256(plan.current_pool_coin_id + message))
+//     with `current_pool_coin_id` also chosen by whoever wrote the solution. In
+//     Chia that is satisfied by ANY coin with that id announcing that message,
+//     so an attacker named a coin they already owned and announced from it. The
+//     pool singleton was never consulted.
+//   * `reserve_inner_puzzle_hash` was solution-supplied and was what the
+//     successor got recreated at, so the "successor" could be a puzzle the
+//     attacker controlled.
+//
+// Three changes close it, and each one is load-bearing:
+//
+//   1. `launcher_id` is now CURRIED. A reserve's puzzle hash therefore commits
+//      to its pool, so one pool's reserve can never be presented as another's.
+//   2. The authorization is now a PUZZLE announcement asserted against the pool
+//      singleton's full puzzle hash, rebuilt here from the curried launcher and
+//      the pool's inner puzzle hash. Only a coin carrying that exact puzzle can
+//      emit it, and a coin at a singleton puzzle hash cannot be spent without
+//      genuine lineage back to the launcher -- so only the real pool can
+//      authorize a spend of its own reserves.
+//   3. AssertMyPuzzleHash pins `reserve_inner_puzzle_hash` to the puzzle this
+//      coin actually runs, so the successor is always recreated as a real
+//      reserve of the same pool rather than at an attacker's puzzle.
+//
+// Inherited from V8: a shrinking reserve splits its payout into the trader's
+// settlement and the protocol recipient's coin. The amount and recipient arrive
+// in the plan and are covered by the pool announcement asserted here, so neither
+// can be altered without the pool authorizing it.
+
+inline const CAT_MOD_HASH: Bytes32 = 0x37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a;
+inline const CAT_MOD_HASH_HASH: Bytes32 = 0x3cf0e1c3e933019e1e9dd413339b7ad91615de6d626ca332fa5c076b850672d0;
+inline const OFFER_MOD_HASH: Bytes32 = 0xcfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7;
+// singleton_top_layer_v1_1 and its launcher. Used to rebuild the pool coin's
+// full puzzle hash from the curried launcher id, which is what makes the
+// authorization below unforgeable.
+inline const SINGLETON_MOD_HASH: Bytes32 = 0x7faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9f;
+inline const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 = 0xeff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9;
+
+struct ReservePlan {
+    mode: Int,
+    current_pool_coin_id: Bytes32,
+    asset_id: Bytes32,
+    current_coin_id: Bytes32,
+    current_amount: Int,
+    settlement_coin_id: Bytes32,
+    successor_coin_id: Bytes32,
+    successor_amount: Int,
+    protocol_fee_amount: Int,
+    protocol_puzzle_hash: Bytes32,
+}
+
+fn main(
+    launcher_id: Bytes32,
+    asset_id: Bytes32,
+    reserve_inner_puzzle_hash: Bytes32,
+    pool_inner_puzzle_hash: Bytes32,
+    plan: ReservePlan,
+) -> List<Condition> {
+    assert launcher_id != zero_bytes32();
+    assert reserve_inner_puzzle_hash != zero_bytes32();
+    assert pool_inner_puzzle_hash != zero_bytes32();
+    assert plan.asset_id == asset_id;
+    assert plan.current_pool_coin_id != zero_bytes32();
+    assert plan.current_coin_id != zero_bytes32();
+    assert plan.current_amount > 0;
+    assert plan.successor_amount > 0;
+    assert (plan.successor_amount == plan.current_amount
+        && plan.settlement_coin_id == zero_bytes32())
+        || (plan.successor_amount != plan.current_amount
+            && plan.settlement_coin_id != zero_bytes32());
+    let reserve_cat_puzzle_hash = reserve_puzzle_hash(asset_id, reserve_inner_puzzle_hash);
+    let settlement_cat_puzzle_hash = settlement_puzzle_hash(asset_id);
+    assert plan.successor_coin_id
+        == sha256(plan.current_coin_id + reserve_cat_puzzle_hash + (plan.successor_amount as Bytes));
+    // The settlement now carries what the TRADER receives, which is the release
+    // minus the protocol fee -- the fee leaves as its own coin. Checking the
+    // full release here would name a coin this puzzle never creates.
+    assert (plan.successor_amount >= plan.current_amount)
+        | (plan.settlement_coin_id
+            == sha256(
+                plan.current_coin_id
+                + settlement_cat_puzzle_hash
+                + ((plan.current_amount - plan.successor_amount - plan.protocol_fee_amount) as Bytes),
+            ));
+
+    let pool_message = tree_hash([
+        "forge-reserve-plan-v4",
+        plan.current_pool_coin_id,
+        plan.mode,
+        plan.asset_id,
+        plan.current_coin_id,
+        plan.current_amount,
+        plan.settlement_coin_id,
+        plan.successor_coin_id,
+        plan.successor_amount,
+        plan.protocol_fee_amount,
+        plan.protocol_puzzle_hash,
+    ]);
+    let acknowledgement = tree_hash([pool_message, "reserve-ack-v4"]);
+    // A fee is only ever owed by a reserve that is paying out. On a growing or
+    // untouched reserve there is no release to take it from, so the only valid
+    // amount is zero -- and the bound below would be nonsense there, since
+    // current minus successor is negative.
+    assert plan.protocol_fee_amount >= 0;
+    assert plan.protocol_fee_amount == 0
+        || (plan.successor_amount < plan.current_amount
+            && plan.protocol_puzzle_hash != zero_bytes32()
+            && plan.protocol_fee_amount <= plan.current_amount - plan.successor_amount);
+
+    // The pool coin's full puzzle hash, rebuilt from the CURRIED launcher id. A
+    // coin can only carry this puzzle hash as a genuine singleton of that
+    // launcher -- one fabricated at the same hash cannot be spent, because the
+    // singleton top layer checks its lineage back to the launcher. So asserting
+    // a PUZZLE announcement here means only the real pool can authorize a spend
+    // of its own reserves. (A coin announcement, which is what V4..V9 asserted,
+    // is keyed by coin id alone and any coin can produce one.)
+    let pool_full_puzzle_hash = curry_tree_hash(
+        SINGLETON_MOD_HASH,
+        [
+            tree_hash((SINGLETON_MOD_HASH, (launcher_id, SINGLETON_LAUNCHER_PUZZLE_HASH))),
+            pool_inner_puzzle_hash,
+        ],
+    );
+
+    let base_conditions: List<Condition> = [
+        AssertMyCoinId { coin_id: plan.current_coin_id },
+        AssertMyAmount { amount: plan.current_amount },
+        // Pins the solution-supplied reserve puzzle hash to the puzzle this coin
+        // actually runs, so the successor below is recreated as a real reserve of
+        // this pool rather than at a puzzle the spender chose.
+        AssertMyPuzzleHash { puzzle_hash: reserve_cat_puzzle_hash },
+        AssertPuzzleAnnouncement { id: sha256(pool_full_puzzle_hash + pool_message) },
+        CreateCoin { puzzle_hash: reserve_inner_puzzle_hash, amount: plan.successor_amount },
+        CreateCoinAnnouncement { message: acknowledgement },
+    ];
+    if plan.successor_amount == plan.current_amount {
+        base_conditions
+    } else {
+        let settlement_message = tree_hash((plan.settlement_coin_id, []));
+        let settlement_assertion: List<Condition> = [
+            AssertPuzzleAnnouncement { id: sha256(settlement_cat_puzzle_hash + settlement_message) },
+        ];
+        if plan.successor_amount < plan.current_amount {
+            let released = plan.current_amount - plan.successor_amount;
+            let to_trader = released - plan.protocol_fee_amount;
+            let payouts: List<Condition> = if plan.protocol_fee_amount == 0 {
+                [CreateCoin { puzzle_hash: OFFER_MOD_HASH, amount: released }]
+            } else {
+                [
+                    CreateCoin { puzzle_hash: OFFER_MOD_HASH, amount: to_trader },
+                    CreateCoin {
+                        puzzle_hash: plan.protocol_puzzle_hash,
+                        amount: plan.protocol_fee_amount,
+                    },
+                ]
+            };
+            concat_conditions(base_conditions, concat_conditions(settlement_assertion, payouts))
+        } else {
+            concat_conditions(base_conditions, settlement_assertion)
+        }
+    }
+}
+
+fn concat_conditions(left: List<Condition>, right: List<Condition>) -> List<Condition> {
+    if left is nil {
+        right
+    } else {
+        [left.first, ...concat_conditions(left.rest, right)]
+    }
+}
+
+fn cat_puzzle_hash(asset_id: Bytes32, inner_puzzle_hash: Bytes32) -> Bytes32 {
+    curry_tree_hash(
+        CAT_MOD_HASH,
+        [CAT_MOD_HASH_HASH, tree_hash(asset_id), inner_puzzle_hash],
+    )
+}
+
+fn reserve_puzzle_hash(asset_id: Bytes32, reserve_inner_puzzle_hash: Bytes32) -> Bytes32 {
+    if asset_id == zero_bytes32() {
+        reserve_inner_puzzle_hash
+    } else {
+        cat_puzzle_hash(asset_id, reserve_inner_puzzle_hash)
+    }
+}
+
+fn settlement_puzzle_hash(asset_id: Bytes32) -> Bytes32 {
+    if asset_id == zero_bytes32() {
+        OFFER_MOD_HASH
+    } else {
+        cat_puzzle_hash(asset_id, OFFER_MOD_HASH)
+    }
+}
+
+inline fn zero_bytes32() -> Bytes32 {
+    0x0000000000000000000000000000000000000000000000000000000000000000
+}

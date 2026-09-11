@@ -1,0 +1,199 @@
+{
+  "compiler": "rue build --hex --hash",
+  "contracts": {
+    "_probe_pool_singleton_v7_wide.rue": {
+      "output": "compiled/_probe_pool_singleton_v7_wide.clvm.hex",
+      "output_sha256": "3cd8f84f971a3dc43634c899096e5996a90aa2f552388c49f77ed5f986d56d16",
+      "source_sha256": "e80b31742ea496a983c3efdade89494accb866024c29e6c0c3d06c391a30f3a9",
+      "tree_hash": "a6e597a8972b95fc6d1d5d396a3cd0beba8cd3ac9dd8dcae19272f19071e3b03"
+    },
+    "forge_launch_guard_v3.rue": {
+      "output": "compiled/forge_launch_guard_v3.clvm.hex",
+      "output_sha256": "e169339ce42657e8740f2ccfd408323b5fa091b5e4abad0a32b91ea6d86ca121",
+      "source_sha256": "8d6ed99c306d8498f3e49fa33221b9c8434a01ba8c16ade116570a78e0ce7f78",
+      "tree_hash": "09261d9de816355d750723b654625db577a22ff1839256e581722d6160d207f1"
+    },
+    "forge_launch_guard_v4.rue": {
+      "output": "compiled/forge_launch_guard_v4.clvm.hex",
+      "output_sha256": "f51a61d87080836017f5c13647ff8a2d9c67fe80577b7966aa2fc2a8d3835d6a",
+      "source_sha256": "8c814042a79e7f9240cd8cb101a7c10ce1962c9f510eb4066dd0a20fbd8a09b6",
+      "tree_hash": "e909f099992062d4457399d2301f8efd65dc9949891cfdbab732537d4f8ee806"
+    },
+    "forge_launch_guard_v5.rue": {
+      "output": "compiled/forge_launch_guard_v5.clvm.hex",
+      "output_sha256": "32776f7db70d9e8cdd5cd1735cb895bf2444f8cb8b6b255f377b124d4b95c5c4",
+      "source_sha256": "f0d7029dcb35f76d344606011f6f45a45a3b23ff4ea1b41e563556fcd3ccade9",
+      "tree_hash": "9f2528712357cf49085da4d255b5ba51438586b00f318d47e846d2c1c41ff59d"
+    },
+    "forge_lp_cat_tail_FORGE.rue": {
+      "output": "compiled/forge_lp_cat_tail_FORGE.clvm.hex",
+      "output_sha256": "d3865a4fe0395e94948f268f8f11ed461db7123b3de10778a88060444629b0bb",
+      "source_sha256": "b8139163e06bc2c4507f04db4e7e3df56233111b2d64371037e197bdef4410e8",
+      "tree_hash": "538c62b5e74108e8b0b8552a5500dbff073f938b73c08dd5ca1dd20fec24ef10"
+    },
+    "forge_lp_cat_tail_v10.rue": {
+      "output": "development/compiled/forge_lp_cat_tail_v10.clvm.hex",
+      "output_sha256": "d3865a4fe0395e94948f268f8f11ed461db7123b3de10778a88060444629b0bb",
+      "source_sha256": "b8139163e06bc2c4507f04db4e7e3df56233111b2d64371037e197bdef4410e8",
+      "tree_hash": "538c62b5e74108e8b0b8552a5500dbff073f938b73c08dd5ca1dd20fec24ef10"
+    },
+    "forge_lp_cat_tail_v3.rue": {
+      "output": "compiled/forge_lp_cat_tail_v3.clvm.hex",
+      "output_sha256": "4396f19f58349c151ef602f23450a550a592ae3cda93c2b7ae020d8bfcfdda06",
+      "source_sha256": "d1934e17b6a7e244d12e87da102fca2fa85d07bd99b1a76c3360d94545388e6b",
+      "tree_hash": "b43ff3b3bf90d39655378e0211f5bf5f69b68028c91925c2658fee8460f12720"
+    },
+    "forge_lp_cat_tail_v4.rue": {
+      "output": "compiled/forge_lp_cat_tail_v4.clvm.hex",
+      "output_sha256": "441da20b4c1ff76c1b4c9b71cb4142cd4177cb5b2a9c83762c52826854b00f6d",
+      "source_sha256": "844198d5bdb79ef08fdc18badbd69acadbe1fcc735b868e50b98ee06ad8e9b1c",
+      "tree_hash": "ef668d6182a2f22cc0c6a8ba57aca6e6f0d1defda233a4bd48fc6e10cbef697f"
+    },
+    "forge_lp_cat_tail_v5.rue": {
+      "output": "compiled/forge_lp_cat_tail_v5.clvm.hex",
+      "output_sha256": "30b5e506e4a590a6ef2b85b3b5e717f4baeed1fbb7e20e2b1d3c9b125eca2820",
+      "source_sha256": "1064cd14869ce0f12f83346a993e97371fda31baa9861c36dc6c987d6bf1a933",
+      "tree_hash": "d5c15c1bdde546d67469445be47438696be090308ade8fcb2cbb8527e5521ae9"
+    },
+    "forge_lp_cat_tail_v6.rue": {
+      "output": "compiled/forge_lp_cat_tail_v6.clvm.hex",
+      "output_sha256": "e079912b5abb01ebc4c5bbdee2948b6dbc8564e7e3f4d39c65c3221410c2fd0e",
+      "source_sha256": "e93a0cef8c6412f61680d4925c680bb052a40faade986f4b8b88d4127e2be907",
+      "tree_hash": "861e995fbc99357142c6b7bcda7f228e47cb1e4a76fdd7b69336ba87ef539b7c"
+    },
+    "forge_lp_cat_tail_v7.rue": {
+      "output": "compiled/forge_lp_cat_tail_v7.clvm.hex",
+      "output_sha256": "fc515f72d06bf1453f67c7437100b4072426db53e052b832b825ab7aed087477",
+      "source_sha256": "ad45fc35d257a88ef276310796fb3107514e9aaa060607ed666d344d3ecf1943",
+      "tree_hash": "5a2b4dff903dbe397eae8b497769a0857c3aef2f4df7476afebc44c4b7111190"
+    },
+    "forge_lp_cat_tail_v8.rue": {
+      "output": "compiled/forge_lp_cat_tail_v8.clvm.hex",
+      "output_sha256": "e6e7b02eaf119f3dc528290abfdb024c13293a2568f84b2f3fd82bcb5fefa9ad",
+      "source_sha256": "384b042b5cab0c0a84b2ed931ce03abe3997aba220bc8b6beb968a079eb000ce",
+      "tree_hash": "cbc627a10db624f598e609d8306e9a5823367e7cccb1da67d62df0ef700bc6ec"
+    },
+    "forge_lp_melt_inner_FORGE.clsp": {
+      "output": "compiled/forge_lp_melt_inner_FORGE.clvm.hex",
+      "output_sha256": "022205cfe5a4b21ae084d11fb48f72f537d5c2bc1fcc19fb19df92e5c18c0102",
+      "source_sha256": "8eb1e34d0fcabeab95e6f60f41739e8a2cd6096d9009d88a2dec0eaaac127731",
+      "tree_hash": "8b5b948a4c0e713bcb0b28ddb85cc1609d799b40c6fb65b2372de96976ad277a"
+    },
+    "forge_lp_melt_inner_v10.clsp": {
+      "output": "development/compiled/forge_lp_melt_inner_v10.clvm.hex",
+      "output_sha256": "022205cfe5a4b21ae084d11fb48f72f537d5c2bc1fcc19fb19df92e5c18c0102",
+      "source_sha256": "8eb1e34d0fcabeab95e6f60f41739e8a2cd6096d9009d88a2dec0eaaac127731",
+      "tree_hash": "8b5b948a4c0e713bcb0b28ddb85cc1609d799b40c6fb65b2372de96976ad277a"
+    },
+    "forge_lp_mint_inner_FORGE.clsp": {
+      "output": "compiled/forge_lp_mint_inner_FORGE.clvm.hex",
+      "output_sha256": "5002e225bdd83c268ce58fdf7d7c8493d60994db2f2f1ea9545d48869229d8be",
+      "source_sha256": "276d0345a2d014c081157df40915eb73955a4e0c55543616847d6a4452527126",
+      "tree_hash": "20f01870e46592c9f0fda2561fbb92c46b15c26120af80ae4ee782e1bcaf1593"
+    },
+    "forge_lp_mint_inner_v10.clsp": {
+      "output": "development/compiled/forge_lp_mint_inner_v10.clvm.hex",
+      "output_sha256": "5002e225bdd83c268ce58fdf7d7c8493d60994db2f2f1ea9545d48869229d8be",
+      "source_sha256": "276d0345a2d014c081157df40915eb73955a4e0c55543616847d6a4452527126",
+      "tree_hash": "20f01870e46592c9f0fda2561fbb92c46b15c26120af80ae4ee782e1bcaf1593"
+    },
+    "forge_reserve_FORGE.rue": {
+      "output": "compiled/forge_reserve_FORGE.clvm.hex",
+      "output_sha256": "5c1e81f4d7f113ac96fd9ba0718d64439540900ac9dfe681bf819441a6281142",
+      "source_sha256": "399aa0df294c0291e7b23b24c7da9eaf9840006b560f376284e59c44fd1a7c81",
+      "tree_hash": "dd2271a144135a519c19f557012838079dccbbac1c2a9aacc4636b2781c91717"
+    },
+    "forge_reserve_v10.rue": {
+      "output": "development/compiled/forge_reserve_v10.clvm.hex",
+      "output_sha256": "5c1e81f4d7f113ac96fd9ba0718d64439540900ac9dfe681bf819441a6281142",
+      "source_sha256": "399aa0df294c0291e7b23b24c7da9eaf9840006b560f376284e59c44fd1a7c81",
+      "tree_hash": "dd2271a144135a519c19f557012838079dccbbac1c2a9aacc4636b2781c91717"
+    },
+    "forge_reserve_v3.rue": {
+      "output": "compiled/forge_reserve_v3.clvm.hex",
+      "output_sha256": "bf8f6642665d25f58d422256b4a3aa926036b83a364fccb30832de8d80fcd4ea",
+      "source_sha256": "01c38c75d32dcd06b6baa678b7590f2514b4b4bdcd0c5eb386b3c1d3cc594f84",
+      "tree_hash": "05d458e5b60b37820b1f870d5fbc7b15f88f6b2a3edb4c97ee213539864f3759"
+    },
+    "forge_reserve_v4.rue": {
+      "output": "compiled/forge_reserve_v4.clvm.hex",
+      "output_sha256": "5148f8efa7badf200b4e3a2d934aa18c97858dacc6301e0c25d496d206c7e84e",
+      "source_sha256": "795faae9eb76985a56ddf9d814ae457681d868e4108c13388b9a7eddba272340",
+      "tree_hash": "508729ce0f74a5704613447af37834e2e7d28a415559d206a4f5eb17f067fc9a"
+    },
+    "forge_reserve_v5.rue": {
+      "output": "compiled/forge_reserve_v5.clvm.hex",
+      "output_sha256": "febaf77f7d25cee1098220d5bbe8c317fbf65b3eda4e1330cc37e111fbff4a19",
+      "source_sha256": "0e82aa77aa123718f17f057af0ec04955cba19eb7ef75d1f76ebd67fccb1809f",
+      "tree_hash": "0489ac19fa0963b498a470d265e7224f8d7e8e0ca047f209a9071c918db7d51e"
+    },
+    "forge_reserve_v6.rue": {
+      "output": "compiled/forge_reserve_v6.clvm.hex",
+      "output_sha256": "febaf77f7d25cee1098220d5bbe8c317fbf65b3eda4e1330cc37e111fbff4a19",
+      "source_sha256": "9c1b53d9f886f5a66612a8f4edfe993ad9fc0401d392318df758e6f504cc8978",
+      "tree_hash": "0489ac19fa0963b498a470d265e7224f8d7e8e0ca047f209a9071c918db7d51e"
+    },
+    "forge_reserve_v7.rue": {
+      "output": "compiled/forge_reserve_v7.clvm.hex",
+      "output_sha256": "febaf77f7d25cee1098220d5bbe8c317fbf65b3eda4e1330cc37e111fbff4a19",
+      "source_sha256": "079de706214d91fe1e701271d409f3ba280ca0799becad2a8e2f6bae9229e095",
+      "tree_hash": "0489ac19fa0963b498a470d265e7224f8d7e8e0ca047f209a9071c918db7d51e"
+    },
+    "forge_reserve_v8.rue": {
+      "output": "compiled/forge_reserve_v8.clvm.hex",
+      "output_sha256": "bd4057addcf08e63343d06f96f8eb832ed4eab3aab6156bfea3170abed1ad1dd",
+      "source_sha256": "275e13df514cc9208695293686fd130d9409afbf36452be681dad21948aba505",
+      "tree_hash": "5b7799a801e3237be1eec592c2c5374766fbeac1acd28fe70967b11b28ccb9d2"
+    },
+    "pool_singleton_FORGE.rue": {
+      "output": "compiled/pool_singleton_FORGE.clvm.hex",
+      "output_sha256": "8c6f4eea041d3878ab3085ade2e6ef44e906a037cb0b2b522eaa194e5ea6a730",
+      "source_sha256": "3ccbc30c6d2acb17b7258500219272b76d963beeec2ba1fb4c41a34705f2eae1",
+      "tree_hash": "affe75d9fc39ae0df958ca074a334cdc1e9bb0332eaee78f23bb5de82ff23d41"
+    },
+    "pool_singleton_v10.rue": {
+      "output": "development/compiled/pool_singleton_v10.clvm.hex",
+      "output_sha256": "8c6f4eea041d3878ab3085ade2e6ef44e906a037cb0b2b522eaa194e5ea6a730",
+      "source_sha256": "3ccbc30c6d2acb17b7258500219272b76d963beeec2ba1fb4c41a34705f2eae1",
+      "tree_hash": "affe75d9fc39ae0df958ca074a334cdc1e9bb0332eaee78f23bb5de82ff23d41"
+    },
+    "pool_singleton_v3.rue": {
+      "output": "compiled/pool_singleton_v3.clvm.hex",
+      "output_sha256": "dc09e1c6db7a4ec9563a8359fbc43024ef34d9df0c3c4cc75a66ed182fc86009",
+      "source_sha256": "29a1c8a3cc8a7f04e036103fb15503ac99422e67740ecbab11c6594284a0a2eb",
+      "tree_hash": "5e4cb3acc6ac85a023b5f88bfd034f37cf5ea2f58b6af897f1492cbf35b964cc"
+    },
+    "pool_singleton_v4.rue": {
+      "output": "compiled/pool_singleton_v4.clvm.hex",
+      "output_sha256": "bf169b44ec81ad1630629911dfc09741c7710fa02dfcb5500b95d99ce42c5d8b",
+      "source_sha256": "2fd693bfbe3bffd07ee742935acd4277297a312bc8cb08c5831b86e41de8f70b",
+      "tree_hash": "f90bc2ab6304cf0c133bc5224dbc4ae1399c783a731fb4e374922eeac67f58fc"
+    },
+    "pool_singleton_v5.rue": {
+      "output": "compiled/pool_singleton_v5.clvm.hex",
+      "output_sha256": "48536ae70fad27142b87c8f29b74ba4da776a40a622047a5ecc487326539bcad",
+      "source_sha256": "424d3230753fb2b68dd05555d67bfdb3335e801f9f018e4f59d3cfef59d2b4e5",
+      "tree_hash": "247ea540fd9924a8614b2ce9535deb8590d8b0a54f2c1182fafebe3674f746be"
+    },
+    "pool_singleton_v6.rue": {
+      "output": "compiled/pool_singleton_v6.clvm.hex",
+      "output_sha256": "9b1a77b71968dc5b81ef4351bc163a3b2ec72794be95ac38822c476f6adb7c39",
+      "source_sha256": "0d898501d1681b135d0a11d3e4a2aeec1b0d54399c5b58256086092914e28849",
+      "tree_hash": "cf078e250c694b0916f383d6bcfaf17128ea7d91a9eac94a92965ed000af3dfe"
+    },
+    "pool_singleton_v7.rue": {
+      "output": "compiled/pool_singleton_v7.clvm.hex",
+      "output_sha256": "cdc30b4001f24b0f48e7a09d06e17b4b058a3c145ab078ba68ae67de25c9a8ed",
+      "source_sha256": "a39678035a3cc4c45e7f7f6a59099dd50cf73cf7990fcada71b52cfba5be162c",
+      "tree_hash": "59b3b352bab9f5ec70bd0be990fe9bc26aba2e369c3afc04fdb0b821f0d7137a"
+    },
+    "pool_singleton_v8.rue": {
+      "output": "compiled/pool_singleton_v8.clvm.hex",
+      "output_sha256": "1dbe1588f2e2759002acc4a6bcdc44da1d5ba4f8cc8e777bbef0817b068571fe",
+      "source_sha256": "ee3d679f1d9d1acfdd9af49df40acc826613f57666cd93a2df86a377f839adba",
+      "tree_hash": "08b9839c460a9972ce369c7c94b84922683f1e0f128ff0c66c87137ab75d03eb"
+    }
+  },
+  "protocol": "forge-v3-v4-v5-alpha",
+  "schema_version": 1
+}

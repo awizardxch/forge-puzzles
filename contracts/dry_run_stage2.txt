@@ -1,0 +1,35 @@
+=== STEP 1: Verify T1.7 pre-bootstrap puzzle hash ===
+  Computed: d19ff535854c47ff802a46095d303662f99681171252d1582fa2842c128516b5
+  Expected: d19ff535854c47ff802a46095d303662f99681171252d1582fa2842c128516b5
+  Match:    True
+
+=== STEP 1b: Verify P2 formula (4-asset verbose pool) ===
+  Computed P2 ph: c0861fff660c83e0372585ce6c52e617a0c78ee71f764e9a5e544fc47cb16aa1
+  Expected P2 ph: c0861fff660c83e0372585ce6c52e617a0c78ee71f764e9a5e544fc47cb16aa1
+  Match: True
+
+=== STEP 2: T1.7 post-bootstrap puzzle hash ===
+  Post-bootstrap PH:  a1de958d8f6f3a47a717acc4bc17b8c5f725dfa4f47abc23183d3cd00a4aa4a6
+  Expected P2 (T1.7): a1de958d8f6f3a47a717acc4bc17b8c5f725dfa4f47abc23183d3cd00a4aa4a6
+  Match: True
+
+=== STEP 3: TM10 post-bootstrap puzzle hash ===
+  Target PH (from deploy): 11eee594c0a480d4dd5996b67ddf638ce03b7f7df5aefcc75ff303708ce3219a
+  TXCH first:              3c15f9d52a33e48fda0fd9c85ab71b94a7eafd41f456658607cbce0a9e9c832b
+  TXCH first match:        False
+  TXCH last:               5da974da61de6aad722e18717b1a74629b146601b5ac2b2db28e26c3bcf6a5d1
+  TXCH last match:         False
+  Sorted by ID:            27174172cb34f2dbce8b68509caadeedce1db15981742fd4543f089d8228deee
+  Sorted match:            False
+
+  Sorted asset order:
+    [0]: TXCH
+    [1]: 17839ee5f9ce...
+    [2]: 32bcad65145b...
+    [3]: 38ae3d2bfac9...
+    [4]: 41760f0c95e6...
+    [5]: 63e84f989ac1...
+    [6]: 7f4c27d7ca22...
+    [7]: 969289f721be...
+    [8]: b7d1803c8bd2...
+    [9]: c3b49d131c89...

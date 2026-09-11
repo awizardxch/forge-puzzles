@@ -1,0 +1,95 @@
+// Forge V3-alpha pool-scoped LP CAT TAIL. Testnet research only; unaudited.
+
+inline const PROTOCOL_VERSION: Int = 10;
+
+struct LpAction {
+    current_pool_coin_id: Bytes32,
+    lp_action_coin_id: Bytes32,
+    expected_delta: Int,
+    new_total_lp: Int,
+    next_state_root: Bytes32,
+}
+
+fn main(
+    launcher_id: Bytes32,
+    protocol_version: Int,
+    truths_any: Any,
+    parent_is_cat_any: Any,
+    _lineage_proof: Any,
+    delta_any: Any,
+    _inner_conditions: Any,
+    action: LpAction,
+) -> List<Condition> {
+    assert launcher_id != zero_bytes32();
+    assert protocol_version == PROTOCOL_VERSION;
+    assert action.current_pool_coin_id != zero_bytes32();
+    assert action.lp_action_coin_id != zero_bytes32();
+    assert action.expected_delta != 0;
+    assert action.new_total_lp >= 0;
+
+    let parent_is_cat = unchecked_cast::<Bool>(parent_is_cat_any);
+    let delta = unchecked_cast::<Int>(delta_any);
+    let action_coin_id = cat_my_id(truths_any);
+    let action_coin_amount = cat_my_amount(truths_any);
+    assert action_coin_amount > 0;
+    assert action_coin_id == action.lp_action_coin_id;
+
+    // A melt destroys supply, so it can only come from a coin that HELD supply --
+    // one with real CAT lineage. A coin whose parent is not a CAT was never
+    // issued by this TAIL, and CAT2 lets such a coin be spent at all only because
+    // the TAIL is authorizing it here.
+    //
+    // Without this line the genesis branch below scores `amount + delta`, so an
+    // attacker could CREATE_COIN a coin at the melt puzzle hash out of an
+    // ordinary coin and pick delta = -2*amount to make `effective_delta` equal
+    // whatever burn the pool asked for -- destroying LP that was never issued
+    // while the pool released reserves against it. Binding the melt coin's id in
+    // the pool is what stops an impostor *puzzle*; this is what stops an
+    // impostor *coin*.
+    //
+    // Minting is the opposite case and must stay open: the genesis eve has no
+    // CAT parent by definition, which is exactly why the branch exists.
+    assert parent_is_cat || action.expected_delta > 0;
+
+    let effective_delta = if parent_is_cat { delta } else { action_coin_amount + delta };
+    assert effective_delta == action.expected_delta;
+
+    let message = tree_hash([
+        "forge-lp-action-v3",
+        launcher_id,
+        action.current_pool_coin_id,
+        action.lp_action_coin_id,
+        effective_delta,
+        action.new_total_lp,
+        action.next_state_root,
+    ]);
+    let acknowledgement = tree_hash([message, "lp-ack-v3"]);
+
+    [
+        AssertMyCoinId { coin_id: action.lp_action_coin_id },
+        AssertCoinAnnouncement { id: sha256(action.current_pool_coin_id + message) },
+        CreateCoinAnnouncement { message: acknowledgement },
+    ]
+}
+
+inline fn zero_bytes32() -> Bytes32 {
+    0x0000000000000000000000000000000000000000000000000000000000000000
+}
+
+// CAT2 truths:
+// ((inner_puzzle_hash . cat_struct) .
+//  (my_coin_id . (parent_coin_info, full_puzzle_hash, my_amount)))
+fn cat_my_id(truths: Any) -> Bytes32 {
+    let outer = unchecked_cast::<(Any, Any)>(truths);
+    let id_and_coin = unchecked_cast::<(Any, Any)>(outer.rest);
+    unchecked_cast::<Bytes32>(id_and_coin.first)
+}
+
+fn cat_my_amount(truths: Any) -> Int {
+    let outer = unchecked_cast::<(Any, Any)>(truths);
+    let id_and_coin = unchecked_cast::<(Any, Any)>(outer.rest);
+    let coin_info = unchecked_cast::<(Any, Any)>(id_and_coin.rest);
+    let puzzle_hash_and_amount = unchecked_cast::<(Any, Any)>(coin_info.rest);
+    let amount_and_nil = unchecked_cast::<(Any, Any)>(puzzle_hash_and_amount.rest);
+    unchecked_cast::<Int>(amount_and_nil.first)
+}

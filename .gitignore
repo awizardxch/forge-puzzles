@@ -1,0 +1,24 @@
+# Forge — puzzles. Synced from the monorepo; this file is maintained there.
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local chain state and anything holding a key
+.env
+.env.*
+.awizard/
+.simulator/
+
+# Working detritus: bundles kept while chasing a bug, dumps from failed runs
+debug_*.json
+*_error_*.json
+cancel_body*.json
+cancel_result*.json
+lifecycle_*.json
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

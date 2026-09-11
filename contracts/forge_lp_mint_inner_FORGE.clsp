@@ -1,0 +1,28 @@
+; Forge LP mint inner. Testnet research only; unaudited.
+;
+; The CAT inner puzzle that the LP genesis ("eve") coin must wrap on an add.
+; Counterpart to forge_lp_melt_inner_FORGE: binding the eve to this puzzle hash
+; is proof that the mint the pool authorized actually happens.
+;
+; The pool derives the eve's id as
+;   sha256(parent + cat_puzzle_hash(lp_asset_id, THIS_HASH) + 1)
+; -- the eve always carries one mojo, with the TAIL authorizing the rest of the
+; supply via extra_delta -- and asserts an announcement from it. Because the only
+; outputs here are the minted coin and the -113 mint, there is no branch that
+; produces the pool's acknowledgement without minting.
+;
+; `settlement_hash` and `amount` are the depositor's own choice of where their
+; LP lands and how much, which is safe to leave open: the pool independently
+; re-derives the canonical mint from its invariant and rejects any other figure,
+; and the TAIL checks the delta against the real CAT ring. `lp_tail` is pinned by
+; the CAT layer, since the coin's puzzle hash commits to the asset id.
+
+(mod (settlement_hash amount lp_tail lp_action)
+  (list
+    ; The minted LP, paid to the settlement puzzle so the Offer can route it.
+    (list 51 settlement_hash amount)
+    ; The -113 mint: the CAT layer runs the TAIL, which authorizes the supply
+    ; increase the pool named in lp_action.
+    (list 51 () -113 lp_tail lp_action)
+  )
+)

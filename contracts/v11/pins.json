@@ -1,0 +1,36 @@
+{
+  "source": "Yakuhito/slot-machine",
+  "commit": "2d37ba1014e14220c26a0541b5d3199f9d15ec21",
+  "also_published_as": "chia-sdk-types 0.36.0 (crates/chia-sdk-types/src/puzzles/action_layer/*.rs)",
+  "note": "Tree hashes of the RUE builds (rue-puzzles/singleton/*.rue.hex). The clsp builds of the same puzzles hash differently and are not what the SDK ships.",
+  "puzzles": {
+    "action": "afa03f2903f9e4a293523237799074b13ab2361f250df10de5df884b0b09a22b",
+    "finalizer": "9d274de59aeaa128d1b0a802b52911838420ef9720d605c78942e8dadfc0810b",
+    "reserve_finalizer": "5b406eb66d10998027924c9bdea4254966e27ca765a8992227f826cb0e868095",
+    "p2_delegated_by_singleton": "3f2358e5141470a084ab2f68126f6f07269f01a690994f364e67c9624bb6e05e",
+    "slot": "8ab9f3b57a65d7f7a0810f79f7bc1e96bda680d16dd6f51d51e868e13fc7bbb3"
+  },
+  "reserve_amount_from_state_default_program_hash": "a12871fee210fb8619291eaea194581cbd2531e4b23759d225f6806923f63222",
+  "sources": {
+    "puzzles/common_types.rue": "9abe900c733d03c711e07b537687dd25fbc35fd94950c35d002db566c558f122",
+    "puzzles/upstream/action.rue": "efc12243d2cfdb76d3048b992b2a1ea5bbf4fd5adc2698a599955fe3cc546f0b",
+    "puzzles/upstream/finalizer.rue": "d83f3c3266f3f936e229a284580f65d93ebc2e72fc26729dab403cd97cdc3d04",
+    "puzzles/upstream/merkle_utils.rue": "c8a01f70bf9fb1ccc37654baf53b22c5d7763360b43dbb28174a4837fc9fc8a8",
+    "puzzles/upstream/p2_delegated_by_singleton.rue": "17d82f079519cb8b2d412e9ec4e973416da50ae5f762faeba2cd1519e5988e5d",
+    "puzzles/upstream/reserve_finalizer.rue": "dc8797c98f1fdf698f475c90587daabc20e9bb64d81e05fee0b3d4966482a766",
+    "puzzles/upstream/slot.rue": "883da41e35deea7d68c2acaedc700534f792d130fa08975b173fe5c3b6d7d3db",
+    "puzzles/upstream/slot_helpers.rue": "836936ad8f7b340ba30e2122c81fad4b29c9236748f4a19da135066942cc0d7d"
+  },
+  "byte_identical_to_v10": [
+    "exact_swap_output",
+    "pow_int",
+    "sum_weights",
+    "vault_fee_bps"
+  ],
+  "lp_inners": {
+    "forge_lp_melt_inner": "8b5b948a4c0e713bcb0b28ddb85cc1609d799b40c6fb65b2372de96976ad277a",
+    "forge_lp_mint_inner": "66811aedacdefe1228ecf5c9553e02627173b81db5f8d90ca44f61297bdfc4c6",
+    "note": "melt inner is V10's, byte for byte; mint inner adds the CHIP-0020 hint = settlement_hash"
+  },
+  "vendoring_note": "puzzles/upstream/slot_helpers.rue is upstream's rue-puzzles/slot.rue (the helper module), renamed because rue-puzzles/singleton/slot.rue (the puzzle) already occupies the name; contents verbatim."
+}

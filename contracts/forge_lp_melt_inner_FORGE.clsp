@@ -1,0 +1,26 @@
+; Forge LP melt inner. Testnet research only; unaudited.
+;
+; The CAT inner puzzle that a burning LP coin must wrap. Its whole purpose is to
+; have exactly one behavior, so that binding a coin to this puzzle hash is proof
+; the coin's entire amount is destroyed.
+;
+; The pool derives the burning coin's id as
+;   sha256(parent + cat_puzzle_hash(lp_asset_id, THIS_HASH) + burn)
+; and asserts an announcement from it. Because this puzzle emits the -113 melt
+; and nothing else -- no CREATE_COIN that could pay the amount onward, no branch,
+; no caller-supplied conditions -- a coin wrapping it cannot both satisfy the
+; pool and keep its LP. That is what makes a reserve release conditional on a
+; real supply reduction.
+;
+; `lp_action` is validated by the TAIL, and `lp_tail` is pinned by the CAT layer
+; (the coin's puzzle hash commits to the asset id, which is the TAIL's tree hash),
+; so neither can be swapped for something the pool did not authorize.
+;
+; Deliberately NOT parameterised: any extra argument is another thing a caller
+; could vary, and this puzzle's security comes from having nothing to vary.
+
+(mod (lp_tail lp_action)
+  ; The magic amount -113 tells the CAT layer to run the TAIL. With no other
+  ; CREATE_COIN in the output, the coin's full amount is melted.
+  (list (list 51 () -113 lp_tail lp_action))
+)

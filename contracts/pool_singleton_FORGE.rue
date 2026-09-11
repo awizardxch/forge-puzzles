@@ -1,0 +1,898 @@
+// Forge V10 pool singleton inner puzzle. Testnet research only; unaudited.
+//
+// V10 CLOSES A SECOND CRITICAL BUG: reserves were not bound to their pool.
+//
+// Through V9 this puzzle authorized a reserve spend with a COIN announcement.
+// A coin announcement is keyed by the announcing coin's id alone, and the
+// reserve took that id from its own solution, so any coin the spender already
+// owned could authorize draining any pool's reserves -- this singleton was never
+// consulted. From V10 the authorization is a PUZZLE announcement, which the
+// reserve asserts against this pool's full singleton puzzle hash rebuilt from
+// its curried launcher id. Only a genuine singleton of that launcher can carry
+// that puzzle hash, so only the real pool can move its own reserves. See
+// forge_reserve_FORGE for the other half, including why the launcher is now
+// curried and what AssertMyPuzzleHash is doing there.
+//
+// V9 CLOSED A CRITICAL LP-AUTHORIZATION BUG present through V8.
+//
+// Through V8 the pool released reserves on a remove in exchange for burning
+// `lp_delta` LP, but its ONLY link to that burn was a coin announcement it
+// asserted from `lp_action_coin_id` -- a free field checked only `!= zero`.
+// Nothing tied that coin to the pool's own LP CAT. A coin announcement id is
+// sha256(coin_id, message), and ANY coin can emit ANY message, so an attacker
+// could name a plain coin they control, have it emit the acknowledgement, and
+// drain reserves for burning LP that was never destroyed -- "remove liquidity
+// without owning it". (Confirmed by running the real puzzle against live V7
+// state; the same code path exists in V4..V8.)
+//
+// The fix binds `lp_action_coin_id` to a coin whose puzzle is the pool's LP CAT
+// wrapping a FIXED inner that has no branch other than the TAIL melt/mint. The
+// coin id is derived here from its parent, that pinned puzzle hash, and the
+// exact amount -- exactly as the reserve path already derives its settlement
+// coin ids. Because the coin's only behavior is to invoke the TAIL with the
+// pool-authorized action, a reserve release can no longer happen without a real
+// supply change of the same size:
+//
+//   remove  the LP coin runs LP_MELT_INNER, whose sole output is the -113 melt.
+//           Its whole amount (= burn) is destroyed; there is no non-melt path.
+//   add     the eve runs LP_MINT_INNER, whose outputs are the minted settlement
+//           coin and the -113 mint. There is no branch that fabricates the
+//           acknowledgement without minting.
+//
+// The TAIL still validates the delta against the real CAT ring and asserts the
+// pool's message, so the two sides remain a genuine mutual handshake -- only now
+// the pool's side can no longer be satisfied by an impostor coin.
+//
+// Everything else is V8, unchanged. V8 added a PROTOCOL FEE that consensus
+// enforces, on top of the liquidity fee
+// rather than carved out of it. The two are different charges to different
+// parties and the split matters:
+//
+//   liquidity fee  stays inside the curve, so it accrues to the reserve and is
+//                  earned by liquidity providers and LP coin holders.
+//   protocol fee   leaves the pool to a fixed recipient, and the TRADER pays it
+//                  -- the pool releases the same curve output either way, and
+//                  the trader simply receives that output minus the fee.
+//
+// Paying it out of the output rather than the input is what makes it
+// enforceable here. A shrinking reserve is the one spend that physically
+// creates coins, so it can be made to create two: the trader's settlement and
+// the recipient's payment. The pool derives the amount from its own config and
+// binds it into the reserve plan announcement, so a reserve cannot be spent
+// with any other split.
+//
+// Unlike the router fee, which is only collected when we are the party that
+// settles, this one cannot be avoided by anyone.
+//
+// V7 is V6 with one constraint removed: a pool may hold a SINGLE asset. That is
+// the only change to the rules, and it needs no new maths, because the V6
+// invariant already degrades correctly at N = 1:
+//
+//   mint     (new_lp/lp)^1 <= next/old  collapses to an exactly proportional
+//            share of the one reserve, at whatever LP-to-asset ratio the pool
+//            was created with.
+//   swap     valid_pairwise_swap needs one reserve up and one down. With one
+//            reserve that is unsatisfiable, so a single-asset pool refuses to
+//            trade rather than needing a separate guard.
+//
+// What a single-asset pool is, then, is a vault: deposits mint a receipt CAT
+// against one reserve and burning it redeems the share. The same puzzle covers
+// XCH alone, XCH plus CATs, and CATs alone, from one asset up to MAX_ASSETS.
+//
+// V8 also changes what a vault charges. Under V7 a vault was free: the
+// imbalance fee scales the excess by (K - k_i)/K, which is zero when one asset
+// holds all the weight, so neither entering nor leaving cost anything. But a
+// vault cannot swap, so crossing between its LP and its one reserve IS the only
+// trade it has -- and routes cross vaults constantly to reach assets held
+// nowhere else. Leaving it free meant a vault's depositors supplied that
+// liquidity and earned nothing for it.
+//
+// So from V8 the pool's own liquidity fee applies to that crossing, in both
+// directions, and what is withheld stays in the reserve where its holders own
+// it. Multi-asset pools are untouched: they keep an exactly proportional,
+// free add and remove, and only their swaps are charged.
+//
+// Inherited from V6, unchanged:
+//
+//   valid_assets            every weight >= 1, and their sum within the cap
+//   exact_invariant_lp_mint (new_lp/lp)^K bracketed against the weighted product
+//   valid_pairwise_swap     exactly one reserve up, one down, the rest frozen
+//
+// WEIGHTS ARE INTEGER UNITS, NOT BASIS POINTS. A pool keeps
+// prod(reserve_i ** weight_i) constant, where each weight is a small positive
+// integer and K is their sum. Equal weights are all ones; 80/20 is [4, 1].
+// Displayed percentages are weight_i / K.
+//
+// Fractional exponents are the usual reason weighted pools are avoided on
+// chain. They are not needed here: the puzzle never solves for an output, it
+// only verifies one. Both the mint and the swap are checked by bracketing --
+// the claimed value must hold the invariant, and one unit more must break it --
+// which pins the result exactly using nothing but integer multiplication.
+//
+// With all weights at one this reduces to the constant product it replaces,
+// output for output.
+
+inline const PROTOCOL_VERSION: Int = 10;
+// Fixed inner puzzles the LP action coin must wrap, so its only behavior is to
+// invoke the TAIL with the pool-authorized action. See the header: this is what
+// binds a reserve release to a real LP supply change.
+//   LP_MELT_INNER = (mod (lp_tail lp_action)
+//                     (list (list 51 () -113 lp_tail lp_action)))
+//   LP_MINT_INNER = (mod (settlement_hash amount lp_tail lp_action)
+//                     (list (list 51 settlement_hash amount)
+//                           (list 51 () -113 lp_tail lp_action)))
+inline const LP_MELT_INNER_HASH: Bytes32 = 0x8b5b948a4c0e713bcb0b28ddb85cc1609d799b40c6fb65b2372de96976ad277a;
+inline const LP_MINT_INNER_HASH: Bytes32 = 0x20f01870e46592c9f0fda2561fbb92c46b15c26120af80ae4ee782e1bcaf1593;
+// Ceiling on the protocol fee, well under the liquidity fee's own cap. A pool's
+// config is fixed at creation, so this bound is permanent for every pool minted
+// against this puzzle.
+inline const MAX_PROTOCOL_FEE_BPS: Int = 100;
+// A pool may hold a single asset. See the header: every N-ary rule already
+// degrades correctly at one, so this floor is the whole of the change.
+inline const MIN_ASSETS: Int = 1;
+inline const WEIGHT_SCALE: Int = 10000;
+// Weights are integer units. Reserves are raised to them, so the cap bounds the
+// size of the intermediate: a 7e12 reserve to the eighth is 43 bytes, which is
+// cheap, and the sum bounds the LP bracket's exponent the same way.
+inline const MAX_WEIGHT_UNITS: Int = 8;
+inline const MAX_TOTAL_WEIGHT: Int = 20;
+// The liquidity fee a creator may set, in basis points. V6 and V7 allowed up to
+// 1000 (10%), which is far past anything a pool would sensibly charge and only
+// serves to make a mistyped fee possible. 200 (2%) is the ceiling here; the
+// interface offers at most 100 (1%), leaving the range between the two available
+// to a caller who means it without putting it a keystroke away in the UI.
+inline const MAX_FEE_BPS: Int = 200;
+// Every N-asset check recurses over the reserve list and the LP bracket raises
+// to the N-th power, so cost grows with asset count. Ten is the supported
+// ceiling for now; raising it is a constant change plus a cost re-measurement.
+inline const MAX_ASSETS: Int = 10;
+// Fixed-point scale for the balanced-deposit ratio. Deposits are compared as
+// fractions of their reserve, so this needs far more precision than bps.
+inline const RATIO_SCALE: Int = 1000000000000;
+inline const MODE_SWAP: Int = 0;
+inline const MODE_ADD: Int = 1;
+inline const MODE_REMOVE: Int = 2;
+inline const CAT_MOD_HASH: Bytes32 = 0x37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a;
+inline const CAT_MOD_HASH_HASH: Bytes32 = 0x3cf0e1c3e933019e1e9dd413339b7ad91615de6d626ca332fa5c076b850672d0;
+inline const OFFER_MOD_HASH: Bytes32 = 0xcfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7;
+
+struct Singleton {
+    mod_hash: Bytes32,
+    launcher_id: Bytes32,
+    launcher_puzzle_hash: Bytes32,
+}
+
+struct PoolConfig {
+    protocol_version: Int,
+    pool_module_hash: Bytes32,
+    asset_ids: List<Bytes32>,
+    weights: List<Int>,
+    fee_bps: Int,
+    // Charged on top of fee_bps and paid out of the swap output to
+    // protocol_puzzle_hash. Zero disables it entirely.
+    protocol_fee_bps: Int,
+    protocol_puzzle_hash: Bytes32,
+    lp_tail_hash: Bytes32,
+    reserve_inner_puzzle_hash: Bytes32,
+}
+
+struct ReserveState {
+    asset_id: Bytes32,
+    coin_id: Bytes32,
+    amount: Int,
+}
+
+struct PoolState {
+    reserves: List<ReserveState>,
+    total_lp: Int,
+}
+
+struct ReservePlan {
+    asset_id: Bytes32,
+    current_coin_id: Bytes32,
+    current_amount: Int,
+    settlement_coin_id: Bytes32,
+    successor_coin_id: Bytes32,
+    successor_amount: Int,
+    // What the reserve must pay the protocol recipient out of this spend. The
+    // pool derives it and the announcement below binds it, so the reserve can
+    // neither skip it nor inflate it.
+    protocol_fee_amount: Int,
+    protocol_puzzle_hash: Bytes32,
+}
+
+struct PoolAction {
+    mode: Int,
+    current_pool_coin_id: Bytes32,
+    reserve_plans: List<ReservePlan>,
+    lp_action_coin_id: Bytes32,
+    lp_delta: Int,
+    // Parent of the LP action coin, so the pool can derive that coin's id from
+    // its parent, its pinned LP-CAT puzzle hash, and its amount -- and reject
+    // any coin that is not the genuine melt/mint coin. Unused for a swap.
+    lp_parent_id: Bytes32,
+}
+
+fn main(
+    singleton: Singleton,
+    config: PoolConfig,
+    state: PoolState,
+    action: PoolAction,
+) -> List<Condition> {
+    validate_config(config);
+    assert state_matches_assets(config.asset_ids, state.reserves);
+    assert state.total_lp > 0;
+    assert action.current_pool_coin_id != zero_bytes32();
+    assert plan_matches_state(config, state.reserves, action.reserve_plans);
+    assert valid_protocol_fees(action.mode, config, action.reserve_plans);
+
+    let new_reserves = plans_to_state(action.reserve_plans);
+    let new_total_lp = validate_action(config, state, new_reserves, action);
+    let next_state = PoolState { reserves: new_reserves, total_lp: new_total_lp };
+    let next_pool_ph = curry_tree_hash(
+        config.pool_module_hash,
+        [tree_hash(singleton), tree_hash(config), tree_hash(next_state)],
+    );
+    let state_root = tree_hash(next_state);
+
+    [
+        AssertMyCoinId { coin_id: action.current_pool_coin_id },
+        AssertMyAmount { amount: 1 },
+        CreateCoin {
+            puzzle_hash: next_pool_ph,
+            amount: 1,
+            memos: Memos { value: [] },
+        },
+        ...concat_conditions(
+            pool_reserve_conditions(action.current_pool_coin_id, action.mode, action.reserve_plans),
+            pool_lp_conditions(
+                singleton.launcher_id,
+                action.current_pool_coin_id,
+                action.lp_action_coin_id,
+                action.lp_delta,
+                new_total_lp,
+                state_root,
+            ),
+        ),
+    ]
+}
+
+fn validate_config(config: PoolConfig) {
+    assert config.protocol_version == PROTOCOL_VERSION;
+    assert config.pool_module_hash != zero_bytes32();
+    assert config.lp_tail_hash != zero_bytes32();
+    assert config.reserve_inner_puzzle_hash != zero_bytes32();
+    assert config.fee_bps >= 0;
+    assert config.fee_bps <= MAX_FEE_BPS;
+    assert config.protocol_fee_bps >= 0;
+    assert config.protocol_fee_bps <= MAX_PROTOCOL_FEE_BPS;
+    // A fee with no recipient would be burned rather than collected.
+    assert config.protocol_fee_bps == 0 || config.protocol_puzzle_hash != zero_bytes32();
+    assert valid_assets(config.asset_ids, config.weights);
+}
+
+fn valid_assets(asset_ids: List<Bytes32>, weights: List<Int>) -> Bool {
+    let n = count_assets(asset_ids);
+    let total = sum_weights(weights);
+    n >= MIN_ASSETS
+        && n <= MAX_ASSETS
+        && count_weights(weights) == n
+        && strictly_ascending(asset_ids)
+        && total >= n
+        && total <= MAX_TOTAL_WEIGHT
+        && weights_in_range(weights)
+}
+
+fn weights_in_range(weights: List<Int>) -> Bool {
+    if weights is nil {
+        true
+    } else {
+        weights.first >= 1
+            && weights.first <= MAX_WEIGHT_UNITS
+            && weights_in_range(weights.rest)
+    }
+}
+
+fn count_assets(asset_ids: List<Bytes32>) -> Int {
+    if asset_ids is nil {
+        0
+    } else {
+        1 + count_assets(asset_ids.rest)
+    }
+}
+
+fn count_weights(weights: List<Int>) -> Int {
+    if weights is nil {
+        0
+    } else {
+        1 + count_weights(weights.rest)
+    }
+}
+
+// Canonical ascending order also rules out duplicate assets in one pool. Native
+// XCH is the zero asset id, so a TXCH-and-CATs pool always lists TXCH first.
+fn strictly_ascending(asset_ids: List<Bytes32>) -> Bool {
+    if asset_ids is nil {
+        true
+    } else if asset_ids.rest is nil {
+        true
+    } else {
+        asset_ids.first < asset_ids.rest.first && strictly_ascending(asset_ids.rest)
+    }
+}
+
+fn sum_weights(weights: List<Int>) -> Int {
+    if weights is nil {
+        0
+    } else {
+        weights.first + sum_weights(weights.rest)
+    }
+}
+
+// WEIGHT_SCALE rarely divides evenly by N, so each weight may carry one bps of
+// the remainder. Three assets are [3334, 3333, 3333]; two stay [5000, 5000].
+fn state_matches_assets(asset_ids: List<Bytes32>, reserves: List<ReserveState>) -> Bool {
+    if asset_ids is nil {
+        reserves is nil
+    } else if reserves is nil {
+        false
+    } else {
+        let reserve = reserves.first;
+        reserve.asset_id == asset_ids.first
+            && reserve.coin_id != zero_bytes32()
+            && reserve.amount > 0
+            && state_matches_assets(asset_ids.rest, reserves.rest)
+    }
+}
+
+fn plan_matches_state(
+    config: PoolConfig,
+    reserves: List<ReserveState>,
+    plans: List<ReservePlan>,
+) -> Bool {
+    if reserves is nil {
+        plans is nil
+    } else if plans is nil {
+        false
+    } else {
+        let reserve = reserves.first;
+        let plan = plans.first;
+        plan.asset_id == reserve.asset_id
+            && plan.current_coin_id == reserve.coin_id
+            && plan.current_amount == reserve.amount
+            && plan.successor_amount > 0
+            && valid_settlement_id(plan)
+            && plan.successor_coin_id
+                == sha256(
+                    plan.current_coin_id
+                    + reserve_puzzle_hash(plan.asset_id, config.reserve_inner_puzzle_hash)
+                    + (plan.successor_amount as Bytes),
+                )
+            && plan_matches_state(config, reserves.rest, plans.rest)
+    }
+}
+
+fn valid_settlement_id(plan: ReservePlan) -> Bool {
+    if plan.successor_amount < plan.current_amount {
+        let offer_cat_hash = settlement_puzzle_hash(plan.asset_id);
+        // The settlement carries what the trader receives. On V8 the protocol
+        // fee leaves as a separate coin, so it is not part of this amount --
+        // the reserve puzzle names the same smaller figure.
+        plan.settlement_coin_id
+            == sha256(
+                plan.current_coin_id
+                + offer_cat_hash
+                + ((plan.current_amount - plan.successor_amount - plan.protocol_fee_amount) as Bytes),
+            )
+    } else if plan.successor_amount == plan.current_amount {
+        plan.settlement_coin_id == zero_bytes32()
+    } else {
+        plan.settlement_coin_id != zero_bytes32()
+    }
+}
+
+fn plans_to_state(plans: List<ReservePlan>) -> List<ReserveState> {
+    if plans is nil {
+        []
+    } else {
+        let plan = plans.first;
+        [
+            ReserveState {
+                asset_id: plan.asset_id,
+                coin_id: plan.successor_coin_id,
+                amount: plan.successor_amount,
+            },
+            ...plans_to_state(plans.rest),
+        ]
+    }
+}
+
+fn cat_puzzle_hash(asset_id: Bytes32, inner_puzzle_hash: Bytes32) -> Bytes32 {
+    curry_tree_hash(
+        CAT_MOD_HASH,
+        [CAT_MOD_HASH_HASH, tree_hash(asset_id), inner_puzzle_hash],
+    )
+}
+
+fn reserve_puzzle_hash(asset_id: Bytes32, reserve_inner_puzzle_hash: Bytes32) -> Bytes32 {
+    if asset_id == zero_bytes32() {
+        reserve_inner_puzzle_hash
+    } else {
+        cat_puzzle_hash(asset_id, reserve_inner_puzzle_hash)
+    }
+}
+
+fn settlement_puzzle_hash(asset_id: Bytes32) -> Bytes32 {
+    if asset_id == zero_bytes32() {
+        OFFER_MOD_HASH
+    } else {
+        cat_puzzle_hash(asset_id, OFFER_MOD_HASH)
+    }
+}
+
+fn validate_action(
+    config: PoolConfig,
+    state: PoolState,
+    next: List<ReserveState>,
+    action: PoolAction,
+) -> Int {
+    if action.mode == MODE_ADD {
+        assert action.lp_action_coin_id != zero_bytes32();
+        assert action.lp_delta > 0;
+        // The mint eve is created with amount 1; the TAIL authorizes the net
+        // supply increase from its extra_delta. Binding the eve to LP_MINT_INNER
+        // forces that mint to actually happen.
+        assert_lp_coin_bound(config, action, LP_MINT_INNER_HASH, 1);
+        assert non_decreasing_with_increase(state.reserves, next, false);
+        assert exact_invariant_lp_mint(state.reserves, next, config.weights, state.total_lp, action.lp_delta, config.fee_bps);
+        state.total_lp + action.lp_delta
+    } else if action.mode == MODE_REMOVE {
+        assert action.lp_action_coin_id != zero_bytes32();
+        assert action.lp_delta < 0;
+        let burn = 0 - action.lp_delta;
+        assert burn > 0;
+        assert burn < state.total_lp;
+        // The melt coin holds exactly `burn` LP and its only behavior is to
+        // destroy it. Binding its id here is what makes the reserve release
+        // below conditional on a real burn.
+        assert_lp_coin_bound(config, action, LP_MELT_INNER_HASH, burn);
+        assert exact_withdrawal(state.reserves, next, burn, state.total_lp,
+            vault_fee_bps(state.reserves, config.fee_bps));
+        state.total_lp - burn
+    } else {
+        assert action.mode == MODE_SWAP;
+        assert action.lp_action_coin_id == zero_bytes32();
+        assert action.lp_delta == 0;
+        assert valid_pairwise_swap(state.reserves, next, config.weights, config.fee_bps);
+        state.total_lp
+    }
+}
+
+// Reject any LP action coin that is not the genuine melt/mint coin.
+//
+// The coin id is derived the same way a coin id is derived anywhere on chain:
+// sha256(parent + puzzle_hash + amount). The puzzle hash is pinned to the LP
+// CAT wrapping the fixed inner for this mode, and the amount is the exact figure
+// the pool is acting on. So the only coin that can satisfy the acknowledgement
+// the pool asserts is a real LP CAT coin whose sole behavior is the TAIL
+// melt/mint -- an impostor coin produces a different id and fails the assertion.
+//
+// config.lp_tail_hash holds the LP asset id (the curried TAIL's tree hash),
+// which is exactly the tail-hash the CAT wrapper is curried with.
+fn assert_lp_coin_bound(config: PoolConfig, action: PoolAction, inner_hash: Bytes32, amount: Int) {
+    let lp_cat_puzzle_hash = cat_puzzle_hash(config.lp_tail_hash, inner_hash);
+    let derived = sha256(action.lp_parent_id + lp_cat_puzzle_hash + (amount as Bytes));
+    assert action.lp_action_coin_id == derived;
+}
+
+fn non_decreasing_with_increase(
+    old: List<ReserveState>,
+    next: List<ReserveState>,
+    increased: Bool,
+) -> Bool {
+    if old is nil {
+        next is nil && increased
+    } else if next is nil {
+        false
+    } else {
+        next.first.amount >= old.first.amount
+            && non_decreasing_with_increase(
+                old.rest,
+                next.rest,
+                increased || next.first.amount > old.first.amount,
+            )
+    }
+}
+
+fn exact_invariant_lp_mint(
+    old: List<ReserveState>,
+    next: List<ReserveState>,
+    weights: List<Int>,
+    total_lp: Int,
+    lp_delta: Int,
+    fee_bps: Int,
+) -> Bool {
+    let total_weight = sum_weights(weights);
+    let new_total_lp = total_lp + lp_delta;
+    let old_product = product_of(old, weights);
+    let ratio = min_deposit_ratio(old, next);
+    let target = pow_int(total_lp, total_weight)
+        * effective_product(old, next, weights, ratio, total_weight, fee_bps);
+    // Largest mint whose K-th power stays within the weighted product ratio,
+    // where K is the sum of the weights. With every weight at one this is the
+    // N-th power bracket it replaces, and at two assets balanced it is the V5
+    // square root.
+    pow_int(new_total_lp, total_weight) * old_product <= target
+        && pow_int(new_total_lp + 1, total_weight) * old_product > target
+}
+
+// Largest proportional deposit contained in the offered amounts. Anything above
+// this per asset is imbalanced and has to be swapped by the pool internally.
+fn min_deposit_ratio(old: List<ReserveState>, next: List<ReserveState>) -> Int {
+    if old is nil {
+        0
+    } else if next is nil {
+        0
+    } else if old.rest is nil {
+        deposit_ratio(old.first, next.first)
+    } else {
+        min_int(
+            deposit_ratio(old.first, next.first),
+            min_deposit_ratio(old.rest, next.rest),
+        )
+    }
+}
+
+fn deposit_ratio(old: ReserveState, next: ReserveState) -> Int {
+    let (ratio, _) = divmod((next.amount - old.amount) * RATIO_SCALE, old.amount);
+    ratio
+}
+
+fn min_int(left: Int, right: Int) -> Int {
+    if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+// LP is minted against the *effective* deposit: the balanced portion in full,
+// the imbalanced excess net of swap fee. Without this an unbalanced add followed
+// by a pro-rata remove is a fee-free swap.
+//
+// Only the (n-1)/n share of the excess is actually swapped — the depositor
+// already owns the 1/n that stays in their own asset — so the fee applies there.
+fn effective_product(
+    old: List<ReserveState>,
+    next: List<ReserveState>,
+    weights: List<Int>,
+    ratio: Int,
+    total_weight: Int,
+    fee_bps: Int,
+) -> Int {
+    if old is nil {
+        1
+    } else if next is nil {
+        1
+    } else if weights is nil {
+        1
+    } else {
+        let deposit = next.first.amount - old.first.amount;
+        let (balanced, _) = divmod(old.first.amount * ratio, RATIO_SCALE);
+        let excess = deposit - balanced;
+        // Balancer charges the imbalance fee on the share of the excess that is
+        // effectively a trade into the other assets, which is one minus this
+        // asset's weight. With equal weights that is (n-1)/n; in units it is
+        // (K - k_i)/K, and it still vanishes when a single asset holds all the
+        // weight, so a one-asset pool is never charged.
+        // A vault holds all the weight in one asset, so the imbalance share
+        // below is zero and a deposit would be free. But for a vault the deposit
+        // IS the trade -- there is nothing to be imbalanced against -- so the
+        // full LP fee applies to it instead, and the withheld part stays with
+        // the existing holders.
+        let fee_base = if total_weight == weights.first { deposit } else { excess };
+        let fee_share = if total_weight == weights.first {
+            total_weight
+        } else {
+            total_weight - weights.first
+        };
+        let (fee_amount, _) = divmod(
+            fee_base * fee_bps * fee_share,
+            total_weight * WEIGHT_SCALE,
+        );
+        pow_int(old.first.amount + balanced + excess - fee_amount, weights.first)
+            * effective_product(old.rest, next.rest, weights.rest, ratio, total_weight, fee_bps)
+    }
+}
+
+fn count_reserves(reserves: List<ReserveState>) -> Int {
+    if reserves is nil {
+        0
+    } else {
+        1 + count_reserves(reserves.rest)
+    }
+}
+
+fn product_of(reserves: List<ReserveState>, weights: List<Int>) -> Int {
+    if reserves is nil {
+        1
+    } else if weights is nil {
+        1
+    } else {
+        pow_int(reserves.first.amount, weights.first)
+            * product_of(reserves.rest, weights.rest)
+    }
+}
+
+fn pow_int(base: Int, exp: Int) -> Int {
+    if exp <= 0 {
+        1
+    } else {
+        base * pow_int(base, exp - 1)
+    }
+}
+
+// `fee_bps` is zero for every multi-asset pool, which leaves this exactly
+// proportional -- scaling by (10000 - 0)/10000 changes no value. It is non-zero
+// only for a vault, where crossing between the LP and the one reserve IS the
+// trade, so the pool's LP fee applies to it. What is withheld stays in the
+// reserve, which is how a vault finally earns from the routing flow it carries.
+// A pool with exactly one reserve cannot swap, so entering and leaving its LP is
+// the only trade it has. Everything else is a real multi-asset pool, where
+// removing liquidity stays strictly proportional and free.
+fn vault_fee_bps(reserves: List<ReserveState>, fee_bps: Int) -> Int {
+    if reserves is nil {
+        0
+    } else if reserves.rest is nil {
+        fee_bps
+    } else {
+        0
+    }
+}
+
+fn exact_withdrawal(
+    old: List<ReserveState>,
+    next: List<ReserveState>,
+    burn: Int,
+    total_lp: Int,
+    fee_bps: Int,
+) -> Bool {
+    if old is nil {
+        next is nil
+    } else if next is nil {
+        false
+    } else {
+        let (withdrawal, _) = divmod(
+            old.first.amount * burn * (WEIGHT_SCALE - fee_bps),
+            total_lp * WEIGHT_SCALE,
+        );
+        next.first.amount == old.first.amount - withdrawal
+            && exact_withdrawal(old.rest, next.rest, burn, total_lp, fee_bps)
+    }
+}
+
+fn valid_pairwise_swap(
+    old: List<ReserveState>,
+    next: List<ReserveState>,
+    weights: List<Int>,
+    fee_bps: Int,
+) -> Bool {
+    let up = index_of_increase(old, next, 0);
+    let down = index_of_decrease(old, next, 0);
+    if up < 0 {
+        false
+    } else if down < 0 {
+        false
+    } else if changed_count(old, next) != 2 {
+        // A swap moves exactly one reserve in and one out; every other asset in
+        // an N-asset pool must be untouched or the invariant is not preserved.
+        false
+    } else {
+        exact_swap_output(
+            reserve_at(old, up).amount,
+            reserve_at(old, down).amount,
+            reserve_at(next, up).amount,
+            reserve_at(next, down).amount,
+            weight_at(weights, up),
+            weight_at(weights, down),
+            fee_bps,
+        )
+    }
+}
+
+fn index_of_increase(old: List<ReserveState>, next: List<ReserveState>, index: Int) -> Int {
+    if old is nil {
+        0 - 1
+    } else if next is nil {
+        0 - 1
+    } else if next.first.amount > old.first.amount {
+        index
+    } else {
+        index_of_increase(old.rest, next.rest, index + 1)
+    }
+}
+
+fn index_of_decrease(old: List<ReserveState>, next: List<ReserveState>, index: Int) -> Int {
+    if old is nil {
+        0 - 1
+    } else if next is nil {
+        0 - 1
+    } else if next.first.amount < old.first.amount {
+        index
+    } else {
+        index_of_decrease(old.rest, next.rest, index + 1)
+    }
+}
+
+fn changed_count(old: List<ReserveState>, next: List<ReserveState>) -> Int {
+    if old is nil {
+        0
+    } else if next is nil {
+        0
+    } else if next.first.amount == old.first.amount {
+        changed_count(old.rest, next.rest)
+    } else {
+        1 + changed_count(old.rest, next.rest)
+    }
+}
+
+fn exact_swap_output(
+    reserve_in: Int,
+    reserve_out: Int,
+    next_in: Int,
+    next_out: Int,
+    weight_in: Int,
+    weight_out: Int,
+    fee_bps: Int,
+) -> Bool {
+    let gross_input = next_in - reserve_in;
+    let (effective_input, _) = divmod(
+        gross_input * (WEIGHT_SCALE - fee_bps),
+        WEIGHT_SCALE,
+    );
+    let charged_in = reserve_in + effective_input;
+    // Only the traded pair moves, so every untouched reserve contributes the
+    // same factor to both sides of the invariant and cancels. What remains is
+    // reserve_in^k_in * reserve_out^k_out, bracketed: the claimed output must
+    // hold the invariant, and one mojo more must break it. That pins the output
+    // exactly without ever taking a root.
+    let floor_invariant = pow_int(reserve_in, weight_in) * pow_int(reserve_out, weight_out);
+    let claimed = pow_int(charged_in, weight_in) * pow_int(next_out, weight_out);
+    let greedy = pow_int(charged_in, weight_in) * pow_int(next_out - 1, weight_out);
+    effective_input > 0
+        && next_out > 0
+        && next_out < reserve_out
+        && claimed >= floor_invariant
+        && greedy < floor_invariant
+}
+
+fn weight_at(weights: List<Int>, index: Int) -> Int {
+    if weights is nil {
+        1
+    } else if index <= 0 {
+        weights.first
+    } else {
+        weight_at(weights.rest, index - 1)
+    }
+}
+
+fn reserve_at(reserves: List<ReserveState>, index: Int) -> ReserveState {
+    if reserves is nil {
+        assert false;
+        ReserveState { asset_id: zero_bytes32(), coin_id: zero_bytes32(), amount: 0 }
+    } else if index == 0 {
+        reserves.first
+    } else {
+        reserve_at(reserves.rest, index - 1)
+    }
+}
+
+fn concat_conditions(left: List<Condition>, right: List<Condition>) -> List<Condition> {
+    if left is nil {
+        right
+    } else {
+        [left.first, ...concat_conditions(left.rest, right)]
+    }
+}
+
+fn pool_reserve_conditions(
+    pool_coin_id: Bytes32,
+    mode: Int,
+    plans: List<ReservePlan>,
+) -> List<Condition> {
+    if plans is nil {
+        []
+    } else {
+        let plan = plans.first;
+        let message = reserve_message(pool_coin_id, mode, plan);
+        let acknowledgement = tree_hash([message, "reserve-ack-v4"]);
+        [
+            // A PUZZLE announcement from V10 on, not a coin announcement. The
+            // reserve asserts it against this pool's full singleton puzzle hash,
+            // which only a genuine singleton of this launcher can carry -- see
+            // forge_reserve_FORGE. Keyed by coin id instead, as V4..V9 were, the
+            // assertion was satisfiable by any coin the spender happened to own,
+            // and reserves were drainable by anyone.
+            CreatePuzzleAnnouncement { message },
+            // The reverse direction was already sound: this names one specific
+            // reserve coin id, taken from the pool's own tracked state.
+            AssertCoinAnnouncement { id: sha256(plan.current_coin_id + acknowledgement) },
+            ...pool_reserve_conditions(pool_coin_id, mode, plans.rest),
+        ]
+    }
+}
+
+// The protocol fee is a slice of what a swap releases, so it is only ever owed
+// by the shrinking side of a swap. Deposits and withdrawals move liquidity
+// rather than trade it and are charged nothing, which is also why removing
+// liquidity never pays it.
+fn valid_protocol_fees(mode: Int, config: PoolConfig, plans: List<ReservePlan>) -> Bool {
+    if plans is nil {
+        true
+    } else {
+        let plan = plans.first;
+        let shrinking = plan.successor_amount < plan.current_amount;
+        let owed = if mode == MODE_SWAP && shrinking {
+            let (amount, _) = divmod(
+                (plan.current_amount - plan.successor_amount) * config.protocol_fee_bps,
+                WEIGHT_SCALE,
+            );
+            amount
+        } else {
+            0
+        };
+        plan.protocol_fee_amount == owed
+            && (owed == 0 || plan.protocol_puzzle_hash == config.protocol_puzzle_hash)
+            && valid_protocol_fees(mode, config, plans.rest)
+    }
+}
+
+fn reserve_message(pool_coin_id: Bytes32, mode: Int, plan: ReservePlan) -> Bytes32 {
+    // Bumped to v4: the payout split is part of what the pool authorizes now,
+    // so a v3 message would let a reserve be spent with a different one.
+    tree_hash([
+        "forge-reserve-plan-v4",
+        pool_coin_id,
+        mode,
+        plan.asset_id,
+        plan.current_coin_id,
+        plan.current_amount,
+        plan.settlement_coin_id,
+        plan.successor_coin_id,
+        plan.successor_amount,
+        plan.protocol_fee_amount,
+        plan.protocol_puzzle_hash,
+    ])
+}
+
+fn pool_lp_conditions(
+    launcher_id: Bytes32,
+    pool_coin_id: Bytes32,
+    lp_action_coin_id: Bytes32,
+    lp_delta: Int,
+    new_total_lp: Int,
+    state_root: Bytes32,
+) -> List<Condition> {
+    if lp_delta == 0 {
+        []
+    } else {
+        let message = tree_hash([
+            "forge-lp-action-v3",
+            launcher_id,
+            pool_coin_id,
+            lp_action_coin_id,
+            lp_delta,
+            new_total_lp,
+            state_root,
+        ]);
+        let acknowledgement = tree_hash([message, "lp-ack-v3"]);
+        [
+            CreateCoinAnnouncement { message },
+            AssertCoinAnnouncement { id: sha256(lp_action_coin_id + acknowledgement) },
+        ]
+    }
+}
+
+inline fn zero_bytes32() -> Bytes32 {
+    0x0000000000000000000000000000000000000000000000000000000000000000
+}

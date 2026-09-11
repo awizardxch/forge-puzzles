@@ -1,0 +1,242 @@
+// forge_curve.rue -- the Forge curve, ported from pool_singleton_FORGE.rue (V10).
+//
+// MOVED, NOT REWRITTEN. Every function body below is the V10 body. The curve
+// has been probed for months and 16 pools passed the launch matrix on it; that
+// evidence transfers to V11 only if the code does, and
+// _test_v11_curve_equivalence.py holds this module to identical output against
+// V10 on the recorded corpus of every real V10 spend (compiled/v10-spend-corpus.json)
+// and against the V10 functions themselves on randomized inputs.
+//
+// The mechanical differences from V10, each of which the equivalence suite
+// covers, are these and only these:
+//
+//   * reserves are `List<Int>` amounts rather than `List<ReserveState>`. V11
+//     state carries plain amounts (reserve coin ids leave the state; the
+//     finalizer derives them), so every `x.first.amount` became `x.first`.
+//   * `valid_protocol_fees` no longer walks reserve plans. V11 has no plans: the
+//     swap action knows which reserve shrinks and by how much, and the recipient
+//     is curried rather than carried, so the arithmetic core is exposed as
+//     `protocol_fee_owed(released, bps)` with the V10 name kept as its predicate.
+//   * everything the V10 puzzle did around the curve -- pairwise-swap structure,
+//     non-decreasing adds, mode dispatch, coin-id derivation -- belongs to the
+//     actions, not here. This module is arithmetic only.
+//
+// WEIGHTS ARE INTEGER UNITS, NOT BASIS POINTS. A pool keeps
+// prod(reserve_i ** weight_i) constant, where each weight is a small positive
+// integer and K is their sum. The puzzle never solves for an output, it only
+// verifies one: both the mint and the swap are checked by bracketing -- the
+// claimed value must hold the invariant, and one unit more must break it --
+// which pins the result exactly using nothing but integer multiplication.
+
+inline const WEIGHT_SCALE: Int = 10000;
+// Fixed-point scale for the balanced-deposit ratio. Deposits are compared as
+// fractions of their reserve, so this needs far more precision than bps.
+inline const RATIO_SCALE: Int = 1000000000000;
+
+export fn pow_int(base: Int, exp: Int) -> Int {
+    if exp <= 0 {
+        1
+    } else {
+        base * pow_int(base, exp - 1)
+    }
+}
+
+export fn sum_weights(weights: List<Int>) -> Int {
+    if weights is nil {
+        0
+    } else {
+        weights.first + sum_weights(weights.rest)
+    }
+}
+
+export fn product_of(reserves: List<Int>, weights: List<Int>) -> Int {
+    if reserves is nil {
+        1
+    } else if weights is nil {
+        1
+    } else {
+        pow_int(reserves.first, weights.first)
+            * product_of(reserves.rest, weights.rest)
+    }
+}
+
+export fn exact_invariant_lp_mint(
+    old: List<Int>,
+    next: List<Int>,
+    weights: List<Int>,
+    total_lp: Int,
+    lp_delta: Int,
+    fee_bps: Int,
+) -> Bool {
+    let total_weight = sum_weights(weights);
+    let new_total_lp = total_lp + lp_delta;
+    let old_product = product_of(old, weights);
+    let ratio = min_deposit_ratio(old, next);
+    let target = pow_int(total_lp, total_weight)
+        * effective_product(old, next, weights, ratio, total_weight, fee_bps);
+    // Largest mint whose K-th power stays within the weighted product ratio,
+    // where K is the sum of the weights. With every weight at one this is the
+    // N-th power bracket it replaces, and at two assets balanced it is the V5
+    // square root.
+    pow_int(new_total_lp, total_weight) * old_product <= target
+        && pow_int(new_total_lp + 1, total_weight) * old_product > target
+}
+
+// Largest proportional deposit contained in the offered amounts. Anything above
+// this per asset is imbalanced and has to be swapped by the pool internally.
+export fn min_deposit_ratio(old: List<Int>, next: List<Int>) -> Int {
+    if old is nil {
+        0
+    } else if next is nil {
+        0
+    } else if old.rest is nil {
+        deposit_ratio(old.first, next.first)
+    } else {
+        min_int(
+            deposit_ratio(old.first, next.first),
+            min_deposit_ratio(old.rest, next.rest),
+        )
+    }
+}
+
+fn deposit_ratio(old: Int, next: Int) -> Int {
+    let (ratio, _) = divmod((next - old) * RATIO_SCALE, old);
+    ratio
+}
+
+fn min_int(left: Int, right: Int) -> Int {
+    if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+// LP is minted against the *effective* deposit: the balanced portion in full,
+// the imbalanced excess net of swap fee. Without this an unbalanced add followed
+// by a pro-rata remove would be a fee-free swap.
+//
+// Only the (K - k_i)/K share of the excess is actually swapped -- the depositor
+// already owns the share that stays in their own asset -- so the fee applies
+// there.
+export fn effective_product(
+    old: List<Int>,
+    next: List<Int>,
+    weights: List<Int>,
+    ratio: Int,
+    total_weight: Int,
+    fee_bps: Int,
+) -> Int {
+    if old is nil {
+        1
+    } else if next is nil {
+        1
+    } else if weights is nil {
+        1
+    } else {
+        let deposit = next.first - old.first;
+        let (balanced, _) = divmod(old.first * ratio, RATIO_SCALE);
+        let excess = deposit - balanced;
+        // Balancer charges the imbalance fee on the share of the excess that is
+        // effectively a trade into the other assets, which is one minus this
+        // asset's weight. With equal weights that is (n-1)/n; in units it is
+        // (K - k_i)/K, and it still vanishes when a single asset holds all the
+        // weight, so a one-asset pool is never charged.
+        // A vault holds all the weight in one asset, so the imbalance share
+        // below is zero and a deposit would be free. But for a vault the deposit
+        // IS the trade -- there is nothing to be imbalanced against -- so the
+        // full LP fee applies to it instead, and the withheld part stays with
+        // the existing holders.
+        let fee_base = if total_weight == weights.first { deposit } else { excess };
+        let fee_share = if total_weight == weights.first {
+            total_weight
+        } else {
+            total_weight - weights.first
+        };
+        let (fee_amount, _) = divmod(
+            fee_base * fee_bps * fee_share,
+            total_weight * WEIGHT_SCALE,
+        );
+        pow_int(old.first + balanced + excess - fee_amount, weights.first)
+            * effective_product(old.rest, next.rest, weights.rest, ratio, total_weight, fee_bps)
+    }
+}
+
+// `fee_bps` is zero for every multi-asset pool, which leaves exact_withdrawal
+// exactly proportional -- scaling by (10000 - 0)/10000 changes no value. It is
+// non-zero only for a vault, where crossing between the LP and the one reserve
+// IS the trade, so the pool's LP fee applies to it. What is withheld stays in
+// the reserve, which is how a vault earns from the routing flow it carries.
+export fn vault_fee_bps(reserves: List<Int>, fee_bps: Int) -> Int {
+    if reserves is nil {
+        0
+    } else if reserves.rest is nil {
+        fee_bps
+    } else {
+        0
+    }
+}
+
+export fn exact_withdrawal(
+    old: List<Int>,
+    next: List<Int>,
+    burn: Int,
+    total_lp: Int,
+    fee_bps: Int,
+) -> Bool {
+    if old is nil {
+        next is nil
+    } else if next is nil {
+        false
+    } else {
+        let (withdrawal, _) = divmod(
+            old.first * burn * (WEIGHT_SCALE - fee_bps),
+            total_lp * WEIGHT_SCALE,
+        );
+        next.first == old.first - withdrawal
+            && exact_withdrawal(old.rest, next.rest, burn, total_lp, fee_bps)
+    }
+}
+
+export fn exact_swap_output(
+    reserve_in: Int,
+    reserve_out: Int,
+    next_in: Int,
+    next_out: Int,
+    weight_in: Int,
+    weight_out: Int,
+    fee_bps: Int,
+) -> Bool {
+    let gross_input = next_in - reserve_in;
+    let (effective_input, _) = divmod(
+        gross_input * (WEIGHT_SCALE - fee_bps),
+        WEIGHT_SCALE,
+    );
+    let charged_in = reserve_in + effective_input;
+    // Only the traded pair moves, so every untouched reserve contributes the
+    // same factor to both sides of the invariant and cancels. What remains is
+    // reserve_in^k_in * reserve_out^k_out, bracketed: the claimed output must
+    // hold the invariant, and one mojo more must break it. That pins the output
+    // exactly without ever taking a root.
+    let floor_invariant = pow_int(reserve_in, weight_in) * pow_int(reserve_out, weight_out);
+    let claimed = pow_int(charged_in, weight_in) * pow_int(next_out, weight_out);
+    let greedy = pow_int(charged_in, weight_in) * pow_int(next_out - 1, weight_out);
+    effective_input > 0
+        && next_out > 0
+        && next_out < reserve_out
+        && claimed >= floor_invariant
+        && greedy < floor_invariant
+}
+
+// The protocol fee is a slice of what a swap releases, so it is only ever owed
+// by the shrinking side of a swap. Deposits and withdrawals move liquidity
+// rather than trade it and are charged nothing. V10 computed this per reserve
+// plan; the arithmetic is unchanged.
+export fn protocol_fee_owed(released: Int, protocol_fee_bps: Int) -> Int {
+    let (amount, _) = divmod(released * protocol_fee_bps, WEIGHT_SCALE);
+    amount
+}
+
+export fn valid_protocol_fees(fee_amount: Int, released: Int, protocol_fee_bps: Int) -> Bool {
+    fee_amount == protocol_fee_owed(released, protocol_fee_bps)
+}
