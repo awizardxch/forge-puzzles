@@ -11,11 +11,17 @@
 //
 // Everything else is V10, including the two locks this puzzle owns:
 //   * `parent_is_cat || expected_delta > 0`: a melt destroys supply, so it can
-//     only come from a coin that held supply. Without this a coin fabricated at
-//     the melt puzzle hash out of ordinary mojos would score amount + delta and
-//     let an attacker "burn" LP that never existed while the pool released
-//     reserves -- security finding 4. CHIP-0040's standard TAIL lacks this line,
-//     which is why it was declined for V11.
+//     only come from a coin that held supply -- security finding 4. CHIP-0040's
+//     standard TAIL lacks this line, which is why it was declined for V11.
+//     Be precise about what it buys (mutation run, 2026-09-11): with this line
+//     deleted, a melt coin fabricated from ordinary mojos IS accepted -- but
+//     only with extra_delta = -2*burn to satisfy the delta lock below, and CAT2's
+//     ring then charges for that delta, so a real sibling must shrink by `burn`
+//     and supply genuinely falls. The pool is not drained; the attacker wastes
+//     mojos. This line therefore does not stand alone: it removes the dependence
+//     on the ring's sign convention and makes the messaged coin have to be real
+//     LP. Pinned as policy by _test_v11_lp_receive_forgery.py case C; the
+//     finding-4 probe in _test_v11_actions.py is refused by the delta lock first.
 //   * `effective_delta == expected_delta`: the ring's real supply change is the
 //     one the pool authorized, and the message also commits to the new supply
 //     and the next state root.

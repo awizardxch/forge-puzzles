@@ -331,18 +331,19 @@ Offer.
 
 ## Additional Assets
 
-These accompany this proposal in [`assets/chip-awizard-weighted-n-asset-amm`](/assets/chip-awizard-weighted-n-asset-amm), and should be moved to
-`assets/chip-<CHIP>` once a number is assigned.
+These live alongside the reference implementation, in the public
+[`forge-puzzles`](https://github.com/awizardxch/forge-puzzles) repository, so
+that the specification and the code it describes cannot drift apart.
 
-* Full protocol specification — [`FORGE_PUZZLE_V11.md`](/assets/chip-awizard-weighted-n-asset-amm/FORGE_PUZZLE_V11.md)
-* Architecture, with diagrams — [`FORGE_V11_ARCHITECTURE.md`](/assets/chip-awizard-weighted-n-asset-amm/FORGE_V11_ARCHITECTURE.md)
-* Written CLVM pass over every leaf — [`FORGE_V11_CLVM_PASS.md`](/assets/chip-awizard-weighted-n-asset-amm/FORGE_V11_CLVM_PASS.md)
-* Security notes and scope — [`FORGE_SECURITY.md`](/assets/chip-awizard-weighted-n-asset-amm/FORGE_SECURITY.md)
-* Comparison against publicly documented AMM failures — [`FORGE_AUDIT_TIBETSWAP.md`](/assets/chip-awizard-weighted-n-asset-amm/FORGE_AUDIT_TIBETSWAP.md)
+* Full protocol specification — [`FORGE_PUZZLE_V11.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_PUZZLE_V11.md)
+* Architecture, with diagrams — [`FORGE_V11_ARCHITECTURE.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_V11_ARCHITECTURE.md)
+* Written CLVM pass over every leaf — [`FORGE_V11_CLVM_PASS.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_V11_CLVM_PASS.md)
+* Security notes and scope — [`FORGE_SECURITY.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_SECURITY.md)
+* Comparison against publicly documented AMM failures — [`FORGE_AUDIT_TIBETSWAP.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_AUDIT_TIBETSWAP.md)
 * Reference implementation and test suites — <https://github.com/awizardxch/forge-puzzles>
 
-The first five are included here so this proposal can be assessed without
-leaving the repository; the sixth is the code itself, which cannot be.
+If the Editor would rather these were carried in this repository, they can be
+copied into `assets/chip-<CHIP>` once a number is assigned.
 
 ## Copyright
 

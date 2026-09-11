@@ -1,5 +1,5 @@
 {
- "built_at": "2026-09-11T03:27:48+00:00",
+ "built_at": "2026-09-11T07:14:57+00:00",
  "rue": "0.8.4",
  "outputs": {
   "action.rue.hex": {
@@ -71,7 +71,7 @@
   "forge_lp_cat_tail.rue.hex": {
    "tree_hash": "9870a3f0120fe6cbc167a8def10e5ec47c00fe5956df6c885ad0a340e37c19a0",
    "source": "puzzles/forge_lp_cat_tail.rue",
-   "source_sha256": "861c119cf9ba899378708a64551a1e650f8b8e727448e0f60aa4a7688e6b27a8",
+   "source_sha256": "b95a64235e9e701f195ccd5071337ee7c1b2ac1595b183bb40f6cc99deccff8f",
    "test_only": false
   },
   "forge_multi_reserve_finalizer.rue.hex": {

@@ -303,6 +303,8 @@ def main() -> int:
                                                                       [x + 1 if i == 0 else x for i, x in enumerate(
                                                                           forge_math.withdrawal_amounts([3_000_000, 4_000_000, 5_000_000], 300_000, 3_000_000, 0))]],
                                              salt=0x93)[0]))
+    # Refused by the TAIL's delta lock (amount + delta == 0 != -burn), not by `parent_is_cat`:
+    # this construction never reaches that line. _test_v11_lp_receive_forgery.py case C does.
     refuses("a melt coin fabricated from ordinary mojos (no CAT parent) is refused -- finding 4 stays closed",
             lambda: kit.validate(remove_case(three, 300_000, fabricated=True, salt=0x94)[0]))
 

@@ -68,6 +68,10 @@ DEFAULT_SUITES = [
     "_test_v11_actions.py",
     "_test_v11_dao_fee.py",
     "_test_v11_registry.py",
+    # The only suite that reaches the TAIL's two melt-side locks, the CAT-parent lock
+    # (`parent_is_cat || expected_delta > 0`) and the delta lock
+    # (`effective_delta == expected_delta`): without it a TAIL run reports both as survivors.
+    "_test_v11_lp_receive_forgery.py",
 ]
 
 

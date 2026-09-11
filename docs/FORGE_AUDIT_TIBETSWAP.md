@@ -174,6 +174,15 @@ delete it on the grounds that a test still passes.
       obviously covers them: `settlement_coin_id != zero_bytes32()`,
       `lp_parent_id != zero_bytes32()`, `valid_config(config)` and
       `payout == 0`. Each ends as either a comment or a test.
+      *2026-09-11:* the TAIL was run separately (11 asserts). Its two melt-side
+      locks — `effective_delta == expected_delta` and `parent_is_cat ||
+      expected_delta > 0` — were both survivors under the default suites; the
+      latter because the finding-4 probe is refused by the former first. Both
+      are now killed by `_test_v11_lp_receive_forgery.py`, which the harness
+      runs by default. The nine that remain are the genesis branch and the
+      shape checks (`launcher_id != 0`, protocol version, `expected_delta != 0`,
+      `new_total_lp >= 0`, `amount > 0`, `pool_inner_puzzle_hash != 0`, and the
+      three genesis asserts); they belong to this item.
 
 ---
 
@@ -202,6 +211,42 @@ not two steps that could come apart.
 
 **Status: closed, structurally.** Pinned by *"payout +1 refused"*, *"fabricated
 melt coin (finding 4) refused"* and *"burning the whole supply is refused"*.
+
+**Re-examined 2026-09-11, on the sharper form of the concern.** The version put
+to us was not "the payout can skip the melt" but "the LP coin's *inner puzzle*
+can emit conditions that *look* like the TAIL's receive, instead of running the
+TAIL." That deserved puzzles run, not prose, because it turns on a fact about
+CAT2 rather than about Forge. `_test_v11_lp_receive_forgery.py` establishes:
+
+- **The pass-through is real.** CAT2 (`37bef360…`) hands an inner puzzle's bare
+  `RECEIVE_MESSAGE` straight out; the TAIL never runs. Any CAT pool whose
+  receiver is not pinned to a specific inner puzzle is exposed to exactly this.
+- **Forge is not, for one reason.** `remove` derives its receiver from the
+  *pinned* melt inner's hash — a curried constant whose program decodes to a
+  single `-113` condition and nothing else — and mode 23 makes consensus require
+  *that* coin to answer. A byte-perfect forgery on the attacker's own LP coin is
+  a receive on the wrong coin id: refused with `MESSAGE_NOT_SENT_OR_RECEIVED`.
+- **The zero-delta variant** (a coin *at* the pinned melt hash, `extra_delta = 0`,
+  ring balanced by a sibling) is refused by the TAIL's delta lock,
+  `effective_delta == expected_delta`. Mutation: deleting that assert flips the
+  case to accepted and nothing else in the suites notices — so that suite is
+  its pin.
+- **Finding 4's lock was unpinned.** That is the CAT-parent lock,
+  `parent_is_cat || expected_delta > 0`. The existing probe fabricates the melt
+  coin with `extra_delta = -burn`, which the delta lock refuses *before* the
+  CAT-parent lock is reached; a mutation run showed the latter surviving every
+  suite. Reaching it needs `extra_delta = -2·burn` — and CAT2's ring then
+  charges for it, forcing a real sibling to shrink by `burn`. Against a TAIL
+  with the CAT-parent lock deleted that bundle is **accepted, and it is an
+  honest burn**: real supply falls by exactly what the pool paid for. So the
+  assert is defence in depth — it removes the dependence on the ring's sign
+  convention and requires the messaged coin to hold real supply — not the sole
+  lock its comment claimed. The comment now says so, and case C pins it as
+  policy.
+
+No revision is forced by any of this. The comparison-worthy point is that the
+Tibet bug and the Forge non-bug sit one design decision apart: whether the pool
+names *which* coin must answer, or merely *that* a coin at some puzzle must.
 
 **Action outstanding.**
 
