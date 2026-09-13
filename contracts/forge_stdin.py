@@ -43,10 +43,35 @@ from forge_split_swap import SplitBranchSpec, build_split_swap
 from forge_flow_balance import FlowLegSpec, build_flow_balance
 from forge_routed_deposit import DepositSale, build_routed_deposit
 from forge_transition import build_transition
-import forge_v11_offer as v11
-import forge_v11_route as v11r
-import forge_v11_create as v11c
-import forge_v11_driver as drv_v11
+import forge_v11_offer as off11
+import forge_v11_route as rt11
+import forge_v11_create as cre11
+import forge_v11_driver as drv11
+import forge_v12_offer as off12
+import forge_v12_route as rt12
+import forge_v12_create as cre12
+import forge_v12_driver as drv12
+
+# One lane per protocol revision: (offer, route, create, driver). A request picks its lane by
+# its own protocol_version or its pool snapshots'; a bundle never mixes revisions.
+_LANES = {12: (off11, rt11, cre11, drv11), 13: (off12, rt12, cre12, drv12)}
+
+
+def _lane_version(payload: dict) -> int:
+    declared = payload.get("protocol_version")
+    versions = {int(sn["protocol_version"]) for sn in _pool_snapshots(payload) if sn.get("protocol_version") is not None}
+    if declared is not None:
+        versions.add(int(declared))
+    if len(versions) > 1:
+        raise ValueError(f"a bundle cannot mix Forge revisions: {sorted(versions)}")
+    return versions.pop() if versions else 13          # V12 is the shipping revision
+
+
+def _lane(payload: dict):
+    version = _lane_version(payload)
+    if version not in _LANES:
+        raise ValueError(f"unsupported Forge protocol version for this lane: {version}")
+    return _LANES[version]
 from chia.types.coin_spend import CoinSpend
 
 ZERO_32 = bytes32(b"\x00" * 32)
@@ -142,7 +167,7 @@ def _pool(value: dict[str, Any]) -> V3Pool:
     )
     if protocol_version >= 11:
         raise ValueError(f"V{protocol_version} pools are not V3Pool snapshots; this lane takes them through "
-                         "forge_v11_offer (swap, add, remove only)")
+                         "the versioned offer lane (swap, add, remove, and the route lanes)")
     if protocol_version not in (3, 4, 5, 6, 7, 8, 9, 10):
         raise ValueError(f"unsupported Forge protocol version: {protocol_version}")
     launcher_id = _bytes32(value["launcher_id"])
@@ -314,93 +339,131 @@ def _pool_snapshots(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
-def _build_v11(action: str, payload: dict[str, Any], offer: Offer) -> dict[str, Any]:
+def _build_lane(action: str, payload: dict[str, Any], offer: Offer) -> dict[str, Any]:
     """The V11 lane: a keyless settlement of the offer against one pool.
 
     The leaves bind every spend to a height (`h > last_height`, confirmed within
     the oracle window), so the caller must say what height it is; the responder
-    reads the node's peak. The surplus above the trader's request is the
-    router's fee and goes to the configured dev-fee recipient, or to the pool's
-    protocol recipient when none is configured.
+    reads the node's peak. The router's own fee goes to the configured dev-fee
+    recipient, or to the pool's protocol recipient when none is configured.
+
+    That fee is now a RATE, not a residue. It used to be "everything the pool pays
+    above what the trader asked for", which quietly grew with the trader's slippage
+    tolerance; the configured bps is passed down so a swap takes exactly that much
+    and refunds the rest to the trader. Which leg it comes off is the builder's own
+    decision, never the caller's -- see `router_fee_side`.
     """
+    off, rt, cre, drv = _lane(payload)
     if payload.get("current_height") is None:
         raise ValueError("a V11 action needs current_height: the leaf binds the spend to the chain height")
     height = int(payload["current_height"])
-    surplus_ph, _bps = _dev_fee(payload)
+    surplus_ph, fee_bps = _dev_fee(payload)
     if action in ROUTE_LANES:
-        return _build_v11_route(action, payload, offer, height, surplus_ph)
-    if action not in v11.SETTLERS:
+        return _build_lane_route(action, payload, offer, height, surplus_ph, fee_bps)
+    if action not in off.SETTLERS:
         raise ValueError(f"V11 pools settle through swap, add, remove, {', '.join(sorted(ROUTE_LANES))}; "
                          f"the {action} lane is not available")
-    pool = v11.snapshot_to_pool(payload["pool"])
-    result = v11.settle(action, pool, offer, height, surplus_ph)
+    pool = off.snapshot_to_pool(payload["pool"])
+    result = off.settle(action, pool, offer, height, surplus_ph, fee_bps)         if _settle_takes_fee(off) else off.settle(action, pool, offer, height, surplus_ph)
     lp_delta = {"add": result.details.get("lp_minted", 0), "remove": -int(result.details.get("burn", 0))}.get(action, 0)
     return {
         "success": True,
         "action": action,
         "transaction_id": result.bundle.name().hex(),
         "bundle": result.bundle.to_json_dict(),
-        "pool": v11.pool_to_snapshot(result.pool),
+        "pool": off.pool_to_snapshot(result.pool),
         "lp_delta": str(lp_delta),
-        "dev_fee_collected": str(result.details.get("surplus", 0)),
-        "v11": result.details,
+        "dev_fee_collected": str(result.details.get("router_fee", result.details.get("surplus", 0))),
+        "forge": result.details,
     }
+
+
+def _settle_takes_fee(lane) -> bool:
+    """Older lanes' `settle` has no `fee_bps`; only the current one bounds the fee."""
+    import inspect
+    return "fee_bps" in inspect.signature(lane.settle).parameters
 
 
 ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route")
 
 
-def _v11_pool(snapshot: dict[str, Any]):
-    """Every pool on a V11 route is a V11 pool: one revision per bundle."""
-    if not v11.is_v11_snapshot(snapshot):
-        raise ValueError("a route mixing V11 pools with an earlier revision cannot be built; every pool must be V11")
-    return v11.snapshot_to_pool(snapshot)
+def _lane_pool(snapshot: dict[str, Any]):
+    """Every pool on a route is of one revision; the snapshot says which lane rebuilds it."""
+    lane = _LANES.get(int(snapshot.get("protocol_version") or 0))
+    if lane is None or not lane[0].is_pool_snapshot(snapshot):
+        raise ValueError("a route can only be built from pools of one supported revision (12 or 13)")
+    return lane[0].snapshot_to_pool(snapshot)
 
 
-def _build_v11_route(action: str, payload: dict[str, Any], offer: Offer, height: int, surplus_ph: bytes32 | None) -> dict[str, Any]:
-    """The multi-pool lanes on V11, all through forge_v11_route.compose. The payload
+def _trader_ph_for(offer: Offer) -> bytes32 | None:
+    """A puzzle hash the trader named in their own offer, to send their change back to."""
+    for payments in offer.get_requested_payments().values():
+        if payments:
+            return bytes32(payments[0].puzzle_hash)
+    return None
+
+
+def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height: int, surplus_ph: bytes32 | None,
+                      fee_bps: int = 0) -> dict[str, Any]:
+    """The multi-pool lanes, all through the lane's own route composer. The payload
     contracts are the V10 lanes' (see the branches of `build` below); the successor
-    snapshots come back one per distinct pool, in first-use order."""
+    snapshots come back one per distinct pool, in first-use order.
+
+    The router's fee is taken ONCE, on the entry, before the route spends a coin. That
+    leaves these lanes with no fee arithmetic of their own: LP, protocol and DAO are all
+    inside the puzzle and are already paid out of each hop's own output by the leaf. It
+    also means the overage at the end of a route belongs to the trader -- it is the gap
+    between what the pools actually released and what they asked for, nothing more -- so
+    `surplus_ph` here is the TRADER, not the router. It used to be the router, unbounded,
+    which handed over every mojo of a widened slippage tolerance.
+    """
+    off, rt, cre, drv = _lane(payload)
+    fee_ph = surplus_ph if fee_bps > 0 else None
+    trader = _trader_ph_for(offer)
+    if trader is not None:
+        surplus_ph = trader
     if action == "multihop-swap":
-        pools = [_v11_pool(entry) for entry in payload["pools"]]
+        pools = [_lane_pool(entry) for entry in payload["pools"]]
         surplus = surplus_ph if surplus_ph is not None else pools[0].protocol_ph
-        result = v11r.multihop_swap(pools, [_bytes32(str(a)) for a in payload["path"]], offer, height, surplus)
+        result = rt.multihop_swap(pools, [_bytes32(str(a)) for a in payload["path"]], offer, height, surplus,
+                                  fee_bps, fee_ph)
         extra = {"amounts": [str(a) for a in result.details["amounts"]],
-                 "dev_fee_collected": str(result.details["surplus"].get(_route_hex(payload["path"][-1]), 0))}
+                 "dev_fee_collected": str(result.details.get("router_fee", 0))}
         if "wrap" in result.details:
             extra["wrap"] = {k: str(v) for k, v in result.details["wrap"].items()}
     elif action == "split-swap":
-        branches = [([_v11_pool(entry) for entry in b["pools"]], [_bytes32(str(a)) for a in b["path"]], int(b["amountIn"]))
+        branches = [([_lane_pool(entry) for entry in b["pools"]], [_bytes32(str(a)) for a in b["path"]], int(b["amountIn"]))
                     for b in payload["branches"]]
         surplus = surplus_ph if surplus_ph is not None else branches[0][0][0].protocol_ph
-        result = v11r.split_swap(branches, offer, height, surplus)
+        result = rt.split_swap(branches, offer, height, surplus, fee_bps, fee_ph)
         extra = {"branch_amounts": [[str(a) for a in amounts] for amounts in result.details["branch_amounts"]],
                  "total_out": str(result.details["total_out"]),
-                 "dev_fee_collected": str(result.details["surplus"].get(_route_hex(payload["branches"][0]["path"][-1]), 0))}
+                 "dev_fee_collected": str(result.details.get("router_fee", 0))}
     elif action == "flow-balance":
-        specs = [(_v11_pool(leg["pool"]), _bytes32(str(leg["assetIn"])), _bytes32(str(leg["assetOut"])), int(leg["amountIn"]))
+        specs = [(_lane_pool(leg["pool"]), _bytes32(str(leg["assetIn"])), _bytes32(str(leg["assetOut"])), int(leg["amountIn"]))
                  for leg in payload["legs"]]
         start_raw = str(payload.get("startAsset") or "").strip()
         start = _bytes32(start_raw) if start_raw and start_raw.lower() not in ("txch", "xch", "0" * 64) else ZERO_32
         surplus = surplus_ph if surplus_ph is not None else specs[0][0].protocol_ph
-        result = v11r.flow_balance(specs, offer, height, surplus, start)
+        result = rt.flow_balance(specs, offer, height, surplus, start, fee_bps, fee_ph)
         extra = {"leg_amounts": [[str(a), str(b)] for a, b in result.details["leg_amounts"]],
                  "total_out": str(result.details["total_out"])}
     elif action == "routed-deposit":
-        target = _v11_pool(payload["pool"])
-        sales = [([_v11_pool(entry) for entry in sale["pools"]], [_bytes32(str(a)) for a in sale["path"]], int(sale["amountIn"]))
+        target = _lane_pool(payload["pool"])
+        sales = [([_lane_pool(entry) for entry in sale["pools"]], [_bytes32(str(a)) for a in sale["path"]], int(sale["amountIn"]))
                  for sale in payload.get("sales", [])]
-        result = v11r.routed_deposit(target, sales, offer, height, surplus_ph if surplus_ph is not None else target.protocol_ph)
+        result = rt.routed_deposit(target, sales, offer, height,
+                               surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph)
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
-        extra = {"target": v11.pool_to_snapshot(target_after),
+        extra = {"target": off.pool_to_snapshot(target_after),
                  "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
                  "minted": str(result.details["minted"]), "backing": str(result.details["backing"]),
                  "sale_outputs": [str(a) for a in result.details["sale_outputs"]],
                  "leftover_xch": str(result.details["leftover_xch"])}
     elif action == "vault-route":
-        swap_pool, vault = _v11_pool(payload["swapPool"]), _v11_pool(payload["vault"])
-        result = v11r.vault_route(swap_pool, _bytes32(str(payload["assetIn"])), vault, offer, height,
-                                  surplus_ph if surplus_ph is not None else vault.protocol_ph)
+        swap_pool, vault = _lane_pool(payload["swapPool"]), _lane_pool(payload["vault"])
+        result = rt.vault_route(swap_pool, _bytes32(str(payload["assetIn"])), vault, offer, height,
+                                  surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph)
         extra = {"swap_out": str(result.details["swap_out"]), "redeemed": str(result.details["redeemed"])}
     else:
         raise ValueError(f"unknown route lane {action!r}")
@@ -409,8 +472,8 @@ def _build_v11_route(action: str, payload: dict[str, Any], offer: Offer, height:
         "action": action,
         "transaction_id": result.bundle.name().hex(),
         "bundle": result.bundle.to_json_dict(),
-        "pools": [v11.pool_to_snapshot(pool) for pool in result.pools],
-        "v11": {k: v for k, v in result.details.items() if k not in ("deposits",)},
+        "pools": [off.pool_to_snapshot(pool) for pool in result.pools],
+        "forge": {k: v for k, v in result.details.items() if k not in ("deposits",)},
         **extra,
     }
 
@@ -422,12 +485,12 @@ def _route_hex(asset) -> str:
 CREATE_LANES = ("prepare-create", "create", "commit-create")
 
 
-def _v11_registry(record: dict[str, Any]):
+def _lane_registry(record: dict[str, Any], drv):
     """The registry singleton from the registry driver's record (its `registry` section)."""
     from dataclasses import replace as _replace
     from chia.wallet.lineage_proof import LineageProof
     from chia_rs.sized_ints import uint64 as _u64
-    reg = drv_v11.make_registry(creation_fee=int(record["creation_fee"]), treasury_ph=_bytes32(record["treasury_ph"]),
+    reg = drv.make_registry(creation_fee=int(record["creation_fee"]), treasury_ph=_bytes32(record["treasury_ph"]),
                                 launcher_parent=_bytes32(record["launcher_parent"]), state=list(record["state"]))
     coin = _coin(record["coin"])
     lin = record["lineage"]
@@ -442,17 +505,17 @@ def _creator_coins(payload: dict[str, Any]):
     from chia.wallet.lineage_proof import LineageProof
     from chia_rs.sized_ints import uint64 as _u64
     xch_in = payload["creator"]["xch"]
-    xch = v11c.CreatorXch(_coin(xch_in["coin"]), _P.from_bytes(bytes.fromhex(str(xch_in["puzzle_reveal"]).removeprefix("0x"))))
+    xch = cre.CreatorXch(_coin(xch_in["coin"]), _P.from_bytes(bytes.fromhex(str(xch_in["puzzle_reveal"]).removeprefix("0x"))))
     cats = {}
     for c in payload["creator"].get("cats", []):
         asset = _bytes32(str(c["asset_id"]))
         lp = c["lineage_proof"]
-        cats[asset] = v11c.CreatorCat(asset, _coin(c["coin"]), _P.from_bytes(bytes.fromhex(str(c["inner_puzzle"]).removeprefix("0x"))),
+        cats[asset] = cre.CreatorCat(asset, _coin(c["coin"]), _P.from_bytes(bytes.fromhex(str(c["inner_puzzle"]).removeprefix("0x"))),
                                       LineageProof(_bytes32(lp["parent_name"]), _bytes32(lp["inner_puzzle_hash"]), _u64(int(lp["amount"]))))
     return xch, cats
 
 
-def _creation_config(payload: dict[str, Any]) -> "v11c.CreationConfig":
+def _creation_config(payload: dict[str, Any], cre) -> "cre.CreationConfig":
     cfg = payload["config"]
     assets = [None if str(a).lower() in ("txch", "xch", "0" * 64, "") else _bytes32(str(a)) for a in cfg["asset_ids"]]
     reserves = [int(x) for x in cfg["reserves"]]
@@ -460,36 +523,37 @@ def _creation_config(payload: dict[str, Any]) -> "v11c.CreationConfig":
     total_lp = int(cfg.get("total_lp") or (min(reserves) * int(cfg.get("lp_ratio") or 1)))
     fee_bps = int(cfg.get("fee_bps", 30))
     # a name or symbol left empty is derived the way every pool's default is
-    import forge_v11_index as _idx
-    canonical = v11c.canonical(v11c.CreationConfig(assets, reserves, weights, fee_bps, 0, ZERO_32, total_lp))
+    import forge_v12_index as _idx
+    canonical = cre.canonical(cre.CreationConfig(assets, reserves, weights, fee_bps, 0, ZERO_32, total_lp))
     hex_ids = [("00" * 32) if a is None else a.hex() for a in canonical.asset_ids]
     state = {"pools": []}
     try:
         import json as _json
-        state = _json.loads(Path(payload.get("record_path") or (Path(__file__).resolve().parent.parent / ".awizard" / "v11-testnet.json")).read_text(encoding="utf-8"))
+        state = _json.loads(Path(payload.get("record_path") or (Path(__file__).resolve().parent.parent / ".awizard" / "v12-testnet.json")).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- names of nested LP assets fall back to their ids
         pass
     name = str(cfg.get("name") or "") or _idx.emoji_name(hex_ids, canonical.weights, fee_bps, state)
     symbol = str(cfg.get("symbol") or "") or _idx.pool_symbol(hex_ids, canonical.weights, state)
     dao_raw = str(cfg.get("dao_puzzle_hash") or "").strip()
-    return v11c.CreationConfig(assets, reserves, weights, fee_bps, int(cfg.get("protocol_fee_bps", 5)),
+    return cre.CreationConfig(assets, reserves, weights, fee_bps, int(cfg.get("protocol_fee_bps", 5)),
                                _bytes32(str(cfg["protocol_puzzle_hash"])), total_lp, name, symbol,
                                dao_ph=_bytes32(dao_raw) if dao_raw and set(dao_raw.removeprefix("0x")) != {"0"} else ZERO_32,
                                dao_fee_bps=int(cfg.get("dao_fee_bps") or 0))
 
 
-def _build_v11_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Offer-free, keyless creation (phase 8.1): `prepare-create` returns the creator's spends
     to sign and the pool they will own; `create` takes the signature (and the spends as the
     wallet signed them) and returns the bundle plus the record patch the caller commits after
     the push confirms; `commit-create` applies that patch to the registry driver's record."""
+    off, rt, cre, drv = _lane(payload)
     if action == "commit-create":
-        return v11c.commit_record(payload["record_path"], payload["record_patch"])
-    registry = _v11_registry(payload["registry"])
+        return cre.commit_record(payload["record_path"], payload["record_patch"])
+    registry = _lane_registry(payload["registry"], drv)
     xch, cats = _creator_coins(payload)
-    plan = v11c.plan(registry, payload["registry"]["slots"], _creation_config(payload), xch, cats,
+    plan = cre.plan(registry, payload["registry"]["slots"], _creation_config(payload, cre), xch, cats,
                      _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0))
-    out = {"success": True, "action": action, **v11c.plan_json(plan)}
+    out = {"success": True, "action": action, **cre.plan_json(plan)}
     if action == "create":
         def _hex0x(v: Any) -> str:
             text = str(v)
@@ -505,19 +569,20 @@ def _build_v11_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             })
         signed = [_spend(cs) for cs in payload.get("signed_creator_spends") or []] or None
         signature = G2Element.from_bytes(bytes.fromhex(str(payload["aggregated_signature"]).removeprefix("0x")))
-        bundle = v11c.finalize(plan, signature, signed)
+        bundle = cre.finalize(plan, signature, signed)
         out.update({"transaction_id": bundle.name().hex(), "bundle": bundle.to_json_dict(),
-                    "record_patch": v11c.record_patch(plan, payload["registry"])})
+                    "record_patch": cre.record_patch(plan, payload["registry"])})
     return out
 
 
 def build(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).lower()
     if action in CREATE_LANES and isinstance(payload.get("registry"), dict) or action == "commit-create":
-        return _build_v11_create(action, payload)
+        return _build_lane_create(action, payload)
     offer = Offer.from_bech32(str(payload["offer"]))
-    if any(v11.is_v11_snapshot(snapshot) for snapshot in _pool_snapshots(payload)):
-        return _build_v11(action, payload, offer)
+    # Any action-layer revision (12 = V11.1, 13 = V12) takes the versioned lane; _lane() picks which.
+    if any(int(snapshot.get("protocol_version") or 0) in _LANES for snapshot in _pool_snapshots(payload)):
+        return _build_lane(action, payload, offer)
     if action in ("prepare-create", "finalize-create"):
         signer_public_key = G1Element.from_bytes(
             bytes.fromhex(str(payload["signer_public_key"]).removeprefix("0x"))

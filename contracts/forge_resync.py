@@ -197,13 +197,23 @@ def _reserve_tip_entry(node_url: str, stale_entry: dict, launcher_id: str) -> tu
 
 def resync(payload: dict[str, Any]) -> dict[str, Any]:
     stale_snapshot = payload["pool"]
-    # A V11 pool's state is curried, not read from reserve tips, so its tip is
-    # rebuilt by replaying the spends between the snapshot and the tip.
-    if int((stale_snapshot or {}).get("protocol_version") or 0) == 11:
-        from forge_v11_resync import ResyncError as V11ResyncError, resync as resync_v11
+    # A V11-or-later pool's state is curried, not read from reserve tips, so its tip is
+    # rebuilt by replaying the spends between the snapshot and the tip. Each revision
+    # has its own replay module because each has its own leaf set and solution shape.
+    #
+    # This used to test for 11 alone. V12 is protocol 13, so every V12 pool fell past it
+    # into the V4..V10 branch and came back "V13 pools are not V3Pool snapshots" -- and
+    # because a resync is what the browser does when it finds a pool behind the chain,
+    # that refusal stopped the swap rather than repairing it. Add the version here when
+    # a revision ships; there is no sensible default for an unknown one.
+    REPLAY_LANES = {11: "forge_v11_resync", 13: "forge_v12_resync"}
+    lane = REPLAY_LANES.get(int((stale_snapshot or {}).get("protocol_version") or 0))
+    if lane is not None:
+        import importlib
+        module = importlib.import_module(lane)
         try:
-            return resync_v11(payload)
-        except V11ResyncError as exc:
+            return module.resync(payload)
+        except module.ResyncError as exc:
             raise ResyncError(str(exc), exc.code) from exc
     node_url = str(payload.get("node_url") or DEFAULT_NODE)
     launcher_id = _strip_0x(payload["launcher_id"]).lower()

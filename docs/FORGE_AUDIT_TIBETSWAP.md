@@ -46,7 +46,7 @@ lp_action_coin_id = sha256(lp_parent_id
 ```
 
 — parent, the CAT puzzle hash with the **pinned** inner for that mode, and the
-exact amount ([`forge_action_common.rue:345`](../contracts/v11/puzzles/forge_action_common.rue)).
+exact amount ([`forge_action_common.rue:345`](../contracts/v12/puzzles/forge_action_common.rue)).
 It is delivered by a CHIP-0025 `SendMessage` with mode `SENDER_PUZZLE |
 RECEIVER_COIN`, so consensus itself commits both the sending puzzle and the
 receiving coin. An impostor coin has a different id and never receives the
@@ -58,7 +58,7 @@ This is strictly stronger than the V1 fix: Tibet added an identifier to a
 message anyone could still emit; Forge moved the binding into consensus and
 stopped accepting the identifier as input.
 
-**Status: closed, structurally.** Pinned by `_test_v11_actions.py` —
+**Status: closed, structurally.** Pinned by `_test_v12_actions.py` —
 *"an eve that mints a different amount than the pool authorized is refused by the
 TAIL"* and *"fabricated melt coin (finding 4) refused"*.
 
@@ -104,7 +104,7 @@ input. Verified rather than assumed:
   (`swap reserves and input must be positive`).
 
 **What the mutation test showed, and why it matters.** Sign-refusal cases were
-added to `_test_v11_actions.py`. They pass — but recompiling the swap leaf with
+added to `_test_v12_actions.py`. They pass — but recompiling the swap leaf with
 *both* sign assertions deleted makes them pass too, and the full sweep below
 later confirmed the same for all seven sign and bounds guards in `swap` and
 `add`. So the curve, not the assertions, is the load-bearing defence; the `> 0`
@@ -119,7 +119,7 @@ refused at the leaf — and the comment records which layer is actually holding.
 
 **Actions taken.**
 
-- [x] Sign-refusal cases added to `_test_v11_actions.py` for the swap and remove
+- [x] Sign-refusal cases added to `_test_v12_actions.py` for the swap and remove
       paths: negative and zero input, negative and zero claimed output, negative
       and out-of-range asset index, negative and zero LP burn.
 - [x] The load-bearing layer identified by mutation and written into the suite,
@@ -132,25 +132,25 @@ refused at the leaf — and the comment records which layer is actually holding.
       `any_positive(deposits)` — because a zero on *one* asset is a legitimate
       off-ratio add, so emptiness has to be checked separately. Twelve sign
       probes now, across all three leaves; 78/78 action checks pass.
-- [x] **A standing mutation harness** (2026-09-10): `scripts/mutate-v11.py`.
+- [x] **A standing mutation harness** (2026-09-10): `scripts/mutate-v12.py`.
       See below.
 
 ---
 
 ### The harness, and what it found
 
-`scripts/mutate-v11.py` deletes each `assert` in Forge's leaves one at a time,
+`scripts/mutate-v12.py` deletes each `assert` in Forge's leaves one at a time,
 rebuilds with `rue`, and runs the suites against the result. A mutant that
 **survives** — every suite still passes without the line — is not automatically a
 bug; it is a question with two acceptable answers, *redundant* or *untested*, and
-the point is to know which. Nothing is written into `contracts/v11/compiled`:
+the point is to know which. Nothing is written into `contracts/v12/compiled`:
 each mutant is built in a temporary copy and the suites are pointed at it with
 `FORGE_V11_COMPILED`, so a broken build can never be left behind in the project.
 
 One design note learned the hard way. Run against a single suite, the harness
 reported the DAO fee's **monotonic-decrease guarantee**
 (`new_bps < p.state.dao_fee_bps`) as unpinned — which would have been a serious
-false alarm, since `_test_v11_dao_fee.py` kills it immediately. A mutant is
+false alarm, since `_test_v12_dao_fee.py` kills it immediately. A mutant is
 therefore killed if *any* suite in the run fails, and the output names which one
 did it.
 
@@ -178,7 +178,7 @@ delete it on the grounds that a test still passes.
       locks — `effective_delta == expected_delta` and `parent_is_cat ||
       expected_delta > 0` — were both survivors under the default suites; the
       latter because the finding-4 probe is refused by the former first. Both
-      are now killed by `_test_v11_lp_receive_forgery.py`, which the harness
+      are now killed by `_test_v12_lp_receive_forgery.py`, which the harness
       runs by default. The nine that remain are the genesis branch and the
       shape checks (`launcher_id != 0`, protocol version, `expected_delta != 0`,
       `new_total_lp >= 0`, `amount > 0`, `pool_inner_puzzle_hash != 0`, and the
@@ -216,7 +216,7 @@ melt coin (finding 4) refused"* and *"burning the whole supply is refused"*.
 to us was not "the payout can skip the melt" but "the LP coin's *inner puzzle*
 can emit conditions that *look* like the TAIL's receive, instead of running the
 TAIL." That deserved puzzles run, not prose, because it turns on a fact about
-CAT2 rather than about Forge. `_test_v11_lp_receive_forgery.py` establishes:
+CAT2 rather than about Forge. `_test_v12_lp_receive_forgery.py` establishes:
 
 - **The pass-through is real.** CAT2 (`37bef360…`) hands an inner puzzle's bare
   `RECEIVE_MESSAGE` straight out; the TAIL never runs. Any CAT pool whose
@@ -300,7 +300,7 @@ Their conclusion, which Forge should adopt rather than admire:
 | V2 — negative swap input | **Not vulnerable.** An unsatisfiable curve bracket, with sign asserts as a second layer | Full mutation sweep; brute-force search; 12 refusal cases across three leaves |
 | V2 — remove without melt | **Closed structurally.** The handshake is unconditional and atomic with the payout | `forge_action_remove.rue`; payout and melt refusal tests |
 | Process — audit cadence, bounty, monitoring | **Gaps.** All three outstanding | This document |
-| Tooling — which assertions are load-bearing | **Answered, and now repeatable** | `scripts/mutate-v11.py`: 10/32 killed |
+| Tooling — which assertions are load-bearing | **Answered, and now repeatable** | `scripts/mutate-v12.py`: 10/32 killed |
 
 Nothing here is a clean bill of health. Forge's pool has never been audited by
 anyone outside this workspace, and the V2 post-mortem's most uncomfortable fact

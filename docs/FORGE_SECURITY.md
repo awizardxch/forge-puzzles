@@ -16,7 +16,7 @@ report is worth more than a quiet fix either way.
 
 ## Scope
 
-**In scope: the revision in this repository.** `contracts/v11` is the shipping
+**In scope: the revision in this repository.** `contracts/v12` is the shipping
 pool, live on testnet11, and `contracts/vault_*.py` with `contracts/mips.py` is
 the lock. Those are what an audit should look at.
 
@@ -38,28 +38,39 @@ because a puzzle had been hashed but never executed.
 
 | Suite | What it establishes |
 |---|---|
-| `_test_v11_actions.py` | Every leaf, accepted and refused. Each refusal case is a claim about what the puzzle will not do. |
-| `_test_v11_manipulation.py` | The flash-loan analog: chained actions in one spend, the actor's end position priced at pre-sequence spot, never above the start. |
-| `_test_v11_curve_equivalence.py` | The curve against its mirror, thousands of cases. |
-| `_test_v11_integrity.py` | Built hex matches source; upstream pins hold byte-for-byte. |
-| `_test_v11_registry.py`, `_test_v11_dao_fee.py`, `_test_v11_multipool.py` | The registry, the monotonic fee decrease, routes across pools. |
+| `_test_v12_actions.py` | Every leaf, accepted and refused. Each refusal case is a claim about what the puzzle will not do. |
+| `_test_v12_manipulation.py` | The flash-loan analog: chained actions in one spend, the actor's end position priced at pre-sequence spot, never above the start. |
+| `_test_v12_curve_equivalence.py` | The curve against its mirror, thousands of cases. |
+| `_test_v12_integrity.py` | Built hex matches source; upstream pins hold byte-for-byte. |
+| `_test_v12_genesis.py` | The genesis mint is bound to one eve coin, so a launcher announcement cannot authorise a second. |
+| `_test_v12_consensus_timelocks.py` | Birth heights judged by the mempool's own `check_time_locks`, so a claimed height is checked the way a node checks it. |
+| `_test_v12_lp_receive_forgery.py` | An LP burn cannot be forged by emitting conditions that merely look like one; the pool's message is welded to the payout. |
+| `_test_v12_registry.py`, `_test_v12_dao_fee.py`, `_test_v12_multipool.py` | The registry, the monotonic fee decrease, routes across pools. |
 | `_test_mips.py` | The lock's composition against vectors generated from `chia-wallet-sdk` itself — Python compared against Chia's Rust, not against itself. |
 | `_test_vault_*.py` | The lock: policy, DIDs, offers, batches, NFTs. |
 
-`docs/FORGE_V11_CLVM_PASS.md` is the written CLVM pass over every leaf: what each
-asserts, what it emits, and which test pins each refusal.
+`docs/FORGE_PUZZLE_V12.md` sets out what each leaf asserts and emits, and which
+test pins each refusal.
 
 ## Mutation testing
 
-`scripts/mutate-v11.py` deletes each assertion in turn, rebuilds, and re-runs the
+`scripts/mutate-v12.py` deletes each assertion in turn, rebuilds, and re-runs the
 suites. An assertion whose deletion changes nothing is either redundant or
 untested, and the two are worth telling apart.
 
-The current sweep is **10 killed, 22 survived of 32**. Most survivors are
-structurally unreachable — the curve refuses first — and the leaves say so where
-that is the case. This is published because a reviewer should know which of our
-guards are load-bearing and which are belt-and-braces; we would rather be told we
-have miscounted than have it assumed we checked.
+The current sweep, over the shipping revision: the leaves, **12 of 33 killed**;
+the TAIL, registry, finalizer and reserve-amount puzzles, **8 of 24 killed**;
+nothing unbuildable in either set, and every mutant run against the whole suite.
+
+Most survivors are structurally unreachable — the curve refuses first — and the
+leaves say so where that is the case. Both of this revision's new assertions are
+killed. Two locks live inside emitted conditions rather than `assert` lines and
+so cannot be reached by the sweep; those were mutated by hand, and each one fails
+the suite that pins it.
+
+This is published because a reviewer should know which of our guards are
+load-bearing and which are belt-and-braces; we would rather be told we have
+miscounted than have it assumed we checked.
 
 ## Comparison against published failures
 
