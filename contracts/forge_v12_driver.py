@@ -8,8 +8,8 @@ feeds them real coins from Sage. If the two ever needed different puzzle math,
 one of them would be wrong.
 
 What lives here:
-  * loading the compiled V11 puzzles from contracts/v11/compiled;
-  * PoolSpec-free construction of a V11 pool (V11Pool): reserve inners on
+  * loading the compiled V12 puzzles from contracts/v12/compiled;
+  * PoolSpec-free construction of a V11 pool (V12Pool): reserve inners on
     p2_delegated_by_singleton with nonce = asset index, the multi-reserve
     finalizer, the five leaves curried with PoolConfig, the wallet-sdk merkle
     tree, the action-layer inner and the singleton coin;
@@ -49,19 +49,20 @@ from chia_rs.sized_ints import uint64
 from forge_merkle import LEAF_ORDER, MerkleTree
 
 CONTRACTS = pathlib.Path(__file__).resolve().parent
-# Normally the project's own build. `FORGE_V11_COMPILED` points it somewhere
+# Normally the project's own build. `FORGE_V12_COMPILED` points it somewhere
 # else, which is how the mutation harness runs a suite against a deliberately
-# broken build without ever writing into contracts/v11/compiled -- leaving a
+# broken build without ever writing into contracts/v12/compiled -- leaving a
 # mutant behind in the real build is the one way this tooling could do harm.
-V11_COMPILED = (pathlib.Path(os.environ["FORGE_V11_COMPILED"]).resolve()
-                if os.environ.get("FORGE_V11_COMPILED")
-                else CONTRACTS / "v11" / "compiled")
+V12_COMPILED = (pathlib.Path(os.environ["FORGE_V12_COMPILED"]).resolve()
+                if os.environ.get("FORGE_V12_COMPILED")
+                else CONTRACTS / "v12" / "compiled")
 MAX_COST = 11_000_000_000
 VALIDATION_HEIGHT = 7_000_000  # any height past every soft fork; messages are consensus
 
 CREATE_COIN, CREATE_PUZZLE_ANNOUNCEMENT, SEND_MESSAGE, RECEIVE_MESSAGE = 51, 62, 66, 67
 RESERVE_TAG = -42
-PROTOCOL_VERSION = 12      # V11.1: the DAO fee revision (config, state and leaf set changed)
+PROTOCOL_VERSION = 13      # V12 (CHIP-0062 review revision); was 12 for V11.1
+MIN_LOCKED_LP = 1000       # V12: mirrors forge_action_common.rue; enforced at registration and in remove: the DAO fee revision (config, state and leaf set changed)
 PRICE_SCALE = 2 ** 64
 ORACLE_WINDOW = 32
 IDENTITY = Program.to(1)
@@ -73,15 +74,15 @@ class Rejected(Exception):
     """The bundle would not be accepted: by consensus, or by a builder that mirrors it."""
 
 
-def v11_program(name: str) -> Program:
-    path = V11_COMPILED / f"{name}.rue.hex"
+def v12_program(name: str) -> Program:
+    path = V12_COMPILED / f"{name}.rue.hex"
     if not path.is_file():
-        path = V11_COMPILED / f"{name}.clvm.hex"
+        path = V12_COMPILED / f"{name}.clvm.hex"
     return Program.from_bytes(bytes.fromhex(path.read_text().strip()))
 
 
-def v11_available() -> bool:
-    return (V11_COMPILED / "forge_action_swap.rue.hex").is_file()
+def v12_available() -> bool:
+    return (V12_COMPILED / "forge_action_swap.rue.hex").is_file()
 
 
 def amt(n: int) -> bytes:
@@ -100,17 +101,17 @@ def program_hash(value) -> bytes32:
     return Program.to(value).get_tree_hash()
 
 
-if v11_available():
-    ACTION_LAYER = v11_program("action")
-    P2_DELEGATED = v11_program("p2_delegated_by_singleton")
-    SLOT = v11_program("slot")
-    FINALIZER_MOD = v11_program("forge_multi_reserve_finalizer")
-    RESERVE_AMOUNT = v11_program("forge_reserve_amount")
-    PASSTHROUGH = v11_program("passthrough_action")
-    LP_TAIL_MOD = v11_program("forge_lp_cat_tail")
-    LP_MINT_INNER = v11_program("forge_lp_mint_inner")
-    LP_MELT_INNER = v11_program("forge_lp_melt_inner")
-    LEAF_MODS = {name: v11_program(name) for name in LEAF_ORDER}
+if v12_available():
+    ACTION_LAYER = v12_program("action")
+    P2_DELEGATED = v12_program("p2_delegated_by_singleton")
+    SLOT = v12_program("slot")
+    FINALIZER_MOD = v12_program("forge_multi_reserve_finalizer")
+    RESERVE_AMOUNT = v12_program("forge_reserve_amount")
+    PASSTHROUGH = v12_program("passthrough_action")
+    LP_TAIL_MOD = v12_program("forge_lp_cat_tail")
+    LP_MINT_INNER = v12_program("forge_lp_mint_inner")
+    LP_MELT_INNER = v12_program("forge_lp_melt_inner")
+    LEAF_MODS = {name: v12_program(name) for name in LEAF_ORDER}
 else:  # the suites skip; keep import-time failures out of the way
     ACTION_LAYER = P2_DELEGATED = SLOT = FINALIZER_MOD = RESERVE_AMOUNT = PASSTHROUGH = None
     LP_TAIL_MOD = LP_MINT_INNER = LP_MELT_INNER = None
@@ -121,13 +122,15 @@ else:  # the suites skip; keep import-time failures out of the way
 
 def forge_state(reserves: list[int], total_lp: int, fees: list[int] | None = None,
                 last_height: int = 0, cums: list[int] | None = None, prev_root: bytes = ZERO_32,
-                dao_fee_bps: int = 0, dao_owed: list[int] | None = None) -> list:
+                dao_fee_bps: int = 0, dao_owed: list[int] | None = None,
+                reserve_parents: list | None = None) -> list:
     """[reserves, total_lp, fees_owed, [last_height, cums], prev_root, dao_fee_bps, dao_owed] --
     the Build Spec's STATE, with V11.1's DAO rate and owed balance appended."""
     fees = fees if fees is not None else [0] * len(reserves)
     cums = cums if cums is not None else [0] * max(0, len(reserves) - 1)
     dao_owed = dao_owed if dao_owed is not None else [0] * len(reserves)
-    return [reserves, total_lp, fees, [last_height, cums], prev_root, dao_fee_bps, dao_owed]
+    reserve_parents = reserve_parents if reserve_parents is not None else [ZERO_32] * len(reserves)
+    return [reserves, total_lp, fees, [last_height, cums], prev_root, dao_fee_bps, dao_owed, reserve_parents]
 
 
 def reserve_amounts(state) -> list[int]:
@@ -147,7 +150,7 @@ def expected_cums(state, weights, h: int, scale: int = PRICE_SCALE) -> list[int]
     return [c + spot_price(r[0], weights[0], r[i], weights[i], scale) * elapsed for i, c in enumerate(cums, start=1)]
 
 
-def spend_actions(pool: V11Pool, steps: list, parent_ids: list | None = None, extra_spends: list = (),
+def spend_actions(pool: V12Pool, steps: list, parent_ids: list | None = None, extra_spends: list = (),
                   extra_cats: dict | None = None, omit_proofs: bool = True, force_no_proofs: bool = False, **knobs):
     """Several leaves in ONE spend, in order. `steps` is [(leaf name, solution), ...].
 
@@ -184,8 +187,8 @@ def spend_actions(pool: V11Pool, steps: list, parent_ids: list | None = None, ex
         else:
             reversed_entries.append([selector, *proof])
             proven.add(selector)
-    parents = parent_ids if parent_ids is not None else [r.coin.parent_coin_info for r in pool.reserves]
-    inner_solution = Program.to([puzzles, reversed_entries, [s for _, s in steps], *parents])
+    # V12: no reserve parent ids in the solution -- the finalizer reads them from state.
+    inner_solution = Program.to([puzzles, reversed_entries, [with_birth(pool, s) for _, s in steps]])
     singleton_spend = make_spend(pool.coin, puzzle_for_singleton(pool.launcher_id, pool.inner),
                                  solution_for_singleton(pool.lineage, uint64(1), inner_solution))
     spends = [singleton_spend, *extra_spends]
@@ -213,7 +216,8 @@ def state_to_list(new_state: Program) -> list:
     oracle = list(items[3].as_iter())
     return [[x.as_int() for x in items[0].as_iter()], items[1].as_int(), [x.as_int() for x in items[2].as_iter()],
             [oracle[0].as_int(), [x.as_int() for x in oracle[1].as_iter()]], bytes32(items[4].as_atom()),
-            items[5].as_int(), [x.as_int() for x in items[6].as_iter()]]
+            items[5].as_int(), [x.as_int() for x in items[6].as_iter()],
+            [bytes32(x.as_atom()) for x in items[7].as_iter()]]
 
 
 def _state_amounts(new_state) -> list[int]:
@@ -237,7 +241,7 @@ class Reserve:
 
 
 @dataclass
-class V11Pool:
+class V12Pool:
     launcher_parent: bytes32
     launcher_id: bytes32
     struct_hash: bytes32
@@ -258,7 +262,10 @@ class V11Pool:
     lp_tail: Program                  # curried TAIL; its tree hash is the LP asset id
     slot_first_curry_hash: bytes32
     extra: dict = field(default_factory=dict)
-    dao_ph: bytes32 = ZERO_32         # V11.1: the DAO recipient; the current rate is state[5]
+    dao_ph: bytes32 = ZERO_32
+    # V12: the height this pool coin was created at; every leaf solution carries it and the
+    # prologue asserts it (ASSERT_MY_BIRTH_HEIGHT). Offline, the validator cannot check it.
+    birth: int = 0         # V11.1: the DAO recipient; the current rate is state[5]
 
     @property
     def dao_fee_bps(self) -> int:
@@ -284,15 +291,23 @@ class V11Pool:
     def inner_for_state(self, state) -> Program:
         return ACTION_LAYER.curry(self.finalizer, self.merkle_root, Program.to(state))
 
+    def committed(self, new_state) -> list:
+        """V12: what the finalizer actually commits -- the leaf's new state with reserve_parents
+        rewritten to the ids of the reserve coins this spend consumes (their children's parents)."""
+        st = list(new_state if isinstance(new_state, list) else state_to_list(new_state))
+        st[7] = [r.coin.name() for r in self.reserves]
+        return st
+
     def successor_puzzle_hash(self, new_state) -> bytes32:
-        return puzzle_for_singleton(self.launcher_id, self.inner_for_state(new_state)).get_tree_hash()
+        return puzzle_for_singleton(self.launcher_id, self.inner_for_state(self.committed(new_state))).get_tree_hash()
 
     def leaf_proof(self, name: str) -> list:
         p = self.tree.proof(self.leaves[name].get_tree_hash())
         return [p.path, *p.hashes]
 
-    def advance(self, new_state) -> "V11Pool":
+    def advance(self, new_state) -> "V12Pool":
         """The pool after a spend that produced `new_state`: successor singleton and reserves."""
+        new_state = self.committed(new_state)       # V12: the finalizer's parent rewrite
         inner = self.inner_for_state(new_state)
         coin = Coin(self.coin.name(), puzzle_for_singleton(self.launcher_id, inner).get_tree_hash(), uint64(1))
         lineage = LineageProof(self.coin.parent_coin_info, self.inner_hash, uint64(1))
@@ -302,7 +317,8 @@ class V11Pool:
             succ = Coin(r.coin.name(), r.full_hash, uint64(amounts[r.index]))
             lin = None if r.asset_id is None else LineageProof(r.coin.parent_coin_info, r.inner_hash, r.coin.amount)
             reserves.append(replace(r, coin=succ, lineage=lin))
-        return replace(self, state=new_state, inner=inner, coin=coin, lineage=lineage, reserves=reserves)
+        st = new_state if isinstance(new_state, list) else state_to_list(new_state)
+        return replace(self, state=new_state, inner=inner, coin=coin, lineage=lineage, reserves=reserves, birth=st[3][0])
 
 
 def make_pool(asset_ids: list, reserves: list[int], total_lp: int = 1_000_000,
@@ -313,7 +329,7 @@ def make_pool(asset_ids: list, reserves: list[int], total_lp: int = 1_000_000,
               reserve_inner_hashes: list[bytes32] | None = None,
               launcher_parent: bytes32 | None = None,
               reserve_coins: list | None = None, state: list | None = None,
-              dao_ph: bytes32 | None = None, dao_fee_bps: int = 0) -> V11Pool:
+              dao_ph: bytes32 | None = None, dao_fee_bps: int = 0) -> V12Pool:
     """A V11 pool ready to spend.
 
     `leaves`: None for the passthrough test leaf alone, "forge" for the five real
@@ -359,12 +375,17 @@ def make_pool(asset_ids: list, reserves: list[int], total_lp: int = 1_000_000,
             lineage = LineageProof(grandparent, inner_hash, uint64(amount))
         built.append(Reserve(i, asset, inner, bytes32(full_hash), coin, lineage))
 
+    # V12: reserve parents live in state and must be the parents of the coins this pool will
+    # actually spend. Fabricated reserves (no `reserve_coins`) get their fabricated parents even
+    # when a caller re-seeds a pool from an earlier state; real coins carry their own.
+    if isinstance(state, list) and (reserve_coins is None or all(p == ZERO_32 for p in state[7])):
+        state = [*state[:7], [r.coin.parent_coin_info for r in built]]
     full_hashes = reserve_full_hashes if reserve_full_hashes is not None else [r.full_hash for r in built]
     inner_hashes = reserve_inner_hashes if reserve_inner_hashes is not None else [r.inner_hash for r in built]
     first = FINALIZER_MOD.curry(ACTION_LAYER.get_tree_hash(), full_hashes, inner_hashes, RESERVE_AMOUNT, launcher_id)
     finalizer = first.curry(first.get_tree_hash())
 
-    pool = V11Pool(launcher_parent, launcher_id, struct_hash, launcher_id, list(asset_ids), list(weights),
+    pool = V12Pool(launcher_parent, launcher_id, struct_hash, launcher_id, list(asset_ids), list(weights),
                    fee_bps, protocol_fee_bps, protocol_ph, built, state, finalizer, {}, MerkleTree([]),
                    Program.to(0), Coin(launcher_id, ZERO_32, uint64(1)),
                    LineageProof(launcher_parent, None, uint64(1)), lp_tail, bytes32(slot_first), dao_ph=dao_ph)
@@ -388,13 +409,18 @@ def make_pool(asset_ids: list, reserves: list[int], total_lp: int = 1_000_000,
 
 # ---- running a leaf locally --------------------------------------------------------------
 
-def run_leaf(pool: V11Pool, name: str, solution: list, program: Program | None = None,
+def with_birth(pool, solution: list) -> list:
+    """V12: every leaf solution is [h, birth, ...]; callers pass [h, ...] and the pool's birth is inserted."""
+    return [solution[0], pool.birth, *solution[1:]]
+
+
+def run_leaf(pool: V12Pool, name: str, solution: list, program: Program | None = None,
              ephemeral=None, state=None):
     """What the action layer will see: ((ephemeral' . state') . conditions).
     Returns (new_state, tagged [(index, condition)], base conditions, ephemeral')."""
     leaf = program if program is not None else pool.leaves[name]
     state = state if state is not None else pool.state
-    out = leaf.run(Program.to(((ephemeral, state), solution)))
+    out = leaf.run(Program.to(((ephemeral, state), with_birth(pool, solution))))
     new_state = out.first().rest()
     tagged_conds, base = [], []
     for c in out.rest().as_iter():
@@ -410,7 +436,7 @@ def tagged(index: int, condition: list) -> Program:
     return Program.to((RESERVE_TAG, (index, condition)))
 
 
-def delegated_puzzle_for(pool: V11Pool, reserve: Reserve, new_state, tagged_in_emission_order: list) -> Program:
+def delegated_puzzle_for(pool: V12Pool, reserve: Reserve, new_state, tagged_in_emission_order: list) -> Program:
     """The (q . conditions) the finalizer will hash for this reserve: recreate first,
     then this reserve's tagged conditions in REVERSE emission order (split_conditions prepends)."""
     amounts = _state_amounts(new_state)
@@ -421,13 +447,14 @@ def delegated_puzzle_for(pool: V11Pool, reserve: Reserve, new_state, tagged_in_e
 
 # ---- assembling spends -------------------------------------------------------------------------
 
-def assemble(pool: V11Pool, leaf: Program, proof: list, solution: list, new_state, tagged_conditions: list,
+def assemble(pool: V12Pool, leaf: Program, proof: list, solution: list, new_state, tagged_conditions: list,
              parent_ids: list | None = None, reserve_delegated: dict | None = None,
              reserve_sender_inner_hash: bytes | None = None, extra_spends: list = (),
              extra_cats: dict | None = None, spend_reserves: bool = True,
              selector: int = SINGLE_LEAF_SELECTOR) -> SpendBundle:
-    parents = parent_ids if parent_ids is not None else [r.coin.parent_coin_info for r in pool.reserves]
-    inner_solution = Program.to([[leaf], [[selector, *proof]], [solution], *parents])
+    # V12: no reserve parent ids in the solution; the finalizer reads them from state
+    # (`parent_ids` is accepted and ignored so old call sites fail loudly in their asserts, not here).
+    inner_solution = Program.to([[leaf], [[selector, *proof]], [solution]])
     singleton_spend = make_spend(pool.coin, puzzle_for_singleton(pool.launcher_id, pool.inner),
                                  solution_for_singleton(pool.lineage, uint64(1), inner_solution))
     spends = [singleton_spend, *extra_spends]
@@ -452,14 +479,14 @@ def assemble(pool: V11Pool, leaf: Program, proof: list, solution: list, new_stat
     return SpendBundle(spends, G2Element())
 
 
-def spend_pool(pool: V11Pool, new_state, tagged_conditions=(), base_conditions=(), **knobs) -> SpendBundle:
+def spend_pool(pool: V12Pool, new_state, tagged_conditions=(), base_conditions=(), **knobs) -> SpendBundle:
     """Passthrough-leaf spend: the state and conditions are whatever the caller names."""
     solution = [Program.to(new_state), *[tagged(i, c) for i, c in tagged_conditions], *base_conditions]
     tagged_progs = [(i, Program.to(c)) for i, c in tagged_conditions]
     return assemble(pool, PASSTHROUGH, pool.leaf_proof("passthrough_action"), solution, new_state, tagged_progs, **knobs)
 
 
-def spend_action(pool: V11Pool, name: str, solution: list, leaf: Program | None = None,
+def spend_action(pool: V12Pool, name: str, solution: list, leaf: Program | None = None,
                  proof: list | None = None, **knobs):
     """Run leaf `name` locally, then assemble the full bundle around what it returned.
     `leaf` / `proof` substitute what is revealed to the action layer (adversarial lane).
@@ -467,7 +494,8 @@ def spend_action(pool: V11Pool, name: str, solution: list, leaf: Program | None 
     new_state, tagged_conds, _base, _eph = run_leaf(pool, name, solution)
     leaf = leaf if leaf is not None else pool.leaves[name]
     proof = proof if proof is not None else pool.leaf_proof(name)
-    return assemble(pool, leaf, proof, solution, new_state, tagged_conds, **knobs), new_state
+    # V12: the on-chain solution carries birth, exactly as run_leaf's local run did.
+    return assemble(pool, leaf, proof, with_birth(pool, solution), new_state, tagged_conds, **knobs), new_state
 
 
 # ---- settlement coins ----------------------------------------------------------------------------
@@ -506,7 +534,7 @@ def cat_settlement(asset_id: bytes32, amount: int, salt: int = 0xC1) -> Spendabl
 
 # ---- the LP CAT ------------------------------------------------------------------------------------
 
-def lp_mint_spends(pool: V11Pool, lp_delta: int, new_total_lp: int, next_state_root: bytes32,
+def lp_mint_spends(pool: V12Pool, lp_delta: int, new_total_lp: int, next_state_root: bytes32,
                    recipient_ph: bytes32, salt: int = 0xE0, lp_action: list | None = None,
                    eve_amount: int = 1, inner: Program | None = None):
     """The add-side LP coins: a funding coin that creates the mint eve, and the eve
@@ -532,7 +560,7 @@ def lp_mint_spends(pool: V11Pool, lp_delta: int, new_total_lp: int, next_state_r
     return funding.name(), [funding_spend, *ring]
 
 
-def lp_eve_ring(pool: V11Pool, eve: Coin, recipient_ph: bytes32, mint: int, action: list):
+def lp_eve_ring(pool: V12Pool, eve: Coin, recipient_ph: bytes32, mint: int, action: list):
     """Spend an existing one-mojo eve (LP CAT wrapping the pinned mint inner, no CAT
     parent) minting `mint` LP to `recipient_ph` under `action` -- the genesis form
     when action names the pool's full puzzle hash, the message form otherwise.
@@ -547,12 +575,12 @@ def lp_eve_ring(pool: V11Pool, eve: Coin, recipient_ph: bytes32, mint: int, acti
         raise Rejected(f"LP eve ring: {exc}") from exc
 
 
-def genesis_action(pool: V11Pool) -> list:
+def genesis_action(pool: V12Pool) -> list:
     """The TAIL solution for the genesis mint: expected = new total = total_lp, launcher-authorized."""
     return [pool.state[1], pool.state[1], ZERO_32, ZERO_32, pool.coin.puzzle_hash]
 
 
-def lp_melt_spend(pool: V11Pool, burn: int, new_total_lp: int, next_state_root: bytes32,
+def lp_melt_spend(pool: V12Pool, burn: int, new_total_lp: int, next_state_root: bytes32,
                   salt: int = 0xE8, lp_action: list | None = None, fabricated: bool = False):
     """The remove-side LP coin: `burn` LP wrapping the pinned melt inner, with a real
     CAT parent -- or, for the finding-4 probe, a parent that is NOT a CAT: the
@@ -617,12 +645,12 @@ MIN_KEY, MAX_KEY = bytes32(b"\x00" * 32), bytes32(b"\xff" * 32)
 
 
 def registry_available() -> bool:
-    return (V11_COMPILED / "forge_registry_register.rue.hex").is_file()
+    return (V12_COMPILED / "forge_registry_register.rue.hex").is_file()
 
 
 if registry_available():
-    DEFAULT_FINALIZER = v11_program("finalizer")
-    REGISTRY_LEAF_MODS = {name: v11_program(name) for name in REGISTRY_LEAF_ORDER}
+    DEFAULT_FINALIZER = v12_program("finalizer")
+    REGISTRY_LEAF_MODS = {name: v12_program(name) for name in REGISTRY_LEAF_ORDER}
 else:
     DEFAULT_FINALIZER, REGISTRY_LEAF_MODS = None, {}
 
@@ -736,16 +764,25 @@ def slot_spend(reg: Registry, value, parent: Coin, parent_inner_hash: bytes32, s
     return coin, make_spend(coin, puzzle, Program.to((proof, spender)))
 
 
-def launcher_spend(pool: V11Pool, kv_list=None):
+def launcher_spend(pool: V12Pool, kv_list=None):
     """The standard singleton launcher creating the pool's eve coin. Its key-value
     list is (total_lp): what the TAIL's genesis mint and the registry both require."""
-    kv_list = [pool.state[1]] if kv_list is None else list(kv_list)
+    # V12: (total_lp, eve_coin_id) -- the eve fabricated by lp_genesis_mint_spends with the default salt
+    kv_list = [pool.state[1], pool.extra.get("eve_coin_id", genesis_eve_id(pool))] if kv_list is None else list(kv_list)
     coin = Coin(pool.launcher_parent, SINGLETON_LAUNCHER_HASH, uint64(1))
     assert coin.name() == pool.launcher_id
     return coin, make_spend(coin, SINGLETON_LAUNCHER, Program.to([pool.coin.puzzle_hash, 1, kv_list]))
 
 
-def lp_genesis_mint_spends(pool: V11Pool, recipient_ph: bytes32, salt: int = 0xE4, mint: int | None = None,
+def genesis_eve_id(pool, salt: int = 0xE4, mint: int | None = None) -> bytes32:
+    """The id of the eve lp_genesis_mint_spends fabricates for this salt (no CAT parent)."""
+    total_lp = pool.state[1]; mint = total_lp if mint is None else mint
+    eve_ph = construct_cat_puzzle(CAT_MOD, pool.lp_asset_id, LP_MINT_INNER).get_tree_hash()
+    funding = Coin(bytes32(bytes([salt]) * 32), IDENTITY.get_tree_hash(), uint64(max(mint, 1)))
+    return Coin(funding.name(), eve_ph, uint64(1)).name()
+
+
+def lp_genesis_mint_spends(pool: V12Pool, recipient_ph: bytes32, salt: int = 0xE4, mint: int | None = None,
                            with_cat_parent: bool = False):
     """The genesis LP mint: an eve with no CAT parent minting the pool's whole
     genesis supply to the creator, authorized by the launcher's announcement
@@ -784,7 +821,8 @@ def fee_settlement(reg: Registry, launcher_id: bytes32, amount: int | None = Non
     return coin, make_spend(coin, OFFER_MOD, Program.to([[launcher_id, [reg.treasury_ph, amount, [reg.treasury_ph]]]]))
 
 
-def register_solution(pool: V11Pool, left: tuple, right: tuple) -> list:
+def register_solution(pool: V12Pool, left: tuple, right: tuple) -> list:
     """`left` / `right` are (key, launcher_id, far_key) of the two adjacent slots."""
     return [pool.launcher_parent, pool.config(), pool.state[0], pool.state[1], pool.state[5],
+            pool.state[7], pool.extra.get("eve_coin_id", genesis_eve_id(pool)),
             (left[1], left[2]), (right[1], right[2]), left[0], right[0]]

@@ -14,6 +14,10 @@ conserves rather than assuming the precedent transfers.
 import sys
 
 sys.path.insert(0, ".")
+# This suite prints arrows. Windows consoles default to cp1252, which cannot encode
+# them, so the run dies on its own output and reads as a failing suite -- exactly the
+# kind of false red that teaches people to ignore a test list.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from chia.wallet.trading.offer import NotarizedPayment
 from chia_rs.sized_bytes import bytes32
