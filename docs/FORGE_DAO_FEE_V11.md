@@ -145,7 +145,7 @@ the check must be equality-with-one-exception:
 Anything looser — "next config is well-formed", "next config passes
 validate_config" — lets a spender swap in arbitrary weights, fees, asset ids,
 or a different `lp_tail_hash` under cover of a fee decrease. This is the same
-shape as a bug Forge has shipped before: the fatal pattern is validating the
+shape as the V4–V9 unbound-reserves bug: the fatal pattern is validating the
 successor for plausibility instead of validating it *against the
 predecessor*. Field-by-field equality, spelled out, no structural shortcuts.
 
