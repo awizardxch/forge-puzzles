@@ -162,6 +162,42 @@ def swap_case(label, pool, i_in, i_out, gross, ask_bps=9_900, expect_ok=True):
     return out
 
 
+def refund_at_real_rate(label, pool, i_in, i_out, gross, salt):
+    """The quote's safety margin costs the trader nothing, at the RATE WE CHARGE.
+
+    The case above runs the router at 0 bps, which cannot tell "the cap is applied
+    correctly" from "there is no cap". At 300 bps and paying XCH the fee comes off
+    the ENTRY, so the output side owes the router nothing and the whole payout --
+    the notarised floor plus the margin above it -- belongs to the trader.
+
+    This is worth pinning because the margin LOOKS like a fee on screen and the
+    obvious "saving" is to remove it. It is free: measured on chain 2026-09-13, a
+    settled split paid the trader two coins, 375,943 for the request and 1,132 for
+    the margin, totalling exactly the quote. Removing it would only trade a free
+    cushion for a hard refusal.
+    """
+    fee = {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}
+    a_in, a_out = pool.asset_ids[i_in], pool.asset_ids[i_out]
+    net = gross - gross * 300 // 10_000
+    r, w = pool.state[0], pool.weights
+    honest = v12.forge_math.swap_output(r[i_in], r[i_out], net, pool.fee_bps, w[i_in], w[i_out])
+    payout = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
+    want = payout * 97 // 100          # a deliberately wide margin under the payout
+    offer = fabricate_offer({a_in: gross}, {a_out: want}, salt=salt)
+    out = run({"action": "swap", "offer": offer.to_bech32(), "pool": v12.pool_to_snapshot(pool),
+               "current_height": H, "dev_fee": fee})
+    bundle = SpendBundle.from_json_dict(out["bundle"])
+    trader = paid_to(bundle, TRADER_PH, a_out)
+    check(f"  {label}: the margin is refunded, not kept", trader == payout,
+          f"trader {trader} of {payout}, asked {want}")
+    check(f"  {label}: the router takes nothing from the output",
+          paid_to(bundle, ROUTER_PH, a_out) == 0)
+    check(f"  {label}: the router took its rate from the ENTRY",
+          out["forge"]["router_fee_side"] == "input" and out["forge"]["router_fee"] == gross * 300 // 10_000,
+          f"{out['forge']['router_fee']} of {gross}")
+    return out
+
+
 def add_case(label, pool, pct, extra_xch=0, expect_ok=True):
     print(f"add on {label}: {pct}% of each reserve")
     snap, _ = snapshot_roundtrip(pool)
@@ -266,6 +302,10 @@ def main() -> int:
     swap_case("triple (weighted)", triple, 1, 2, 5_000)
     swap_case("pair, greedy trader", pair, 0, 1, 50_000_000, ask_bps=10_100, expect_ok=False)
     swap_case("pair, trader asks exactly the payout", pair, 0, 1, 50_000_000, ask_bps=10_000)
+
+    print("the safety margin at the rate we actually charge (300 bps, XCH in):")
+    refund_at_real_rate("pair", pair, 0, 1, 50_000_000, salt=0x7A)
+    refund_at_real_rate("triple", triple, 0, 1, 50_000_000, salt=0x7B)
 
     add_case("pair", pair, 5)
     add_case("cats (XCH rides only as backing)", cats, 5, extra_xch=1234)
