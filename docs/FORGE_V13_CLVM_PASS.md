@@ -391,4 +391,4 @@ one finding of the second review that does not reproduce (I-1, section 3).
 - [FORGE_PUZZLE_V13.md](FORGE_PUZZLE_V13.md) — the protocol reference this pass reads against.
 - [FORGE_V13_ARCHITECTURE.md](FORGE_V13_ARCHITECTURE.md) — the coin topology and the off-chain shape.
 - [FORGE_SECURITY_AUDIT.md](FORGE_SECURITY_AUDIT.md) — the findings log, including both external reviews.
-- [FORGE_DAO_FEE_V11.md](FORGE_DAO_FEE_V11.md) — the DAO-fee vectors section 7 checks off.
+- [FORGE_DAO_FEE_V13.md](FORGE_DAO_FEE_V13.md) — the DAO-fee design as built, with its threat model checked off.
