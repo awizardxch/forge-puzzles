@@ -16,7 +16,7 @@ report is worth more than a quiet fix either way.
 
 ## Scope
 
-**In scope: the revision in this repository.** `contracts/v12` is the shipping
+**In scope: the revision in this repository.** `contracts/v13` is the shipping
 pool, live on testnet11, and `contracts/vault_*.py` with `contracts/mips.py` is
 the lock. Those are what an audit should look at.
 
@@ -38,23 +38,23 @@ because a puzzle had been hashed but never executed.
 
 | Suite | What it establishes |
 |---|---|
-| `_test_v12_actions.py` | Every leaf, accepted and refused. Each refusal case is a claim about what the puzzle will not do. |
-| `_test_v12_manipulation.py` | The flash-loan analog: chained actions in one spend, the actor's end position priced at pre-sequence spot, never above the start. |
-| `_test_v12_curve_equivalence.py` | The curve against its mirror, thousands of cases. |
-| `_test_v12_integrity.py` | Built hex matches source; upstream pins hold byte-for-byte. |
-| `_test_v12_genesis.py` | The genesis mint is bound to one eve coin, so a launcher announcement cannot authorise a second. |
-| `_test_v12_consensus_timelocks.py` | Birth heights judged by the mempool's own `check_time_locks`, so a claimed height is checked the way a node checks it. |
-| `_test_v12_lp_receive_forgery.py` | An LP burn cannot be forged by emitting conditions that merely look like one; the pool's message is welded to the payout. |
-| `_test_v12_registry.py`, `_test_v12_dao_fee.py`, `_test_v12_multipool.py` | The registry, the monotonic fee decrease, routes across pools. |
+| `_test_v13_actions.py` | Every leaf, accepted and refused. Each refusal case is a claim about what the puzzle will not do. |
+| `_test_v13_manipulation.py` | The flash-loan analog: chained actions in one spend, the actor's end position priced at pre-sequence spot, never above the start. |
+| `_test_v13_curve_equivalence.py` | The curve against its mirror, thousands of cases. |
+| `_test_v13_integrity.py` | Built hex matches source; upstream pins hold byte-for-byte. |
+| `_test_v13_genesis.py` | The genesis mint is bound to one eve coin, so a launcher announcement cannot authorise a second. |
+| `_test_v13_consensus_timelocks.py` | Birth heights judged by the mempool's own `check_time_locks`, so a claimed height is checked the way a node checks it. |
+| `_test_v13_lp_receive_forgery.py` | An LP burn cannot be forged by emitting conditions that merely look like one; the pool's message is welded to the payout. |
+| `_test_v13_registry.py`, `_test_v13_dao_fee.py`, `_test_v13_multipool.py` | The registry, the monotonic fee decrease, routes across pools. |
 | `_test_mips.py` | The lock's composition against vectors generated from `chia-wallet-sdk` itself — Python compared against Chia's Rust, not against itself. |
 | `_test_vault_*.py` | The lock: policy, DIDs, offers, batches, NFTs. |
 
-`docs/FORGE_PUZZLE_V12.md` sets out what each leaf asserts and emits, and which
+`docs/FORGE_PUZZLE_V13.md` sets out what each leaf asserts and emits, and which
 test pins each refusal.
 
 ## Mutation testing
 
-`scripts/mutate-v12.py` deletes each assertion in turn, rebuilds, and re-runs the
+`scripts/mutate-v13.py` deletes each assertion in turn, rebuilds, and re-runs the
 suites. An assertion whose deletion changes nothing is either redundant or
 untested, and the two are worth telling apart.
 

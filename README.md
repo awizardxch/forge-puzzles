@@ -7,7 +7,7 @@ Everything here can move funds. That is the whole point of the split — the
 interface lives in a separate repository, so what is in front of you *is* the
 attack surface and nothing dilutes that claim.
 
-> **Status: testnet research. Unaudited.** V12 is live on testnet11 with 33
+> **Status: testnet research. Unaudited.** V13 is live on testnet11 with 32
 > pools, and every action a user can take — swap in either direction, deposit,
 > withdrawal, multi-hop route and split route — has settled on chain through the
 > same keyless responder the interface uses. It has still been reviewed by nobody
@@ -20,7 +20,7 @@ attack surface and nothing dilutes that claim.
 
 ```
 contracts/
-  v12/                 the shipping pool, a rue project
+  v13/                 the shipping pool, a rue project
     puzzles/           Forge's leaves, the finalizer, the curve
     puzzles/upstream/  CNI's CHIP-0050 puzzles, vendored verbatim
     compiled/          built hex and tree hashes
@@ -30,7 +30,7 @@ contracts/
 docs/                  protocol documents
 ```
 
-**Start at [`docs/FORGE_PUZZLE_V12.md`](docs/FORGE_PUZZLE_V12.md)**: coin layout,
+**Start at [`docs/FORGE_PUZZLE_V13.md`](docs/FORGE_PUZZLE_V13.md)**: coin layout,
 config and state, the prologue, the leaves, the finalizer, authorization, fees,
 the registry, and the change each of the CHIP-0062 review's findings asked for.
 
@@ -38,7 +38,7 @@ the registry, and the change each of the CHIP-0062 review's findings asked for.
 
 The pool is an action-layer singleton built on **CHIP-0050**. CNI's upstream
 `action`, `finalizer`, `slot` and `p2_delegated_by_singleton` are vendored
-verbatim and required to hash to the values in `contracts/v12/pins.json`; Forge
+verbatim and required to hash to the values in `contracts/v13/pins.json`; Forge
 adds five leaves (`swap`, `add`, `remove`, `collect`, `observe`, plus a DAO fee
 leaf) and a multi-reserve finalizer written from the upstream reserve finalizer.
 Reserves are bound by the finalizer rather than by hand-rolled announcements,
@@ -56,8 +56,8 @@ singleton authorises one at a time. See
 Needs [`rue`](https://github.com/rigidity/rue) 0.8.4 on PATH.
 
 ```bash
-python scripts/build-v12.py     # in the monorepo; rebuilds and re-checks the pins
-rue build --hex --hash --all .  # in contracts/v12, to build in place
+python scripts/build-v13.py     # in the monorepo; rebuilds and re-checks the pins
+rue build --hex --hash --all .  # in contracts/v13, to build in place
 ```
 
 `pins.json` records every upstream puzzle's tree hash **and** its source's
@@ -70,11 +70,11 @@ was bought the hard way: a DID once confirmed on chain and could never be spent,
 because a puzzle was hashed but never executed.
 
 ```bash
-python contracts/_test_v12_actions.py        # the leaves, accept and refuse
-python contracts/_test_v12_manipulation.py   # flash-loan-analog sequences
-python contracts/_test_v12_curve_equivalence.py
-python contracts/_test_v12_genesis.py        # the eve-bound genesis mint
-python contracts/_test_v12_consensus_timelocks.py  # birth heights, judged offline
+python contracts/_test_v13_actions.py        # the leaves, accept and refuse
+python contracts/_test_v13_manipulation.py   # flash-loan-analog sequences
+python contracts/_test_v13_curve_equivalence.py
+python contracts/_test_v13_genesis.py        # the eve-bound genesis mint
+python contracts/_test_v13_consensus_timelocks.py  # birth heights, judged offline
 python contracts/_test_mips.py               # against vectors from chia-wallet-sdk
 python contracts/_test_vault_policy.py       # the lock
 ```
@@ -90,7 +90,7 @@ what is in scope, what has been checked and what has not.
 - [`docs/FORGE_AUDIT_TIBETSWAP.md`](docs/FORGE_AUDIT_TIBETSWAP.md) — both public
   TibetSwap failures tested against these puzzles, with the mutation test that
   established which layer is actually load-bearing.
-- [`docs/FORGE_PUZZLE_V12.md`](docs/FORGE_PUZZLE_V12.md) — what each leaf
+- [`docs/FORGE_PUZZLE_V13.md`](docs/FORGE_PUZZLE_V13.md) — what each leaf
   asserts and emits, and which test pins each refusal.
 
 **Scope is the revision in this repository.** Retired revisions are not published

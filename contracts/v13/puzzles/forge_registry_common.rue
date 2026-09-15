@@ -1,0 +1,208 @@
+// forge_registry_common.rue -- shared by the Forge V13 registry leaves. Testnet research only; unaudited.
+//
+// The registry is a second CHIP-0050 singleton, one per network, with the
+// upstream default finalizer and no reserve. It holds one slot per registered
+// pool in an XCHandles-style sorted doubly-linked list keyed by the pool's
+// economic config, so a duplicate key cannot be inserted, and it is what the
+// frontend and router scan instead of the server and localStorage deployment
+// index that let retired pools reappear.
+//
+// The load-bearing function here is `pool_full_puzzle_hash`: from a launcher id
+// and a config it rebuilds EXACTLY the puzzle hash a genuine V13 pool's eve coin
+// carries -- reserve puzzle hashes, the multi-reserve finalizer curried with the
+// config binding, the six leaves and their merkle root in the wallet-sdk tree
+// shape, the eve state -- so `register` can assert the launcher actually created
+// that pool. Only V13 hashes are computable here, which is the revision gate: no
+// other revision can register.
+//
+// V13 also pins what the second audit found free: the protocol fee recipient, the
+// price scale and the oracle window are registry constants, not per-pool choices,
+// so a registrar cannot route the protocol fee to themselves under a market's key
+// or register a pool whose first spend exceeds the cost limit (M-3, L-3).
+
+import upstream::action::StateTruth;
+import forge_action_common::*;
+
+export inline const REGISTRY_SLOT_NONCE: Int = 0;
+export inline const POOL_SLOT_NONCE: Int = 1;
+// V13 (the second-audit revision) is protocol 14 on chain: a different state shape,
+// finalizer curry and admission rule, so a different registry.
+export inline const PROTOCOL_VERSION: Int = 14;
+
+export struct RegistryState {
+    initialized: Int,
+    pool_count: Int,
+}
+
+export struct RegistryOutput {
+    state_truth: StateTruth,
+    ...conditions: List<Condition>,
+}
+
+// Curried into every registry leaf. Everything a V12 pool is made of, plus the
+// gate and where its fee goes.
+export struct RegistryConstants {
+    action_layer_mod_hash: Bytes32,
+    p2_delegated_mod_hash: Bytes32,
+    slot_mod_hash: Bytes32,
+    reserve_finalizer_mod_hash: Bytes32,
+    reserve_amount_program_hash: Bytes32,
+    lp_tail_mod_hash: Bytes32,
+    leaves: LeafModHashes,
+    creation_fee: Int,
+    treasury_puzzle_hash: Bytes32,
+    // this registry's own slot first-curry hash (nonce 0) and hint (its launcher id)
+    slot_1st_curry_hash: Bytes32,
+    hint: Bytes32,
+    // V13: protocol parameters every registered pool must carry verbatim.
+    protocol_puzzle_hash: Bytes32,
+    price_scale: Int,
+    oracle_window: Int,
+}
+
+// A registered pool's slot value: (key . (launcher_id . (left_key . right_key))).
+export fn slot_value_hash(key: Bytes32, launcher_id: Bytes32, left_key: Bytes32, right_key: Bytes32) -> Bytes32 {
+    tree_hash((key, (launcher_id, (left_key, right_key))))
+}
+
+// The uniqueness key: the economic config. Two pools with the same assets,
+// weights, fees and DAO recipient are the same market, and the list admits one
+// of them; a different DAO may list its own pool of the same pair.
+export fn pool_key(config: PoolConfig) -> Bytes32 {
+    tree_hash([config.asset_ids, config.weights, config.fee_bps, config.protocol_fee_bps, config.dao_puzzle_hash])
+}
+
+export inline fn min_key() -> Bytes32 {
+    0x0000000000000000000000000000000000000000000000000000000000000000
+}
+
+export inline fn max_key() -> Bytes32 {
+    0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+}
+
+fn zeros(count: Int) -> List<Int> {
+    if count <= 0 {
+        nil
+    } else {
+        (0, zeros(count - 1))
+    }
+}
+
+fn all_positive(list: List<Int>) -> Bool {
+    if list is nil {
+        true
+    } else {
+        list.first > 0 && all_positive(list.rest)
+    }
+}
+
+export fn singleton_struct_hash(launcher_id: Bytes32) -> Bytes32 {
+    tree_hash((SINGLETON_MOD_HASH, (launcher_id, SINGLETON_LAUNCHER_PUZZLE_HASH)))
+}
+
+// p2_delegated_by_singleton curried with (SINGLETON_MOD_HASH, struct hash, nonce = asset index).
+fn reserve_inner_hash(c: RegistryConstants, struct_hash: Bytes32, index: Int) -> Bytes32 {
+    curry_tree_hash(c.p2_delegated_mod_hash, [
+        tree_hash_atom(SINGLETON_MOD_HASH),
+        tree_hash_atom(struct_hash),
+        tree_hash(index),
+    ])
+}
+
+fn reserve_inner_hashes(c: RegistryConstants, struct_hash: Bytes32, asset_ids: List<Bytes32>, index: Int) -> List<Bytes32> {
+    if asset_ids is nil {
+        nil
+    } else {
+        (reserve_inner_hash(c, struct_hash, index), reserve_inner_hashes(c, struct_hash, asset_ids.rest, index + 1))
+    }
+}
+
+fn reserve_full_hashes(asset_ids: List<Bytes32>, inner_hashes: List<Bytes32>) -> List<Bytes32> {
+    if asset_ids is nil {
+        nil
+    } else {
+        inline let (inner, remaining) = unchecked_cast::<(Bytes32, List<Bytes32>)>(inner_hashes);
+        (
+            if asset_ids.first == zero_bytes32() { inner } else { cat_puzzle_hash(asset_ids.first, inner) },
+            reserve_full_hashes(asset_ids.rest, remaining)
+        )
+    }
+}
+
+// The genesis state a V12 pool opens with: the reserves and LP the creator
+// funded, no fees owed, an oracle at height 0 with zero accumulators, a zero
+// prev_root, the opening DAO rate and nothing owed to the DAO.
+export fn eve_state_hash(reserves: List<Int>, total_lp: Int, asset_count: Int, dao_fee_bps: Int, reserve_parents: List<Bytes32>) -> Bytes32 {
+    // V12: the eve state carries the creation reserves' parent ids (finding P1, reserve receivers).
+    // V13: the oracle opens with a zero last_spot too.
+    tree_hash([reserves, total_lp, zeros(asset_count), [0, zeros(asset_count - 1), zeros(asset_count - 1)], zero_bytes32(), dao_fee_bps, zeros(asset_count), reserve_parents])
+}
+
+// EXACTLY the puzzle hash `make_pool` in the harness and the driver produce:
+// singleton_top_layer_v1_1 around the action layer curried with the
+// multi-reserve finalizer, the five-leaf root, and the eve state.
+export fn pool_full_puzzle_hash(
+    c: RegistryConstants,
+    launcher_id: Bytes32,
+    config: PoolConfig,
+    reserves: List<Int>,
+    total_lp: Int,
+    dao_fee_bps: Int,
+    reserve_parents: List<Bytes32>,
+) -> Bytes32 {
+    let struct_hash = singleton_struct_hash(launcher_id);
+    let n = count_bytes(config.asset_ids);
+    let inner_hashes = reserve_inner_hashes(c, struct_hash, config.asset_ids, 0);
+    let full_hashes = reserve_full_hashes(config.asset_ids, inner_hashes);
+
+    // the pool's own observation-slot first-curry hash (nonce 1)
+    let pool_slot_1st = curry_tree_hash(c.slot_mod_hash, [
+        tree_hash((SINGLETON_MOD_HASH, struct_hash)),
+        tree_hash(POOL_SLOT_NONCE),
+    ]);
+    let config_hash = tree_hash(config);
+    // V13: the finalizer carries the configuration binding in its first curry.
+    let finalizer_1st = curry_tree_hash(c.reserve_finalizer_mod_hash, [
+        tree_hash_atom(c.action_layer_mod_hash),
+        tree_hash(full_hashes),
+        tree_hash(inner_hashes),
+        c.reserve_amount_program_hash,
+        tree_hash_atom(launcher_id),
+        tree_hash_atom(config_hash),
+        tree_hash(c.leaves),
+        tree_hash_atom(pool_slot_1st),
+    ]);
+    let finalizer = curry_tree_hash(finalizer_1st, [tree_hash_atom(finalizer_1st)]);
+    // the same root the finalizer asserts on every spend
+    let root = config_root(c.leaves, config_hash, pool_slot_1st);
+
+    let inner = curry_tree_hash(c.action_layer_mod_hash, [
+        finalizer,
+        tree_hash_atom(root),
+        eve_state_hash(reserves, total_lp, n, dao_fee_bps, reserve_parents),
+    ]);
+    curry_tree_hash(SINGLETON_MOD_HASH, [struct_hash, inner])
+}
+
+// What the registry requires of a pool before it will list it. V10's
+// validate_config (carried), the LP asset id tied to THIS launcher, a genesis every
+// reserve of which is funded and whose supply exceeds the locked floor, and -- V13 --
+// the protocol parameters the registry pins.
+export fn valid_pool(c: RegistryConstants, launcher_id: Bytes32, config: PoolConfig, reserves: List<Int>, total_lp: Int, dao_fee_bps: Int) -> Bool {
+    valid_config(config)
+        && dao_fee_bps >= 0
+        && dao_fee_bps <= MAX_DAO_FEE_BPS
+        && (dao_fee_bps == 0 || config.dao_puzzle_hash != zero_bytes32())
+        && count_ints(reserves) == count_bytes(config.asset_ids)
+        && all_positive(reserves)
+        // V13: strictly above the floor, or the creator's own position has nothing to
+        // redeem (second audit, boundary); V12 had >=.
+        && total_lp > MIN_LOCKED_LP
+        && config.protocol_puzzle_hash == c.protocol_puzzle_hash
+        && config.price_scale == c.price_scale
+        && config.oracle_window == c.oracle_window
+        && config.lp_tail_hash == curry_tree_hash(c.lp_tail_mod_hash, [
+            tree_hash_atom(launcher_id),
+            tree_hash(PROTOCOL_VERSION),
+        ])
+}
