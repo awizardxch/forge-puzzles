@@ -4,7 +4,7 @@ Title         | The Forge: Weighted N-Asset AMM
 Description   | The Forge: a single-singleton AMM holding any number of assets at fixed weights, on CHIP-0050's action layer.
 Author        | [aWizard](https://github.com/awizardxch)
 Editor        | [Dan Perry](https://github.com/danieljperry)
-Comments-URI  | [CHIPs repo, PR #217](https://github.com/Chia-Network/chips/pull/192)
+Comments-URI  | [CHIPs repo, PR #217](https://github.com/Chia-Network/chips/pull/217)
 Status        | Draft
 Category      | Informational
 Sub-Category  | Puzzle
@@ -31,7 +31,7 @@ This CHIP describes **the Forge**, a weighted constant-function market maker in 
 
 **Why this is its own CHIP.** CHIP-0050 anticipates it: the action layer's reference implementation carries several dApps built on it - CATalog, XCHandles, the Reward Distributor - and states that they "will have their own subsequent CHIPs." The Forge is such a dApp. This proposal documents one application of the action layer rather than proposing a change to it.
 
-**Feasibility.** It is implemented and running. A reference implementation is deployed on testnet11 with twenty pools of varying shapes, and the puzzle is built from CHIP-0050's upstream action layer and finalizer with no changes to either. Nothing in this proposal requires a consensus change or a soft fork; it is a puzzle that any wallet can already spend.
+**Feasibility.** It is implemented and running. A reference implementation is deployed on testnet11 with thirty-three pools of varying shapes, and the puzzle is built from CHIP-0050's upstream action layer and finalizer with no changes to either. Nothing in this proposal requires a consensus change or a soft fork; it is a puzzle that any wallet can already spend.
 
 ## Backwards Compatibility
 
@@ -88,14 +88,17 @@ No endorsement by CHIP-0050's author or by CNI is claimed or implied; the design
 A Forge pool is:
 
 * one **singleton**, whose inner puzzle is the CHIP-0050 action layer curried with a merkle root over the pool's leaves and the pool's configuration;
+* a **finalizer** curried with the configuration's hash and the leaf module hashes, which recomputes the merkle root from them and asserts it against the action layer's on every spend;
 * one **reserve coin per asset**, each a `p2_delegated_by_singleton` coin (XCH) or a CAT wrapping one (CATs), controlled solely by that singleton;
 * one **LP CAT**, whose TAIL permits issuance and melt only on a message from the pool singleton.
 
 ### Configuration and state
 
-**Configuration** is curried and therefore immutable for the life of a pool: asset ids in canonical order, the weight of each, the trade fee in basis points (`fee_bps`), the protocol fee in basis points (`protocol_fee_bps`, denominator 10,000, at most 100), the LP TAIL hash, and the DAO recipient's puzzle hash. The reference implementation uses the same names and the same denominator.
+**Configuration** is curried and therefore immutable for the life of a pool: asset ids in canonical order, the weight of each, the trade fee in basis points (`fee_bps`), the protocol fee in basis points (`protocol_fee_bps`, denominator 10,000, at most 100), the protocol fee recipient, the LP TAIL hash, the oracle's price scale and window, and the DAO recipient's puzzle hash. The reference implementation uses the same names and the same denominator. Both oracle parameters MUST be bounded, so that a pool cannot be created whose first spend exceeds the block cost limit, or whose inclusion window is unbounded.
 
-**State** is committed by the finalizer into each successor: the reserve balance per asset, total LP outstanding, fees owed per asset, the DAO rate and DAO owed per asset, the oracle accumulator with its last height, the previous state root, and the parent coin id of each reserve. That last field is written by the finalizer from the reserve coins it has just messaged and is never read from a solution, so no solution can name a coin the pool should treat as a reserve.
+**State** is committed by the finalizer into each successor: the reserve balance per asset, total LP outstanding, fees owed per asset, the DAO rate and DAO owed per asset, the oracle accumulator with its last height and the spot prices it last credited, the previous state root, and the parent coin id of each reserve. That last field is written by the finalizer from the reserve coins it has just messaged and is never read from a solution, so no solution can name a coin the pool should treat as a reserve.
+
+**One configuration per pool coin.** The action layer proves that each leaf a spend runs is a member of the merkle root. It does not say that the leaves agree with one another: six leaves curried with six different configurations form a perfectly valid root, and each leaf then validates only its own. A conforming implementation MUST therefore bind the whole leaf set to one configuration at the coin level, by currying the configuration's hash and the leaf module hashes into the finalizer, recomputing the root from them, and asserting it equals the root the action layer carries. Without that binding, a pool whose `remove` leaf names a different LP TAIL than its other leaves will release its reserves against a worthless self-minted asset, and nothing on the coin distinguishes such a pool from a genuine one. The binding cannot prevent an unrelated puzzle from existing, and is not meant to: what it provides is legibility. The leaf module hashes and the configuration hash sit in the finalizer's curry in the clear, so a verifier reads them off the coin and compares them with the published set, and a pool that does not match is no longer impersonating a conforming one. A registry that recomputes the root from a single configuration protects the pools it lists; the binding lets anyone perform the same check on a pool that is not listed.
 
 ### The invariant
 
@@ -113,24 +116,28 @@ across a swap, net of fees. A swap supplying `x` of asset `i` and claiming `y` o
 |---|---|
 | `swap` | One reserve rises, one falls. Requires a positive input and a positive claimed output, distinct in-range asset indices, and an exact invariant match. The protocol and DAO slices are taken from the output and accrued in state. |
 | `add` | Deposits to one or more reserves, minting LP. Requires a positive LP delta, non-negative deposits, and at least one positive deposit. |
-| `remove` | Burns LP and pays a proportional share of every reserve. Requires the burn to be positive and to leave at least `MIN_LOCKED_LP` (1,000 units) outstanding, so the pool outlives every withdrawal. The minimum is locked at genesis and is the creator's; every later holder can redeem every unit they hold. |
+| `remove` | Burns LP and pays a proportional share of every reserve. Requires the burn to be positive and to leave at least `MIN_LOCKED_LP` (1,000 units) outstanding, so the pool outlives every withdrawal. The floor is on total supply, not on any particular holding, so the genesis mint MUST place that minimum beyond recovery and registration MUST verify that it did: see Registry. |
 | `collect` | Pays accrued protocol and DAO balances to their recipients. |
 | `observe` | Advances the oracle accumulator without moving value. |
 | DAO fee | Lowers the DAO rate on a message from the configured recipient. The new rate MUST be strictly lower than the current one. |
 
 One or more leaves may run in a single spend; the action layer threads state from each to the next, and the finalizer commits the last. A spend that runs no leaf is refused: the action layer asserts a non-empty action list, so the pool cannot be re-created without at least one action having been checked.
 
-The first leaf of a spend runs a prologue that pins the spend to a height: it asserts the claimed height `h` as an absolute height with a window for inclusion, and it asserts the pool coin's own birth height (`ASSERT_MY_BIRTH_HEIGHT`). The oracle accumulates the pre-spend price over `h − birth`, the interval in which the pre-spend state was actually in force. A claimed `h` can understate that interval by at most the window; it cannot fabricate it, and a successor created and spent in the same block accumulates nothing.
+The first leaf of a spend runs a prologue that pins the spend to a height: it asserts the claimed height `h` as an absolute height with a window for inclusion, and it asserts the pool coin's own birth height (`ASSERT_MY_BIRTH_HEIGHT`). It MUST also require `birth > last_height` and `h >= birth`. Both hold for every real chain of spends, because a claimed height is checked against the previous transaction block while the coin it creates is born in a later one, and together they make the two intervals below non-negative. They also close the cross-generation case outright: a successor created in the block being made cannot be spent in it, since the largest legal `h` is the previous transaction block's height while the successor's birth is one greater, so `h >= birth` has no solution.
+
+A spend is signed at one height and included at another, and the state it replaces stays in force until the block that includes it. An oracle that credits only `h - birth` therefore loses the blocks between the previous spend's claimed height and its inclusion, and loses them permanently once `last_height` has moved past them. A party spending at `h = birth` every time can hold the accumulator still while real blocks pass, and a pool spent honestly in every transaction block does the same by accident. A conforming implementation MUST credit both intervals: the previous state over `(last_height, birth]` at the spot price that state recorded, and the current state over `[birth, h]` at the spot price on the pre-spend reserves. State therefore carries the last credited spot alongside the accumulator. Every block between two consecutive claimed heights is then credited exactly once, at the price in force during it; understating `h` defers credit to the next spend rather than destroying it; and no height can fabricate credit, because `birth` is a consensus fact and `h` cannot exceed the block that includes the spend.
 
 ### Authorization
 
-Every reserve release and every LP mint or melt is a CHIP-0025 `SendMessage` with
-mode `SENDER_PUZZLE | RECEIVER_COIN`. The receiver's coin id MUST be derived by
-the pool from values it already holds, and MUST NOT be taken from the solution. A conforming implementation therefore cannot be satisfied by a substituted coin.
+Every reserve release and every LP mint or melt is a CHIP-0025 `SendMessage` with mode `SENDER_PUZZLE | RECEIVER_COIN`. The receiver's coin id MUST be derived by the pool from values it already holds, and MUST NOT be taken from the solution. A conforming implementation therefore cannot be satisfied by a substituted coin.
 
 ### Registry
 
-Pools register in a sorted on-chain registry keyed by the canonical asset set, the weights, the fee parameters and the DAO recipient, so that one market cannot exist twice under the same parameters. Registration is a singleton spend that proves the key's position in the sort order, requires the genesis supply to be at least `MIN_LOCKED_LP`, and asserts the launcher's creation announcement with the key-value list `(total_lp, eve_coin_id)`. The LP TAIL's genesis branch asserts that same list with its own coin id, so exactly one eve coin can mint the genesis supply and the supply it mints is the one the registry recorded.
+Pools register in a sorted on-chain registry keyed by the canonical asset set, the weights, the fee parameters and the DAO recipient, so that one market cannot exist twice under the same parameters. Registration is a singleton spend that proves the key's position in the sort order, requires the genesis supply to exceed `MIN_LOCKED_LP`, and asserts the launcher's creation announcement with the key-value list `(total_lp, eve_coin_id)`. The LP TAIL's genesis branch asserts that same list with its own coin id, so exactly one eve coin can mint the genesis supply and the supply it mints is the one the registry recorded.
+
+The key describes a market, so it carries the parameters that make one: the assets, the weights, the fee rates and the DAO recipient. The remaining configuration values are protocol parameters rather than market parameters, and a registry MUST pin them to its own constants rather than accept a registrant's choice. Chief among them is the protocol fee recipient. Were it free, a registrant could occupy a market's key with a pool that pays the protocol fee to themselves, and two pools differing only in who is paid would collide on one key.
+
+The genesis mint MUST place `MIN_LOCKED_LP` beyond recovery, in the same transaction that mints it, and registration MUST verify that it did. The pool itself cannot: the puzzle sees a total supply and a burn, never who holds which unit, so it can only require that `MIN_LOCKED_LP` remains outstanding. If the minimum were instead retained by the creator, it would be a transferable CAT holding that can never be burned, and its eventual holder would be in exactly the position this rule exists to prevent. The registry can verify it, because the genesis supply passes through a settlement whose payments are announced: `register` asserts the announcement of a payment of `MIN_LOCKED_LP` to a puzzle hash with no preimage, under the launcher id as nonce. Only the TAIL's genesis branch can create that asset, so the same assertion proves the mint happened rather than merely that it was authorized. The burned units remain a claim on the reserves, and that claim belongs to nobody, which is what makes every later holder's position redeemable in full.
 
 ## Test Cases
 
@@ -144,7 +151,7 @@ The reference implementation's suites are listed under **Additional Assets**. Th
 
 ## Reference Implementation
 
-The reference implementation is **the Forge**, published at <https://github.com/awizardxch/forge-puzzles>. It contains the pool puzzle and its leaves, the multi-reserve finalizer, the registry, the LP CAT's TAIL, and the suites that exercise all of them. A complete deployment is running on testnet11 with twenty pools of varying shapes and weights.
+The reference implementation is **the Forge**, published at <https://github.com/awizardxch/forge-puzzles>. It contains the pool puzzle and its leaves, the multi-reserve finalizer, the registry, the LP CAT's TAIL, and the suites that exercise all of them. A complete deployment is running on testnet11 with a matrix of pools of varying shapes and weights, and every action a user can take - swap, deposit, withdrawal, multi-hop route and split route - has settled on chain through a wallet-signed Offer handed to the keyless router.
 
 The off-chain half - the keyless router that settles Offers against a pool, the quoting, and the interface at forge.awizard.dev - lives in a separate repository and is outside this proposal's scope.
 
@@ -174,7 +181,7 @@ Per CHIP-0001 the reference implementation need not be complete to enter _Draft_
 | A decoy reserve coin substituted for the real one | Reserve parent ids live in state, written by the finalizer; the solution has no field for them |
 | An LP token used against a pool of a different revision | The TAIL asserts the protocol version |
 | Two pools claiming the same market | The sorted registry |
-| Oracle manipulation within one spend, or across generations in one bundle | The accumulator advances on pre-spend prices over `h − birth`, with the pool coin's birth height asserted by consensus and the height pinned across every action in a bundle |
+| Oracle manipulation within one spend, or across generations in one bundle | The accumulator advances on pre-spend prices over `h - birth`, with the pool coin's birth height asserted by consensus and the height pinned across every action in a bundle |
 
 **Guidance for implementers.** Derive every receiver. Bracket exactly. Treat any value taken from the solution as hostile until it has been checked against committed state. And test refusals at least as heavily as acceptances: in this project's experience, and in the publicly documented failures of others, the bug is never in the path that was exercised.
 
@@ -184,9 +191,7 @@ Per CHIP-0001 the reference implementation need not be complete to enter _Draft_
 
 These live alongside the reference implementation, in the public [`forge-puzzles`](https://github.com/awizardxch/forge-puzzles) repository, so that the specification and the code it describes cannot drift apart.
 
-* Full protocol specification - [`FORGE_PUZZLE_V11.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_PUZZLE_V11.md)
-* Architecture, with diagrams - [`FORGE_V11_ARCHITECTURE.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_V11_ARCHITECTURE.md)
-* Written CLVM pass over every leaf - [`FORGE_V11_CLVM_PASS.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_V11_CLVM_PASS.md)
+* Full protocol specification, with what each leaf asserts and which test pins each refusal - [`FORGE_PUZZLE_V12.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_PUZZLE_V12.md)
 * Security notes and scope - [`FORGE_SECURITY.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_SECURITY.md)
 * Comparison against publicly documented AMM failures - [`FORGE_AUDIT_TIBETSWAP.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_AUDIT_TIBETSWAP.md)
 * Reference implementation and test suites - <https://github.com/awizardxch/forge-puzzles>
@@ -195,6 +200,9 @@ If the Editor would rather these were carried in this repository, they can be co
 
 ## Revision History
 
+* **Revision 5 (2026-09-14).** In response to a second independent review of the reference implementation, which tested configuration and registry admission rather than the single well-formed pool the first review exercised. Three changes are normative. An implementation must bind its whole leaf set to one configuration at the coin level, because the action layer proves a leaf's membership of the root and not the leaves' agreement with each other, and a pool assembled from leaves of differing configurations releases its reserves against an asset of the attacker's choosing. The oracle must credit the interval between a spend's claimed height and its inclusion, at the price in force during it, rather than discarding it; the previous text's claim that a claimed height can understate the interval by at most the window was wrong in the case where it understates it to nothing. And registration must verify the genesis burn rather than only require it in prose, which it can do because the genesis supply passes through a settlement whose payments are announced. Alongside those: the genesis supply must exceed the locked minimum rather than merely reach it, the protocol fee recipient and the oracle parameters are pinned by the registry rather than chosen by the registrant, and both oracle parameters are bounded.
+* **Revision 4 (2026-09-14).** Two corrections from an automated review of revision 3, both to the text rather than the design. The oracle paragraph described `h - birth` without stating the `h >= birth` assertion that keeps it non-negative, and said a same-block successor accumulates nothing; it cannot be spent at all, because `ASSERT_HEIGHT_ABSOLUTE` is checked against the previous transaction block while such a coin's birth is one higher. Both are now stated. Separately, `remove`'s row claimed the locked minimum is the creator's and that every later holder can redeem in full; the floor is on total supply, so that only holds if the minimum is put beyond recovery at genesis, which is now normative and explained in Specification.
+* **Revision 3 (2026-09-13).** Housekeeping against the review, no design change. The Additional Assets list pointed at three documents that the reference repository no longer carries: the retired revision's specification, architecture and CLVM pass were withdrawn from it when the shipping revision replaced them, so the list now names the one specification that exists. Comments-URI named the wrong pull request. The deployment is thirty-three pools rather than twenty, and every action a user can take has now settled on chain through a wallet-signed Offer handed to the keyless router, which was not yet true when revision 2 was written.
 * **Revision 2 (2026-09-11).** In response to the Draft review by CNI (four P1 findings and one P0, two of them reproduced with accepted spend bundles against the reference implementation's previous revision): the genesis announcement now names the eve coin; oracle elapsed time is measured from the pool coin's asserted birth height; a minimum liquidity is locked at genesis and enforced at registration and in `remove`; reserve parent ids moved from the finalizer's solution into state. The protocol fee's unit is corrected to basis points, and the non-empty action list is stated. The reference implementation's previous revision was never deployed to mainnet; its testnet liquidity was withdrawn and the pools re-created under the revised puzzles.
 * **Revision 1 (2026-09-11).** Editor's formatting, fee-unit correction, non-empty action sentence.
 * **Revision 0 (2026-09-10).** Submitted.

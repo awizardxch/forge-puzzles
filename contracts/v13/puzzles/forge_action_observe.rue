@@ -1,0 +1,54 @@
+// forge_action_observe.rue -- Forge V13 `observe` leaf. Testnet research only; unaudited.
+//
+// Snapshots the oracle. The prologue has already accumulated the pre-spend
+// price up to `h`; this leaf writes (h . cums) into an observation slot (nonce
+// 1, upstream slot.rue, hinted with the slot's own first-curry hash as upstream
+// does) and ANNOUNCES it, so any coin in the same bundle can assert the value.
+// A same-bundle consumer holding an earlier observation computes
+// TWAP = (cum - cum_past) / (h - h_past).
+//
+// An announcement rather than a message, settled 09-05: a message must name its
+// receiver and fails the spend if nothing receives it, so an observe with no
+// consumer present could never land. The announcement is one-directional.
+//
+// solution: h
+//
+// State is unchanged beyond the prologue. Reading back a past slot in the same
+// action is not implemented in this revision; the slot is created for a future
+// consumer to spend by message.
+
+import upstream::action::StateTruth;
+import forge_action_common::*;
+
+fn main(
+    CONFIG: PoolConfig,
+    SLOT_1ST_CURRY_HASH: Bytes32,
+    truth: StateTruth,
+    h: Int,
+    birth: Int,
+) -> ActionOutput {
+    let p = prologue(CONFIG, truth, h, birth);
+    let value_hash = tree_hash((p.height, p.state.oracle.cums));
+
+    ActionOutput {
+        state_truth: StateTruth {
+            ephemeral_state: p.height,
+            actual_state: p.state,
+        },
+        conditions: concat(
+            p.conditions,
+            [
+                CreateCoin {
+                    puzzle_hash: curry_tree_hash(SLOT_1ST_CURRY_HASH, [tree_hash_atom(value_hash)]),
+                    amount: 0,
+                    memos: Memos {
+                        value: [SLOT_1ST_CURRY_HASH],
+                    },
+                },
+                CreatePuzzleAnnouncement {
+                    message: tree_hash(["forge-observe-v1", p.height, p.state.oracle.cums]),
+                },
+            ],
+        ),
+    }
+}

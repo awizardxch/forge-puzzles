@@ -1,0 +1,271 @@
+// forge_multi_reserve_finalizer.rue -- Forge V13. Testnet research only; unaudited.
+//
+// Derived from reserve_finalizer.rue by yakuhito (Yakuhito/slot-machine @ 2d37ba1,
+// vendored verbatim under upstream/). That finalizer manages ONE reserve whose
+// amount is the first item in the state. A Forge pool holds one reserve coin per
+// asset, up to ten, so this generalizes it in exactly two places and nowhere else:
+//
+//   * the reserve marker carries an index: an action tags a condition for reserve
+//     i as (-42 i . condition). Upstream strips on -42 alone; this strips on -42
+//     and reads the index. An index outside 0..N-1 FAILS the spend -- it is never
+//     dropped into the base bucket, where it would run against the singleton.
+//   * one SEND_MESSAGE per reserve, every spend, touched or not. The receiver is
+//     derived from the reserve's parent id (solution), its curried full puzzle
+//     hash, and its PRE-SPEND amount read from the Truth -- never from anything an
+//     action returned -- so an action cannot aim a message at a coin that is not
+//     the current reserve. A wrong or missing parent id produces a receiver that
+//     exists nowhere and fails the bundle; it cannot misdirect funds.
+//   * V13: the merkle root is asserted, every spend, to be the six-leaf root of ONE
+//     configuration (forge_action_common::config_root). The action layer proves each
+//     leaf is behind the root; nothing in it says the leaves agree with each other,
+//     and six leaves of six configs made a valid root -- a `remove` curried with a
+//     foreign LP TAIL drained an unregistered pool in the second audit (M-4). Now a
+//     pool at this finalizer runs only leaves of the configuration it was curried
+//     with, registered or not.
+//
+// Everything else is upstream's shape: the singleton is re-created at the action
+// layer curried with this finalizer's own hash, the merkle root and the new state;
+// base conditions pass through; the message is the tree hash of the delegated
+// puzzle (1 . conditions) the reserve's p2_delegated_by_singleton will run.
+//
+// What this puzzle deliberately does NOT decide: how much each reserve holds. The
+// amount program is curried, and Forge's (forge_reserve_amount.rue) reads
+// reserves[i] + fees_owed[i] from the state. Conservation -- payouts plus the
+// recreated reserve equal to what the reserve held -- is enforced by the reserve
+// coin itself when it runs the delegated puzzle, and the curve actions are what
+// make the state honest. Nothing here assumes anything about the LP:reserve ratio.
+
+import upstream::action::StateTruth;
+import upstream::finalizer::*;
+import forge_action_common::ForgeState;
+import forge_action_common::LeafModHashes;
+import forge_action_common::config_root;
+
+// Upstream's marker, not ours. Kept so an action written against the reserve
+// finalizer's convention reads the same way here.
+inline const RESERVE_TAG: Int = -42;
+
+// (state, index) -> the amount reserve `index` must hold under `state`.
+type ReserveAmountProgram = fn(state: Any, index: Int) -> Int;
+
+fn count(list: List<Bytes32>) -> Int {
+    if list is nil {
+        0
+    } else {
+        1 + count(list.rest)
+    }
+}
+
+fn concat(left: List<Condition>, right: List<Condition>) -> List<Condition> {
+    if left is nil {
+        right
+    } else {
+        (left.first, concat(left.rest, right))
+    }
+}
+
+// Walk every action's conditions once. Untagged conditions go to `base`, tagged
+// ones are kept as (index . condition) for the per-reserve pass below.
+fn split_conditions(
+    list_of_lists: List<List<Condition>>,
+    base: List<Condition>,
+    tagged: List<(Int, Condition)>,
+) -> (List<Condition>, List<(Int, Condition)>) {
+    inline let (first_thing, the_rest) = unchecked_cast::<(List<Condition>, List<List<Condition>>)>(list_of_lists);
+    if first_thing is nil {
+        if the_rest is nil {
+            (base, tagged)
+        } else {
+            split_conditions(the_rest, base, tagged)
+        }
+    } else {
+        inline let (opcode, payload) = unchecked_cast::<(Int, Any)>(first_thing.first);
+        if opcode == RESERVE_TAG {
+            split_conditions(
+                (first_thing.rest, the_rest),
+                base,
+                (unchecked_cast::<(Int, Condition)>(payload), tagged),
+            )
+        } else {
+            split_conditions(
+                (first_thing.rest, the_rest),
+                (first_thing.first, base),
+                tagged,
+            )
+        }
+    }
+}
+
+// Every tagged index names a real reserve. Anything else fails the whole spend.
+fn indices_in_range(tagged: List<(Int, Condition)>, reserve_count: Int) -> Bool {
+    if tagged is nil {
+        true
+    } else {
+        let index = tagged.first.first;
+        index >= 0 && index < reserve_count && indices_in_range(tagged.rest, reserve_count)
+    }
+}
+
+fn conditions_for(index: Int, tagged: List<(Int, Condition)>) -> List<Condition> {
+    if tagged is nil {
+        nil
+    } else if tagged.first.first == index {
+        (tagged.first.rest, conditions_for(index, tagged.rest))
+    } else {
+        conditions_for(index, tagged.rest)
+    }
+}
+
+// V12: the id of each current reserve coin, from the pre-spend state's parents.
+fn reserve_coin_ids(
+    index: Int,
+    full_hashes: List<Bytes32>,
+    parent_ids: List<Bytes32>,
+    amount_program: ReserveAmountProgram,
+    initial_state: Any,
+) -> List<Bytes32> {
+    if full_hashes is nil {
+        assert parent_ids is nil;
+        nil
+    } else {
+        inline let (parent_id, remaining) = unchecked_cast::<(Bytes32, List<Bytes32>)>(parent_ids);
+        (
+            coinid(parent_id, full_hashes.first, amount_program(initial_state, index)),
+            reserve_coin_ids(index + 1, full_hashes.rest, remaining, amount_program, initial_state)
+        )
+    }
+}
+
+// One message per reserve, in asset order. The three curried-or-solved lists walk
+// in step; a parent-id list of the wrong length fails rather than being padded.
+fn reserve_messages(
+    index: Int,
+    full_hashes: List<Bytes32>,
+    inner_hashes: List<Bytes32>,
+    parent_ids: List<Bytes32>,
+    amount_program: ReserveAmountProgram,
+    initial_state: Any,
+    new_state: Any,
+    tagged: List<(Int, Condition)>,
+    hint: Bytes32,
+) -> List<Condition> {
+    if full_hashes is nil {
+        assert inner_hashes is nil;
+        assert parent_ids is nil;
+        nil
+    } else {
+        // Lists of the wrong length fail here: `first` of nil raises.
+        inline let (inner_hash, remaining_inner_hashes) = unchecked_cast::<(Bytes32, List<Bytes32>)>(inner_hashes);
+        inline let (parent_id, remaining_parent_ids) = unchecked_cast::<(Bytes32, List<Bytes32>)>(parent_ids);
+        let recreate = CreateCoin {
+            puzzle_hash: inner_hash,
+            amount: amount_program(new_state, index),
+            memos: Memos {
+                value: [hint],
+            },
+        };
+        (
+            SendMessage {
+                mode: SENDER_PUZZLE | RECEIVER_COIN,
+                // The delegated puzzle the reserve runs is (q . conditions); this
+                // is its tree hash, so the reserve accepts exactly these
+                // conditions and nothing else.
+                message: tree_hash((1, (recreate, conditions_for(index, tagged)))),
+                receiver: [
+                    coinid(
+                        parent_id,
+                        full_hashes.first,
+                        // Pre-spend amount, from the truth. Never from an action.
+                        amount_program(initial_state, index),
+                    )
+                ],
+            },
+            reserve_messages(
+                index + 1,
+                full_hashes.rest,
+                remaining_inner_hashes,
+                remaining_parent_ids,
+                amount_program,
+                initial_state,
+                new_state,
+                tagged,
+                hint,
+            )
+        )
+    }
+}
+
+fn main(
+    ACTION_LAYER_MOD_HASH: Bytes32,
+    RESERVE_FULL_PUZZLE_HASHES: List<Bytes32>,
+    RESERVE_INNER_PUZZLE_HASHES: List<Bytes32>,
+    RESERVE_AMOUNT_PROGRAM: ReserveAmountProgram,
+    HINT: Bytes32,
+    // V13: the one configuration every leaf must be curried with (its tree hash), the six
+    // leaf mod hashes, and the observe leaf's slot hash -- enough to rebuild the root.
+    CONFIG_HASH: Bytes32,
+    LEAVES: LeafModHashes,
+    POOL_SLOT_1ST_CURRY_HASH: Bytes32,
+    // 2nd curry
+    FINALIZER_SELF_HASH: Bytes32,
+    Truth: FinalizerTruths,
+    last_action_output: (StateTruth, List<List<Condition>>),
+) -> List<Condition> {
+    // V13: one configuration per pool coin (second audit M-4).
+    assert Truth.Merkle_Root == config_root(LEAVES, CONFIG_HASH, POOL_SLOT_1ST_CURRY_HASH);
+    let (base_conditions, tagged) = split_conditions(last_action_output.rest, nil, nil);
+    assert indices_in_range(tagged, count(RESERVE_FULL_PUZZLE_HASHES));
+
+    inline let new_state = last_action_output.first.actual_state;
+
+    // V12: reserve parents come from the pre-spend STATE, never the solution, and the
+    // successor records the coins messaged here as the next parents. A decoy at the
+    // reserve's puzzle hash can no longer be named -- CHIP-0062 review P1.
+    let old_state = unchecked_cast::<ForgeState>(Truth.State);
+    let parent_ids = old_state.reserve_parents;
+    let current_ids = reserve_coin_ids(0, RESERVE_FULL_PUZZLE_HASHES, parent_ids, RESERVE_AMOUNT_PROGRAM, Truth.State);
+    let ns = unchecked_cast::<ForgeState>(new_state);
+    let committed_state = ForgeState {
+        reserves: ns.reserves, total_lp: ns.total_lp, fees_owed: ns.fees_owed, oracle: ns.oracle,
+        prev_root: ns.prev_root, dao_fee_bps: ns.dao_fee_bps, dao_owed: ns.dao_owed,
+        reserve_parents: current_ids,
+    };
+
+    let recreate_singleton = CreateCoin {
+        puzzle_hash: curry_tree_hash(
+            ACTION_LAYER_MOD_HASH,
+            [
+                curry_tree_hash(
+                    FINALIZER_SELF_HASH,
+                    [
+                        tree_hash_atom(FINALIZER_SELF_HASH),
+                    ]
+                ), // finalizer puzzle hash
+                tree_hash_atom(Truth.Merkle_Root),
+                tree_hash(committed_state)
+            ]
+        ), // new inner ph
+        amount: 1,
+        memos: Memos {
+            value: [HINT],
+        }
+    };
+
+    (
+        recreate_singleton,
+        concat(
+            reserve_messages(
+                0,
+                RESERVE_FULL_PUZZLE_HASHES,
+                RESERVE_INNER_PUZZLE_HASHES,
+                parent_ids,
+                RESERVE_AMOUNT_PROGRAM,
+                Truth.State,
+                committed_state,
+                tagged,
+                HINT,
+            ),
+            base_conditions,
+        )
+    )
+}

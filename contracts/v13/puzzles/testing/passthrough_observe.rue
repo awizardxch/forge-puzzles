@@ -1,0 +1,29 @@
+// passthrough_observe.rue -- the TEST leaf for the observe position, never shipped.
+//
+// The observe leaf is curried with (config, slot first-curry hash), so the six-leaf
+// root the V13 finalizer asserts curries two values into position 3. This is the
+// passthrough leaf with that arity, so a test pool built on passthroughs has a root
+// the finalizer accepts. Behaviour is passthrough_action's.
+
+import super::upstream::action::StateTruth;
+
+struct Output {
+    state_truth: StateTruth,
+    ...conditions: List<Condition>,
+}
+
+fn main(
+    _config: Any,
+    _slot_1st_curry_hash: Any,
+    truth: StateTruth,
+    new_state: Any,
+    ...conditions: Any,
+) -> Output {
+    Output {
+        state_truth: StateTruth {
+            ephemeral_state: truth.ephemeral_state,
+            actual_state: new_state,
+        },
+        conditions: unchecked_cast::<List<Condition>>(conditions),
+    }
+}

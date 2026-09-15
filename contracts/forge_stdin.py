@@ -43,18 +43,15 @@ from forge_split_swap import SplitBranchSpec, build_split_swap
 from forge_flow_balance import FlowLegSpec, build_flow_balance
 from forge_routed_deposit import DepositSale, build_routed_deposit
 from forge_transition import build_transition
-import forge_v11_offer as off11
-import forge_v11_route as rt11
-import forge_v11_create as cre11
-import forge_v11_driver as drv11
-import forge_v12_offer as off12
-import forge_v12_route as rt12
-import forge_v12_create as cre12
-import forge_v12_driver as drv12
+import forge_v13_offer as off13
+import forge_v13_route as rt13
+import forge_v13_create as cre13
+import forge_v13_driver as drv13
 
 # One lane per protocol revision: (offer, route, create, driver). A request picks its lane by
-# its own protocol_version or its pool snapshots'; a bundle never mixes revisions.
-_LANES = {12: (off11, rt11, cre11, drv11), 13: (off12, rt12, cre12, drv12)}
+# its own protocol_version or its pool snapshots'; a bundle never mixes revisions. V13
+# (protocol 14) is the only live lane: V11.1 (12) and V12 (13) were drained and retired.
+_LANES = {14: (off13, rt13, cre13, drv13)}
 
 
 def _lane_version(payload: dict) -> int:
@@ -391,7 +388,7 @@ def _lane_pool(snapshot: dict[str, Any]):
     """Every pool on a route is of one revision; the snapshot says which lane rebuilds it."""
     lane = _LANES.get(int(snapshot.get("protocol_version") or 0))
     if lane is None or not lane[0].is_pool_snapshot(snapshot):
-        raise ValueError("a route can only be built from pools of one supported revision (12 or 13)")
+        raise ValueError("a route can only be built from pools of one supported revision (14)")
     return lane[0].snapshot_to_pool(snapshot)
 
 
@@ -523,13 +520,13 @@ def _creation_config(payload: dict[str, Any], cre) -> "cre.CreationConfig":
     total_lp = int(cfg.get("total_lp") or (min(reserves) * int(cfg.get("lp_ratio") or 1)))
     fee_bps = int(cfg.get("fee_bps", 30))
     # a name or symbol left empty is derived the way every pool's default is
-    import forge_v12_index as _idx
+    import forge_v13_index as _idx
     canonical = cre.canonical(cre.CreationConfig(assets, reserves, weights, fee_bps, 0, ZERO_32, total_lp))
     hex_ids = [("00" * 32) if a is None else a.hex() for a in canonical.asset_ids]
     state = {"pools": []}
     try:
         import json as _json
-        state = _json.loads(Path(payload.get("record_path") or (Path(__file__).resolve().parent.parent / ".awizard" / "v12-testnet.json")).read_text(encoding="utf-8"))
+        state = _json.loads(Path(payload.get("record_path") or (Path(__file__).resolve().parent.parent / ".awizard" / "v13-testnet.json")).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- names of nested LP assets fall back to their ids
         pass
     name = str(cfg.get("name") or "") or _idx.emoji_name(hex_ids, canonical.weights, fee_bps, state)
@@ -580,7 +577,7 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     if action in CREATE_LANES and isinstance(payload.get("registry"), dict) or action == "commit-create":
         return _build_lane_create(action, payload)
     offer = Offer.from_bech32(str(payload["offer"]))
-    # Any action-layer revision (12 = V11.1, 13 = V12) takes the versioned lane; _lane() picks which.
+    # The action-layer revision (14 = V13) takes the versioned lane; _lane() picks which.
     if any(int(snapshot.get("protocol_version") or 0) in _LANES for snapshot in _pool_snapshots(payload)):
         return _build_lane(action, payload, offer)
     if action in ("prepare-create", "finalize-create"):
