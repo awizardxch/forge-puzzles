@@ -17,6 +17,16 @@ B is a real spend and moves the pool honestly (it pays for what it takes). A is 
 push. Run A alone with --only a.
 
     python scripts/v14-slack-probe.py --label "H2 txch t8 8-1 v14" --gross 5000000
+
+This probe drives OUR testnet wallet, through scripts/deploy-v14-testnet.py, which is
+deliberately not published: it holds wallet paths and picks our coins. So in the public
+repository this file is a READING of what was pushed and what the node answered, not
+something you can run here -- you could not sign from our wallet in any case.
+
+What is reproducible without a wallet: scripts/sim-v14-review-derivations.py builds the
+reserve-launcher constructions against an in-process full node, and the offline suites
+under contracts/_test_v14_*.py build every refusal against the compiled puzzles.
+
 """
 from __future__ import annotations
 
