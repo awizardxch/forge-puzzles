@@ -14,6 +14,16 @@ Then the control: the same swap with an honest settlement, pushed and confirmed,
 refusal above is the puzzle's and not the pool's state or the wallet's coins.
 
     python scripts/v14-settlement-probe.py --label H6 --gross 10000000
+
+This probe drives OUR testnet wallet, through scripts/deploy-v14-testnet.py, which is
+deliberately not published: it holds wallet paths and picks our coins. So in the public
+repository this file is a READING of what was pushed and what the node answered, not
+something you can run here -- you could not sign from our wallet in any case.
+
+What is reproducible without a wallet: scripts/sim-v14-review-derivations.py builds the
+reserve-launcher constructions against an in-process full node, and the offline suites
+under contracts/_test_v14_*.py build every refusal against the compiled puzzles.
+
 """
 from __future__ import annotations
 
