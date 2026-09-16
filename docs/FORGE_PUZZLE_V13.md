@@ -1,5 +1,15 @@
 # Forge puzzle V13 -- the second-audit revision
 
+> **Erratum (2026-09-15).** The I-1 row below is wrong. `add`'s `assert deposit >= 0`
+> **is load-bearing.** On the actions-suite pool, `deposits = [-100000, +500000]` satisfies
+> the mint bracket at `lp_delta = 36611` — a withdrawal of 100,000 wearing an `add` — and
+> the shipped leaf refuses it only because of that line. The claim that it "does not
+> reproduce" came from a search run through a Python mirror whose wrapper refuses negative
+> deposits before the bracket is reached; it tested the guard it was trying to test. The
+> vector is now pinned in `_test_v13_actions.py` and `_test_v13_second_review.py`, which
+> turns the mutation verdict on that line from survived to killed. V13 as deployed was
+> not exploitable; the published claim was.
+
 Testnet research only; unaudited. Protocol 14 on chain.
 
 On 2026-09-14 a six-agent re-audit of V12 (`contracts/v12`, commit `26338d5`) was

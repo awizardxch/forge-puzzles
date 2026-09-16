@@ -1,5 +1,17 @@
 # Security
 
+> **Erratum (2026-09-15).** Two statements below overclaim. (1) The `_test_v13_integrity.py`
+> row says "built hex matches source". The suite recompiles and compares only the pinned
+> *upstream* puzzles and the curve exports; Forge's own leaves and finalizer get a
+> source-hash staleness check, not a fresh recompile, and when `rue` is absent the
+> recompile is skipped and the suite still passes. The next revision recompiles every
+> puzzle and fails when it cannot. (2) "No revision has been reviewed by anyone outside
+> the team" is false: the CHIP has had human review from Chia Network and two rounds of
+> community review including a six-agent audit, all on PR 217. What remains true is that
+> there has been **no commissioned audit** — which is the claim this document should have
+> made. Attribution: commissioned audit, none; external community review, CNI and
+> trgarrett on PR 217; automated, cursor[bot]; internal, ours.
+
 How to report something, what has been checked, and what has not.
 
 ---

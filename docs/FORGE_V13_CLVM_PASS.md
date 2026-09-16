@@ -1,5 +1,15 @@
 # Forge V13 — the written CLVM pass, leaf by leaf
 
+> **Erratum (2026-09-15).** Two corrections. (1) Section 3's "Finding I-1 does not
+> reproduce" is wrong: the assert is load-bearing — see the erratum in
+> `FORGE_PUZZLE_V13.md`. (2) Section 1's closure of O-1 rests on a false step. It says a
+> future-dated spend "has `birth >= h`, so `h == birth`"; but `birth` is the coin's
+> *creation* height, pinned by `ASSERT_MY_BIRTH_HEIGHT`, and naming a future `h` delays
+> inclusion without moving it. The conclusion survives for a different reason: the exact
+> two-interval accounting credits `[birth, h]` in this spend and the tail `(h, inclusion]`
+> in the next, at the spot this one recorded. Measured across a 20-block future-dating gap,
+> every block is credited exactly once (`_sim_v14_review_corrections.py`).
+
 The reading of every puzzle a V13 pool runs, in the order a spend meets them.
 Each section states what the puzzle takes, what it asserts, what it emits, which
 suite pins each refusal, and what remains open. Written against the V13 build

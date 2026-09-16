@@ -201,6 +201,11 @@ def main() -> int:
             leaf_probe("forge_action_add", [H0, [100_000, 200_000], 0, ADD_PARENT, ADD_IDS]))
     refuses("a negative deposit in any slot is refused",
             leaf_probe("forge_action_add", [H0, [-100_000, 200_000], 50_000, ADD_PARENT, ADD_IDS]))
+    # Fourth review, I-1: the vector the bracket ACCEPTS without the assert -- the earlier
+    # probe above sits in the region the bracket refuses on its own, which is why the
+    # mutation run reported this line SURVIVED. With this one it is killed.
+    refuses("PR-217 I-1: a negative deposit with an invariant-valid positive mint is refused",
+            leaf_probe("forge_action_add", [H0, [-100_000, 500_000], 36_611, ADD_PARENT, ADD_IDS]))
     refuses("a deposit of nothing at all is refused",
             leaf_probe("forge_action_add", [H0, [0, 0], 50_000, ADD_PARENT, ADD_IDS]))
 

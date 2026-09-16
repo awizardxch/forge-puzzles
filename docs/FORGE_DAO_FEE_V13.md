@@ -1,5 +1,10 @@
 # DAO fee — V13, as built, with the threat model checked off
 
+> **Erratum (2026-09-15).** "The second external review" below refers to the six-agent
+> audit posted to Chia-Network/chips#217 — external *community* review, not a commissioned
+> audit. No revision of Forge has had a commissioned audit. The security document's
+> attribution table separates the two.
+
 `FORGE_DAO_FEE_V11.md` was a design: what a DAO fee would be, and the seven
 vectors a review would have to check. This is the same document after the feature
 shipped, read against `contracts/v13`. Each vector says what closes it in the

@@ -1,5 +1,12 @@
 # Forge V13 — architecture, as built
 
+> **Erratum (2026-09-15).** Section 5's leaf diagram writes `lp_delta ≤ invariant mint`
+> and `payouts ≤ pro-rata`. Both are **exact**, not upper bounds: `exact_invariant_lp_mint`
+> and `exact_withdrawal` are brackets, and an `add` asking for one LP less than the bracket
+> or a `remove` asking for one mojo less than pro-rata is refused. An implementer who
+> requested less defensively would be refused, and this document would have told them it
+> was allowed. `burn ≤ total_lp − MIN_LOCKED_LP` is a genuine bound and stands.
+
 **Updated 2026-09-15.** This describes the V13 that runs on testnet11: the
 CHIP-0050 action layer under `contracts/v13`, the registry, the LP CAT, the
 keyless responder and its lanes, and the naming layer. V13 is **protocol 14**.
