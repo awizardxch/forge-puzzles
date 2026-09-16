@@ -1,0 +1,15 @@
+# Puzzle sources are hashed for provenance, so their bytes must not depend on the
+# platform that checked them out. The manifest's `source_sha256` is taken over
+# LF-normalised content as well, so a hash is verifiable from any clone; this file
+# keeps the working copy matching the blob so the two agree without normalising.
+*.rue      text eol=lf
+*.clsp     text eol=lf
+*.clvm     text eol=lf
+*.clvm.hex text eol=lf
+*.hex      text eol=lf
+*.hash     text eol=lf
+
+# The compiled artefacts and their manifest are compared byte for byte by
+# _test_v14_integrity.py.
+*.json     text eol=lf
+*.py       text eol=lf

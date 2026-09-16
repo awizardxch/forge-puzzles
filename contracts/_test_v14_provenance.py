@@ -94,7 +94,7 @@ def main() -> int:
             if show.returncode != 0:
                 ok = False; detail = "not committed"
             else:
-                ok = hashlib.sha256(show.stdout).hexdigest() == entry["source_sha256"]; detail = "" if ok else "committed source differs from the built one"
+                ok = hashlib.sha256(show.stdout.replace(b"\r\n", b"\n")).hexdigest() == entry["source_sha256"]; detail = "" if ok else "committed source differs from the built one"
             verdict_git &= ok
             results.append(check(f"{out} <- {rel}", ok, detail))
 
