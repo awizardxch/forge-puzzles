@@ -1,0 +1,93 @@
+// forge_action_remove.rue -- Forge V14 `remove` leaf. Testnet research only; unaudited.
+//
+// V10's MODE_REMOVE as a merkle leaf. Burning `burn` LP releases an exactly
+// proportional share of every reserve, floored per asset, checked by
+// exact_withdrawal (moved from V10 unchanged). A single-asset vault charges its
+// liquidity fee on the crossing, via vault_fee_bps; every multi-asset pool pays
+// out free. `burn < total_lp`, so the pool always outlives the withdrawal.
+//
+// The LP action coin is the melt coin -- exactly `burn` LP wrapping the pinned
+// melt inner, whose only behavior is to destroy its whole amount -- and the
+// TAIL additionally requires it to have a CAT parent, so a coin fabricated out
+// of ordinary mojos cannot stand in for a burn.
+//
+// solution: h, burn, lp_parent_id, payouts[N]
+//
+// Payouts go to the offer settlement puzzle of each asset; the finalizer tags
+// them to the right reserve, and the CAT layer wraps them for CAT reserves.
+
+import upstream::action::StateTruth;
+import forge_curve::*;
+import forge_action_common::*;
+
+fn payout_conditions(index: Int, payouts: List<Int>) -> List<Condition> {
+    if payouts is nil {
+        nil
+    } else {
+        let payout = payouts.first;
+        if payout > 0 {
+            (
+                for_reserve(index, CreateCoin { puzzle_hash: OFFER_MOD_HASH, amount: payout }),
+                payout_conditions(index + 1, payouts.rest)
+            )
+        } else {
+            assert payout == 0;
+            payout_conditions(index + 1, payouts.rest)
+        }
+    }
+}
+
+fn main(
+    CONFIG: PoolConfig,
+    truth: StateTruth,
+    h: Int,
+    birth: Int,
+    burn: Int,
+    lp_parent_id: Bytes32,
+    payouts: List<Int>,
+) -> ActionOutput {
+    let p = prologue(CONFIG, truth, h, birth);
+    assert burn > 0;
+    // V12: everything above the locked minimum is redeemable; the pool outlives every
+    // withdrawal because LOCKED_BURN always remains -- CHIP-0062 review P1.
+    assert burn <= p.state.total_lp - LOCKED_BURN;
+
+    // zip_sub fails unless payouts has exactly one entry per reserve.
+    let new_reserves = zip_sub(p.state.reserves, payouts);
+    assert exact_withdrawal(
+        p.state.reserves,
+        new_reserves,
+        burn,
+        p.state.total_lp,
+        vault_fee_bps(p.state.reserves, CONFIG.fee_bps),
+    );
+    let new_total_lp = p.state.total_lp - burn;
+
+    let new_state = ForgeState {
+        reserves: new_reserves,
+        total_lp: new_total_lp,
+        fees_owed: p.state.fees_owed,
+        oracle: p.state.oracle,
+        prev_root: p.state.prev_root,
+        dao_fee_bps: p.state.dao_fee_bps,
+        dao_owed: p.state.dao_owed,
+        reserve_parents: p.state.reserve_parents,
+    };
+
+    ActionOutput {
+        state_truth: StateTruth {
+            ephemeral_state: p.height,
+            actual_state: new_state,
+        },
+        conditions: concat(
+            p.conditions,
+            concat(
+                payout_conditions(0, payouts),
+                [
+                    lp_handshake(CONFIG, lp_parent_id, LP_MELT_INNER_HASH, burn,
+                                 0 - burn, new_total_lp, tree_hash(new_state)),
+                ],
+            ),
+        ),
+    }
+}

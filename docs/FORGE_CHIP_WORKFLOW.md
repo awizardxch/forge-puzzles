@@ -298,6 +298,6 @@ package. Mainnet follows the review, not before.
 - Suites: `contracts/_test_v11_*.py` (integrity, curve equivalence, finalizer,
   actions, registry, offer lane, route lane, creation, manipulation, payout
   audit, DAO fee, multipool, discoverability) and the second driver under
-  `scripts/wallet-sdk/`; the one-line invocation is in
+  the wallet-sdk fixtures (private); the one-line invocation is in
   `FORGE_V11_FOUNDATIONS.md`.
-- Pins: `contracts/v11/pins.json`, checked by `_test_v11_integrity.py`.
+- Pins: the V11 pin file (private; V14's is `contracts/v14/pins.json`), checked by `_test_v11_integrity.py`.

@@ -1,5 +1,10 @@
 # 🔐 Locks — M-of-N safes on CNI's `p2_m_of_n_delegate_direct`
 
+
+> Paths under `api/` and `src/` are in the **interface repository** (forge-ui), not this
+> one. They are named so a reader knows which file carries the behaviour; they do not
+> resolve inside this repository.
+
 In the app the feature is just the lock: the tab is `🔐` with no word, and a
 safe is called a **lock** in copy ("Create Lock", "Observe lock"). The lock
 states your access: 🔒 watching, 🔐 you hold a key, 🔓 inside one you hold a

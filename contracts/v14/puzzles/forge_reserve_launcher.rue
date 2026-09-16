@@ -1,0 +1,40 @@
+// forge_reserve_launcher.rue -- Forge V14. Testnet research only; unaudited.
+//
+// The coin a reserve is born from. It creates exactly one coin -- the reserve, at the
+// puzzle hash it is told, for its whole amount, hinted with the pool's launcher id -- and
+// makes a COIN announcement saying so.
+//
+// Why it exists (spec 1.3, review R-1): `register` used to take each reserve's parent id
+// from its solution, and nothing in the registration bundle proved the reserve had been
+// funded. A registration naming parents that created nothing succeeded, and the slot it
+// took could never be spent by anyone. Now `register` is given each reserve's GRANDPARENT
+// and derives the parent itself:
+//
+//     P_i = coinid(grandparent_i, RESERVE_LAUNCHER_HASH, reserves[i])
+//
+// then asserts this puzzle's announcement from P_i. A coin id commits to its puzzle hash,
+// so the only coin that can make that announcement is one running this puzzle -- and this
+// puzzle does nothing but create the reserve. Both halves at once: the id fixes WHICH coin,
+// the puzzle fixes WHAT it did.
+//
+// For a CAT reserve this puzzle is the inner of a CAT coin: the CAT layer wraps the created
+// puzzle hash and passes the announcement through, so `register` derives P_i with
+// cat_puzzle_hash(asset_id, RESERVE_LAUNCHER_HASH) and asserts the same message.
+//
+// solution: created_puzzle_hash, amount, launcher_id
+
+import forge_action_common::reserve_launcher_message;
+
+fn main(created_puzzle_hash: Bytes32, amount: Int, launcher_id: Bytes32) -> List<Condition> {
+    assert amount > 0;
+    [
+        // the whole coin becomes the reserve: nothing else is created here
+        AssertMyAmount { amount: amount },
+        CreateCoin {
+            puzzle_hash: created_puzzle_hash,
+            amount: amount,
+            memos: Memos { value: [launcher_id] },
+        },
+        CreateCoinAnnouncement { message: reserve_launcher_message(created_puzzle_hash, amount, launcher_id) },
+    ]
+}

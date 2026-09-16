@@ -1,0 +1,7 @@
+# Forge V14 rue project. Every .rue under puzzles/ is a module named by its
+# file stem; puzzles/upstream/ is vendored verbatim from Yakuhito/slot-machine
+# at 2d37ba1 and is never edited (upstream pinned its manifest to rue 0.9.0;
+# rue 0.8.4 reproduces the same hashes, which _test_v11_integrity.py proves).
+[compiler]
+entrypoint = "puzzles"
+dist_dir = "compiled"

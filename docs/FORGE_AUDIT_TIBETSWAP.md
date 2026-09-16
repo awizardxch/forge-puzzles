@@ -132,18 +132,18 @@ refused at the leaf — and the comment records which layer is actually holding.
       `any_positive(deposits)` — because a zero on *one* asset is a legitimate
       off-ratio add, so emptiness has to be checked separately. Twelve sign
       probes now, across all three leaves; 78/78 action checks pass.
-- [x] **A standing mutation harness** (2026-09-10): `scripts/mutate-v12.py`.
+- [x] **A standing mutation harness** (2026-09-10): the V12 mutation harness (private, with the retired sources).
       See below.
 
 ---
 
 ### The harness, and what it found
 
-`scripts/mutate-v12.py` deletes each `assert` in Forge's leaves one at a time,
+the V12 mutation harness (private, with the retired sources) deletes each `assert` in Forge's leaves one at a time,
 rebuilds with `rue`, and runs the suites against the result. A mutant that
 **survives** — every suite still passes without the line — is not automatically a
 bug; it is a question with two acceptable answers, *redundant* or *untested*, and
-the point is to know which. Nothing is written into `contracts/v12/compiled`:
+the point is to know which. Nothing is written into the retired V12 build (private):
 each mutant is built in a temporary copy and the suites are pointed at it with
 `FORGE_V11_COMPILED`, so a broken build can never be left behind in the project.
 
@@ -300,7 +300,7 @@ Their conclusion, which Forge should adopt rather than admire:
 | V2 — negative swap input | **Not vulnerable.** An unsatisfiable curve bracket, with sign asserts as a second layer | Full mutation sweep; brute-force search; 12 refusal cases across three leaves |
 | V2 — remove without melt | **Closed structurally.** The handshake is unconditional and atomic with the payout | `forge_action_remove.rue`; payout and melt refusal tests |
 | Process — audit cadence, bounty, monitoring | **Gaps.** All three outstanding | This document |
-| Tooling — which assertions are load-bearing | **Answered, and now repeatable** | `scripts/mutate-v12.py`: 10/32 killed |
+| Tooling — which assertions are load-bearing | **Answered, and now repeatable** | the V12 mutation harness (private, with the retired sources): 10/32 killed |
 
 Nothing here is a clean bill of health. Forge's pool has never been audited by
 anyone outside this workspace, and the V2 post-mortem's most uncomfortable fact
