@@ -57,7 +57,15 @@ def check(label, ok, detail=""):
 
 
 def sha256(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Hash the source as git stores it: CRLF normalised to LF.
+
+    Hashing raw bytes records a hash that matches only the checkout it was built
+    on. Ten .rue sources are stored LF and sit CRLF in a Windows working copy, so
+    the fourth review found 11 of 41 entries unverifiable from a fresh clone -- a
+    provenance claim nobody outside could check. Normalising makes the hash a
+    property of the content rather than of the platform that built it.
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def tree_hash(path: pathlib.Path) -> str:
