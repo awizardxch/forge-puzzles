@@ -39,7 +39,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 import forge_stdin as fs
-from _test_v6_transition import USER_PH, audit, cat_maker_spend, xch_maker_spend
+from _forge_testkit import USER_PH, audit, cat_maker_spend, xch_maker_spend
 from forge_create_pool import deploy
 from forge_offer import MODE_ADD, MODE_REMOVE, MODE_SWAP
 from forge_math import invariant_lp_mint, swap_output, withdrawal_amounts

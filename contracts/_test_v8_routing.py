@@ -40,7 +40,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 import forge_stdin as fs
-from _test_v6_transition import USER_PH, audit, cat_maker_spend, make_offer
+from _forge_testkit import USER_PH, audit, cat_maker_spend, make_offer
 from _test_v8_transition import IDENTITY, TREASURY
 from forge_create_pool import deploy
 from forge_multihop_swap import _plan_legs, build_multihop_swap, protocol_fee_for

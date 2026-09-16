@@ -18,8 +18,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 from _test_route_nasset import T6, T11, external_for, load_pools, require_pools
-from _test_v6_devfee import DEV_BPS, DEV_PH, payouts_to
-from _test_v6_transition import USER_PH, audit, make_offer, xch_maker_spend
+from _forge_testkit import DEV_BPS, DEV_PH, USER_PH, audit, make_offer, payouts_to, xch_maker_spend
 from forge_offer import ZERO_32
 from forge_multihop_swap import build_multihop_swap
 from forge_split_swap import SplitBranchSpec, build_split_swap

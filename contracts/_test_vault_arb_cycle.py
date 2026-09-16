@@ -25,7 +25,7 @@ from chia.wallet.trading.offer import NotarizedPayment
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
-from _test_v6_transition import USER_PH, audit, make_offer, xch_maker_spend
+from _forge_testkit import USER_PH, audit, make_offer, xch_maker_spend
 from _test_route_nasset import external_for, load_pools
 from forge_offer import ZERO_32
 from forge_multihop_swap import _plan_legs, build_multihop_swap
