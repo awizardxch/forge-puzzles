@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 322" width="780" height="322" role="img"
+     aria-label="A leaf cannot address a reserve. It emits a tagged condition, the finalizer routes it, and the finalizer derives the reserve's coin id from committed state before sending a CHIP-0025 message.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5d6675"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2d6b59"/>
+    </marker>
+  </defs>
+  <rect width="780" height="322" fill="#f7f8fa"/>
+  <g font-family="DejaVu Sans, Verdana, Geneva, sans-serif" fill="#1f2430">
+
+    <rect x="24" y="52" width="164" height="58" rx="3" fill="#ffffff" stroke="#7a8394" stroke-width="1.5"/>
+    <text x="106" y="76" font-size="13" font-weight="bold" text-anchor="middle">Leaf</text>
+    <text x="106" y="95" font-size="11" fill="#5d6675" text-anchor="middle">swap / add / remove / ...</text>
+
+    <rect x="286" y="40" width="208" height="82" rx="3" fill="#ffffff" stroke="#7a8394" stroke-width="1.5"/>
+    <text x="390" y="64" font-size="13" font-weight="bold" text-anchor="middle">Multi-reserve finalizer</text>
+    <text x="390" y="82" font-size="11" fill="#5d6675" text-anchor="middle">curried: reserve hashes,</text>
+    <text x="390" y="97" font-size="11" fill="#5d6675" text-anchor="middle">config hash, leaf mod hashes</text>
+    <text x="390" y="112" font-size="11" fill="#5d6675" text-anchor="middle">reads parents from STATE</text>
+
+    <rect x="592" y="52" width="164" height="58" rx="3" fill="#e9f2ef" stroke="#2d6b59" stroke-width="1.5"/>
+    <text x="674" y="76" font-size="13" font-weight="bold" text-anchor="middle">Reserve coin i</text>
+    <text x="674" y="95" font-size="11" fill="#2d6b59" text-anchor="middle">p2_delegated_by_singleton</text>
+
+    <line x1="188" y1="81" x2="282" y2="81" stroke="#5d6675" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="235" y="72" font-size="10.5" fill="#5d6675" text-anchor="middle">tagged</text>
+    <text x="235" y="84" font-size="10.5" fill="#5d6675" text-anchor="middle">condition</text>
+
+    <line x1="494" y1="81" x2="588" y2="81" stroke="#2d6b59" stroke-width="1.8" marker-end="url(#ag)"/>
+    <text x="541" y="66" font-size="10.5" fill="#2d6b59" text-anchor="middle" font-weight="bold">SEND_MESSAGE</text>
+    <text x="541" y="78" font-size="10.5" fill="#2d6b59" text-anchor="middle">mode 23, receiver id</text>
+    <text x="541" y="90" font-size="10.5" fill="#2d6b59" text-anchor="middle">DERIVED from state</text>
+
+    <rect x="286" y="212" width="208" height="52" rx="3" fill="#ffffff" stroke="#7a8394" stroke-width="1.5"/>
+    <text x="390" y="234" font-size="12.5" font-weight="bold" text-anchor="middle">Successor singleton</text>
+    <text x="390" y="251" font-size="10.5" fill="#5d6675" text-anchor="middle">new state, parents rewritten</text>
+    <line x1="390" y1="122" x2="390" y2="208" stroke="#5d6675" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="399" y="170" font-size="10.5" fill="#5d6675">recreates, once</text>
+
+    <rect x="592" y="212" width="164" height="52" rx="3" fill="#ffffff" stroke="#7a8394" stroke-width="1.5"/>
+    <text x="674" y="234" font-size="12.5" font-weight="bold" text-anchor="middle">Payout coin</text>
+    <text x="674" y="251" font-size="11" fill="#5d6675" text-anchor="middle">OFFER_MOD child</text>
+    <line x1="674" y1="110" x2="674" y2="208" stroke="#5d6675" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="683" y="164" font-size="10.5" fill="#5d6675">CREATE_COIN</text>
+
+    <path d="M106,110 C106,180 380,196 592,150" fill="none" stroke="#9aa2ae" stroke-width="1.4" stroke-dasharray="5 4"/>
+    <g stroke="#a84b57" stroke-width="2.2">
+      <line x1="322" y1="167" x2="342" y2="187"/>
+      <line x1="342" y1="167" x2="322" y2="187"/>
+    </g>
+    <text x="332" y="205" font-size="10.5" fill="#a84b57" text-anchor="middle">no path: a leaf cannot address a reserve</text>
+
+    <text x="24" y="296" font-size="10.5" fill="#5d6675">The reserve's delegated puzzle is recreate-itself plus whatever the leaves asked, and its</text>
+    <text x="24" y="311" font-size="10.5" fill="#5d6675">p2 puzzle receives the pool's message for exactly that. Nothing else can be run against it.</text>
+  </g>
+</svg>
