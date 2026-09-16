@@ -1,0 +1,153 @@
+// forge_registry_register.rue -- the registry's `register` leaf. Testnet research only; unaudited.
+//
+// Runs in the same bundle as a pool's creation. It:
+//
+//   1. derives the pool's launcher id from the launcher's parent, so the coin
+//      it names necessarily runs the standard launcher puzzle;
+//   2. rebuilds the pool's full puzzle hash from that launcher id and the
+//      claimed config and genesis (forge_registry_common), and asserts the
+//      launcher's announcement that it created a coin at exactly that hash --
+//      so what is registered is what was minted, at V12, and nothing else;
+//   3. asserts the creation fee was paid to the treasury by an offer settlement
+//      whose nonce is this launcher id, so one payment registers one pool;
+//   3b. V13: asserts the genesis LP settlement paid LOCKED_BURN of this pool's LP
+//      to the zero puzzle hash under the same nonce. The floor is therefore burned
+//      before the pool is listed -- not held by the creator as a transferable coin
+//      that can never be redeemed, which is what the reference website lane did in
+//      V12 (second audit, "LOCKED_BURN burn unimplemented"). Only the TAIL's
+//      genesis branch can create that asset, so this also proves the mint happened
+//      rather than merely that it was authorized (second audit, INFO).
+//   3c. V14: derives each reserve's parent from the grandparent named in the solution
+//      and the reserve launcher's puzzle hash, and asserts that launcher's announcement
+//      that it created the reserve -- so a registered pool has FUNDED reserves, at the
+//      parents its state records, by construction (fourth review, R-1). The parents are
+//      derived, never claimed: `reserve_parents` left the solution.
+//   4. inserts the pool's key between two adjacent slots, spending both by
+//      message and re-creating them around the new key. Adjacency is
+//      structural: the left slot's right pointer and the right slot's left
+//      pointer are the same variables as the neighbours' own keys, so a pair of
+//      slots that are not neighbours cannot both be spent.
+//
+// Uniqueness is the sorted list's: `left_key < key < right_key` between
+// adjacent slots admits a key exactly once. Duplicate economic configs are
+// therefore refused, whatever their launcher.
+//
+// The launcher's key-value list is fixed to (total_lp): that is the list the
+// LP TAIL's genesis branch requires, so registering a pool proves its genesis
+// LP supply is exactly the total_lp in its eve state.
+//
+// solution: launcher_parent_id, config, reserves, total_lp, dao_fee_bps,
+//           reserve_grandparents, eve_coin_id,
+//           (left_launcher_id, left_left_key), (right_launcher_id, right_right_key),
+//           left_key, right_key
+
+import upstream::action::StateTruth;
+import upstream::slot_helpers::*;
+import forge_action_common::*;
+import forge_registry_common::*;
+
+struct Neighbour {
+    launcher_id: Bytes32,
+    ...far_key: Bytes32,
+}
+
+fn main(
+    CONSTANTS: RegistryConstants,
+    truth: StateTruth,
+    launcher_parent_id: Bytes32,
+    config: PoolConfig,
+    reserves: List<Int>,
+    total_lp: Int,
+    dao_fee_bps: Int,
+    reserve_grandparents: List<Bytes32>,
+    eve_coin_id: Bytes32,
+    left: Neighbour,
+    right: Neighbour,
+    left_key: Bytes32,
+    right_key: Bytes32,
+) -> RegistryOutput {
+    let state = unchecked_cast::<RegistryState>(truth.actual_state);
+    assert state.initialized == 1;
+
+    // The launcher coin: parent, the standard launcher puzzle, one mojo.
+    assert launcher_parent_id != zero_bytes32();
+    let launcher_id = sha256(launcher_parent_id + SINGLETON_LAUNCHER_PUZZLE_HASH + (1 as Bytes));
+
+    assert valid_pool(CONSTANTS, launcher_id, config, reserves, total_lp, dao_fee_bps);
+    // V14: the reserve parents, derived from the grandparents and the launcher's hash.
+    let reserve_parents = derived_reserve_parents(CONSTANTS, config.asset_ids, reserves, reserve_grandparents);
+    let reserve_inners = reserve_inner_hashes(CONSTANTS, singleton_struct_hash(launcher_id), config.asset_ids, 0);
+    let pool_puzzle_hash = pool_full_puzzle_hash(CONSTANTS, launcher_id, config, reserves, total_lp, dao_fee_bps, reserve_parents);
+
+    let key = pool_key(config);
+    assert left_key < key;
+    assert key < right_key;
+
+    let fee_conditions: List<Condition> = if CONSTANTS.creation_fee == 0 {
+        nil
+    } else {
+        [
+            // settlement_payments announces sha256tree(nonce . payments)
+            AssertPuzzleAnnouncement {
+                id: sha256(OFFER_MOD_HASH + tree_hash((
+                    launcher_id,
+                    [[CONSTANTS.treasury_puzzle_hash, CONSTANTS.creation_fee, [CONSTANTS.treasury_puzzle_hash]]],
+                ))),
+            },
+        ]
+    };
+
+    RegistryOutput {
+        state_truth: StateTruth {
+            ephemeral_state: truth.ephemeral_state,
+            actual_state: RegistryState { initialized: 1, pool_count: state.pool_count + 1 },
+        },
+        conditions: concat(
+            // V14: every reserve was created, at its amount, by a launcher at the derived parent.
+            reserve_launch_asserts(reserve_parents, reserve_inners, reserves, launcher_id),
+            concat(
+            [
+                // V13: the burned floor. settlement_payments announces sha256tree(nonce . payments)
+                // per notarized group; the CAT layer passes the announcement through under the
+                // settlement's full CAT puzzle hash.
+                AssertPuzzleAnnouncement {
+                    id: sha256(cat_puzzle_hash(config.lp_tail_hash, OFFER_MOD_HASH)
+                               + tree_hash((launcher_id, [[zero_bytes32(), LOCKED_BURN]]))),
+                },
+                // singleton_launcher announces (sha256tree (list full_puzzle_hash amount key_value_list));
+                // V12: the list is (total_lp, eve_coin_id) -- what the TAIL's genesis mint requires,
+                // so exactly one eve can claim the genesis supply (finding P0)
+                AssertCoinAnnouncement {
+                    id: sha256(launcher_id + tree_hash([pool_puzzle_hash, 1, [total_lp, eve_coin_id]])),
+                },
+                // the two neighbours, spent by message
+                spend_slot(CONSTANTS.slot_1st_curry_hash,
+                           slot_value_hash(left_key, left.launcher_id, left.far_key, right_key)),
+                spend_slot(CONSTANTS.slot_1st_curry_hash,
+                           slot_value_hash(right_key, right.launcher_id, left_key, right.far_key)),
+                // the new slot and the neighbours re-created around it
+                create_slot_with_hint(CONSTANTS.slot_1st_curry_hash,
+                                      slot_value_hash(key, launcher_id, left_key, right_key), CONSTANTS.hint),
+                create_slot_with_hint(CONSTANTS.slot_1st_curry_hash,
+                                      slot_value_hash(left_key, left.launcher_id, left.far_key, key), CONSTANTS.hint),
+                create_slot_with_hint(CONSTANTS.slot_1st_curry_hash,
+                                      slot_value_hash(right_key, right.launcher_id, key, right.far_key), CONSTANTS.hint),
+                // For anything in the bundle that wants to know a pool was listed. V12
+                // carries the whole identity rather than just the key and the launcher:
+                // every value here was already proved above -- `pool_puzzle_hash` was
+                // rebuilt from the config and matched against the launcher's own
+                // announcement, and `total_lp` and `eve_coin_id` came out of that same
+                // announcement -- so a consumer that asserts this one announcement learns
+                // where the pool coin lives, what its genesis supply is and which eve
+                // holds it, without having to re-derive any of it or trust an index.
+                // Nothing in the registry reads this; it exists to be verified against.
+                CreatePuzzleAnnouncement {
+                    message: tree_hash(["forge-registered-v14", key, launcher_id,
+                                        pool_puzzle_hash, total_lp, eve_coin_id]),
+                },
+            ],
+            fee_conditions,
+            ),
+        ),
+    }
+}

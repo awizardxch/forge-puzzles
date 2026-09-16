@@ -1,0 +1,115 @@
+// forge_action_add.rue -- Forge V14 `add` leaf. Testnet research only; unaudited.
+//
+// V10's MODE_ADD as a merkle leaf. No reserve falls, at least one rises, and the
+// LP minted is bracketed by exact_invariant_lp_mint (moved from V10 unchanged,
+// imbalance fee included). The LP action coin is the mint eve -- one mojo,
+// wrapping the pinned mint inner -- whose id the pool derives and messages.
+// Whether the eve actually mints is the TAIL's check against the CAT ring; the
+// message it must receive commits to lp_delta, the new supply and the next
+// state root.
+//
+// solution: h, birth, deposits[N], lp_delta, lp_parent_id, settlement_parents[N], settlement_amounts[N]
+//
+// Each positive deposit is funded by the trader's settlement coin for that asset. V14 names
+// it by parent and amount, derives its id, asserts it was spent and holds at least the
+// deposit (spec 1.8). A zero deposit needs none, and its two slots are ignored.
+
+import upstream::action::StateTruth;
+import forge_curve::*;
+import forge_action_common::*;
+
+fn deposit_asserts(
+    asset_ids: List<Bytes32>,
+    deposits: List<Int>,
+    settlement_parents: List<Bytes32>,
+    settlement_amounts: List<Int>,
+) -> List<Condition> {
+    if deposits is nil {
+        nil
+    } else {
+        inline let (asset_id, remaining_assets) = unchecked_cast::<(Bytes32, List<Bytes32>)>(asset_ids);
+        inline let (deposit, remaining_deposits) = unchecked_cast::<(Int, List<Int>)>(deposits);
+        inline let (settlement_parent, remaining_parents) = unchecked_cast::<(Bytes32, List<Bytes32>)>(settlement_parents);
+        inline let (settlement_amount, remaining_amounts) = unchecked_cast::<(Int, List<Int>)>(settlement_amounts);
+        // Load-bearing: the mint bracket admits a negative slot beside a large positive one
+        // (PR-217 I-1, reproduced at lp_delta 36,611 on [-100000, +500000]).
+        assert deposit >= 0;
+        if deposit > 0 {
+            concat(
+                settlement_binding(asset_id, settlement_parent, settlement_amount, deposit),
+                deposit_asserts(remaining_assets, remaining_deposits, remaining_parents, remaining_amounts)
+            )
+        } else {
+            deposit_asserts(remaining_assets, remaining_deposits, remaining_parents, remaining_amounts)
+        }
+    }
+}
+
+fn any_positive(list: List<Int>) -> Bool {
+    if list is nil {
+        false
+    } else {
+        list.first > 0 || any_positive(list.rest)
+    }
+}
+
+fn main(
+    CONFIG: PoolConfig,
+    truth: StateTruth,
+    h: Int,
+    birth: Int,
+    deposits: List<Int>,
+    lp_delta: Int,
+    lp_parent_id: Bytes32,
+    settlement_parents: List<Bytes32>,
+    settlement_amounts: List<Int>,
+) -> ActionOutput {
+    let p = prologue(CONFIG, truth, h, birth);
+    // Defence in depth, like the swap leaf's: mutation testing showed
+    // `exact_invariant_lp_mint` already refuses every negative and empty case
+    // these cover. Kept for the same reason -- see forge_action_swap.rue.
+    assert lp_delta > 0;
+    assert any_positive(deposits);
+
+    // zip_add fails unless deposits has exactly one entry per reserve.
+    let new_reserves = zip_add(p.state.reserves, deposits);
+    assert exact_invariant_lp_mint(
+        p.state.reserves,
+        new_reserves,
+        CONFIG.weights,
+        p.state.total_lp,
+        lp_delta,
+        CONFIG.fee_bps,
+    );
+    let new_total_lp = p.state.total_lp + lp_delta;
+
+    let new_state = ForgeState {
+        reserves: new_reserves,
+        total_lp: new_total_lp,
+        fees_owed: p.state.fees_owed,
+        oracle: p.state.oracle,
+        prev_root: p.state.prev_root,
+        dao_fee_bps: p.state.dao_fee_bps,
+        dao_owed: p.state.dao_owed,
+        reserve_parents: p.state.reserve_parents,
+    };
+
+    ActionOutput {
+        state_truth: StateTruth {
+            ephemeral_state: p.height,
+            actual_state: new_state,
+        },
+        conditions: concat(
+            p.conditions,
+            concat(
+                deposit_asserts(CONFIG.asset_ids, deposits, settlement_parents, settlement_amounts),
+                [
+                    // The mint eve is created with amount 1; the TAIL authorizes the
+                    // rest of the supply through its extra_delta.
+                    lp_handshake(CONFIG, lp_parent_id, LP_MINT_INNER_HASH, 1,
+                                 lp_delta, new_total_lp, tree_hash(new_state)),
+                ],
+            ),
+        ),
+    }
+}

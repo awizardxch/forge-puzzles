@@ -1,0 +1,506 @@
+// forge_action_common.rue -- shared by every Forge V14 action leaf, the finalizer, the
+// registry and the LP TAIL.
+// Testnet research only; unaudited.
+//
+// Three things live here so they cannot drift between leaves:
+//
+//   * the shapes: PoolConfig (curried into every leaf, committed by the merkle
+//     root), ForgeState (the action layer's persistent state), ActionOutput.
+//   * the PROLOGUE every leaf runs. In the first action of a spend it validates
+//     the config once, pins the height with ASSERT_HEIGHT_ABSOLUTE and a window,
+//     asserts the singleton amount, credits the oracle exactly (see `prologue`),
+//     and chains prev_root to the state it started from. A later action in the
+//     same spend only asserts it names the same height.
+//   * the six-leaf merkle root, computed here from one config hash so the
+//     finalizer (every spend) and the registry (registration) agree on what a
+//     pool of a given configuration IS -- V13, second audit M-4.
+//   * the LP handshake: the derived LP action coin id (V10's three-part lock,
+//     part 1) and the message both the pool and the TAIL compute. Under
+//     CHIP-0025 the pool SENDS with mode 23 -- sender committed by puzzle hash,
+//     receiver by coin id -- so the message no longer needs to carry the
+//     launcher, the pool coin id or the action coin id: consensus commits them.
+//
+// The reserve tag is upstream's -42 with an index; the multi-reserve finalizer
+// buckets on it and fails the spend for an index outside the asset count.
+//
+// Nothing here reads or assumes an LP:reserve ratio. lpRatio is a vault genesis
+// parameter that the puzzle's proportional maths then preserves on its own.
+
+import upstream::action::StateTruth;
+import forge_curve::*;
+
+export struct ActionOutput {
+    state_truth: StateTruth,
+    ...conditions: List<Condition>,
+}
+
+// Immutable per pool: curried into each leaf, so a different config is a
+// different merkle root. The asset ids are canonically sorted ascending; native
+// XCH is the zero id and sorts first.
+export struct PoolConfig {
+    asset_ids: List<Bytes32>,
+    weights: List<Int>,
+    fee_bps: Int,
+    protocol_fee_bps: Int,
+    protocol_puzzle_hash: Bytes32,
+    lp_tail_hash: Bytes32,
+    price_scale: Int,
+    oracle_window: Int,
+    // where the DAO fee goes. Immutable; the RATE lives in state so it can
+    // only ever fall (forge_action_dao_fee). Zero means the pool has no DAO and the
+    // prologue then requires the rate to be zero.
+    dao_puzzle_hash: Bytes32,
+}
+
+export struct Oracle {
+    last_height: Int,
+    // price of asset i in asset 0, times price_scale, height-weighted; N-1 entries
+    cums: List<Int>,
+    // V13: the spot prices the last spend credited, N-1 entries. The next spend credits
+    // them over (last_height, birth] -- the blocks after that spend was signed and before
+    // it was included -- which V12 credited to nobody. Second audit, "oracle interval
+    // discard".
+    last_spot: List<Int>,
+}
+
+export struct ForgeState {
+    reserves: List<Int>,
+    total_lp: Int,
+    fees_owed: List<Int>,
+    oracle: Oracle,
+    prev_root: Bytes32,
+    // the current DAO fee (bps of the swap output, like the protocol fee) and
+    // what is owed per reserve; `collect` pays both fees out of the same reserve.
+    dao_fee_bps: Int,
+    dao_owed: List<Int>,
+    // V12: the parent id of each reserve coin, in asset order. Written by the finalizer
+    // from the coins it just messaged, never read from a solution -- CHIP-0062 review P1,
+    // "reserve receiver derivation trusts solution data". Actions pass it through.
+    reserve_parents: List<Bytes32>,
+}
+
+export struct Prologue {
+    height: Int,
+    state: ForgeState,
+    ...conditions: List<Condition>,
+}
+
+export inline const RESERVE_TAG: Int = -42;
+export inline const MIN_ASSETS: Int = 1;
+export inline const MAX_ASSETS: Int = 10;
+export inline const MAX_WEIGHT_UNITS: Int = 8;
+export inline const MAX_TOTAL_WEIGHT: Int = 20;
+export inline const MAX_FEE_BPS: Int = 200;
+export inline const MAX_PROTOCOL_FEE_BPS: Int = 100;
+export inline const MAX_DAO_FEE_BPS: Int = 100;
+// V13: both bounded, so a pool cannot be minted with a scale that makes its first spend
+// exceed the cost limit, nor with a window that removes the inclusion bound -- second
+// audit. The registry additionally pins both to its constants.
+export inline const MAX_PRICE_SCALE: Int = 18446744073709551616;
+export inline const MAX_ORACLE_WINDOW: Int = 4608;
+
+// Pinned LP inners. The melt inner is V10's, byte for byte. The mint inner arrived in
+// V11 and is unchanged here: its only difference from V10 is that the minted coin
+// carries a hint equal to its own inner puzzle hash (CHIP-0020), so the wallet that
+// owns it can see it.
+export inline const LP_MELT_INNER_HASH: Bytes32 = 0x8b5b948a4c0e713bcb0b28ddb85cc1609d799b40c6fb65b2372de96976ad277a;
+// V12: LP units locked for the life of the pool, so every later holder can redeem every
+// unit they hold and the pool always outlives a withdrawal -- CHIP-0062 review P1, "the
+// final LP position cannot redeem". Enforced at registration and in `remove`.
+export inline const LOCKED_BURN: Int = 1;
+
+export inline const LP_MINT_INNER_HASH: Bytes32 = 0x66811aedacdefe1228ecf5c9553e02627173b81db5f8d90ca44f61297bdfc4c6;
+
+export inline const CAT_MOD_HASH: Bytes32 = 0x37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a;
+export inline const CAT_MOD_HASH_HASH: Bytes32 = 0x3cf0e1c3e933019e1e9dd413339b7ad91615de6d626ca332fa5c076b850672d0;
+export inline const OFFER_MOD_HASH: Bytes32 = 0xcfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7;
+export inline const SINGLETON_MOD_HASH: Bytes32 = 0x7faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9f;
+export inline const SINGLETON_LAUNCHER_PUZZLE_HASH: Bytes32 = 0xeff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9;
+
+export inline fn zero_bytes32() -> Bytes32 {
+    0x0000000000000000000000000000000000000000000000000000000000000000
+}
+
+// ---- list helpers -----------------------------------------------------------
+
+export fn count_ints(list: List<Int>) -> Int {
+    if list is nil {
+        0
+    } else {
+        1 + count_ints(list.rest)
+    }
+}
+
+export fn count_bytes(list: List<Bytes32>) -> Int {
+    if list is nil {
+        0
+    } else {
+        1 + count_bytes(list.rest)
+    }
+}
+
+// Out of range fails the spend: `first` of nil raises.
+export fn nth_int(list: List<Int>, index: Int) -> Int {
+    inline let (head, tail) = unchecked_cast::<(Int, List<Int>)>(list);
+    if index == 0 {
+        head
+    } else {
+        nth_int(tail, index - 1)
+    }
+}
+
+export fn nth_bytes(list: List<Bytes32>, index: Int) -> Bytes32 {
+    inline let (head, tail) = unchecked_cast::<(Bytes32, List<Bytes32>)>(list);
+    if index == 0 {
+        head
+    } else {
+        nth_bytes(tail, index - 1)
+    }
+}
+
+// list[index] += delta; an index past the end fails.
+export fn add_at(list: List<Int>, index: Int, delta: Int) -> List<Int> {
+    inline let (head, tail) = unchecked_cast::<(Int, List<Int>)>(list);
+    if index == 0 {
+        (head + delta, tail)
+    } else {
+        (head, add_at(tail, index - 1, delta))
+    }
+}
+
+export fn set_at(list: List<Int>, index: Int, value: Int) -> List<Int> {
+    inline let (head, tail) = unchecked_cast::<(Int, List<Int>)>(list);
+    if index == 0 {
+        (value, tail)
+    } else {
+        (head, set_at(tail, index - 1, value))
+    }
+}
+
+// Element-wise sum of two lists of exactly the same length.
+export fn zip_add(left: List<Int>, right: List<Int>) -> List<Int> {
+    if left is nil {
+        assert right is nil;
+        nil
+    } else {
+        inline let (r, rr) = unchecked_cast::<(Int, List<Int>)>(right);
+        (left.first + r, zip_add(left.rest, rr))
+    }
+}
+
+export fn zip_sub(left: List<Int>, right: List<Int>) -> List<Int> {
+    if left is nil {
+        assert right is nil;
+        nil
+    } else {
+        inline let (r, rr) = unchecked_cast::<(Int, List<Int>)>(right);
+        (left.first - r, zip_sub(left.rest, rr))
+    }
+}
+
+export fn concat(left: List<Condition>, right: List<Condition>) -> List<Condition> {
+    if left is nil {
+        right
+    } else {
+        (left.first, concat(left.rest, right))
+    }
+}
+
+// ---- config validation (V10's validate_config, run once per spend) -------------
+
+fn weights_in_range(weights: List<Int>) -> Bool {
+    if weights is nil {
+        true
+    } else {
+        weights.first >= 1
+            && weights.first <= MAX_WEIGHT_UNITS
+            && weights_in_range(weights.rest)
+    }
+}
+
+// Canonical ascending order also rules out duplicate assets in one pool.
+fn strictly_ascending(asset_ids: List<Bytes32>) -> Bool {
+    if asset_ids is nil {
+        true
+    } else if asset_ids.rest is nil {
+        true
+    } else {
+        asset_ids.first < asset_ids.rest.first && strictly_ascending(asset_ids.rest)
+    }
+}
+
+export fn valid_config(config: PoolConfig) -> Bool {
+    let n = count_bytes(config.asset_ids);
+    let total = sum_weights(config.weights);
+    n >= MIN_ASSETS
+        && n <= MAX_ASSETS
+        && count_ints(config.weights) == n
+        && strictly_ascending(config.asset_ids)
+        && total >= n
+        && total <= MAX_TOTAL_WEIGHT
+        && weights_in_range(config.weights)
+        && config.fee_bps >= 0
+        && config.fee_bps <= MAX_FEE_BPS
+        && config.protocol_fee_bps >= 0
+        && config.protocol_fee_bps <= MAX_PROTOCOL_FEE_BPS
+        // A fee with no recipient would be burned rather than collected.
+        && (config.protocol_fee_bps == 0 || config.protocol_puzzle_hash != zero_bytes32())
+        && config.lp_tail_hash != zero_bytes32()
+        && config.price_scale > 0
+        && config.price_scale <= MAX_PRICE_SCALE
+        && config.oracle_window > 0
+        && config.oracle_window <= MAX_ORACLE_WINDOW
+}
+
+// ---- the six-leaf root ----------------------------------------------------------------
+
+// The six action leaf mod hashes in driver order [swap, add, remove, observe, collect, dao_fee].
+export struct LeafModHashes {
+    swap: Bytes32,
+    add: Bytes32,
+    remove: Bytes32,
+    observe: Bytes32,
+    collect: Bytes32,
+    dao_fee: Bytes32,
+}
+
+// The wallet-sdk MerkleTree over exactly six leaves in driver order: split at
+// (n+1)/2, leaf sha256(1||h), node sha256(2||l||r). Six splits 3 + 3, and each half
+// splits 2 + 1. Hard-coded to this shape; a different leaf count is a different revision.
+export fn six_leaf_root(swap: Bytes32, add: Bytes32, remove: Bytes32, observe: Bytes32, collect: Bytes32, dao_fee: Bytes32) -> Bytes32 {
+    tree_hash_pair(
+        tree_hash_pair(
+            tree_hash_pair(tree_hash_atom(swap), tree_hash_atom(add)),
+            tree_hash_atom(remove),
+        ),
+        tree_hash_pair(
+            tree_hash_pair(tree_hash_atom(observe), tree_hash_atom(collect)),
+            tree_hash_atom(dao_fee),
+        ),
+    )
+}
+
+// V13: the root a pool of configuration `config_hash` MUST have. Every leaf is curried
+// with the same config; the observe leaf additionally with the pool's slot first-curry
+// hash. The finalizer asserts this against the action layer's root on every spend, and
+// the registry rebuilds it at registration, so six leaves of six different configs --
+// the second audit's cross-leaf drain -- can never sit behind one Forge pool coin.
+export fn config_root(leaves: LeafModHashes, config_hash: Bytes32, pool_slot_1st_curry_hash: Bytes32) -> Bytes32 {
+    six_leaf_root(
+        curry_tree_hash(leaves.swap, [config_hash]),
+        curry_tree_hash(leaves.add, [config_hash]),
+        curry_tree_hash(leaves.remove, [config_hash]),
+        curry_tree_hash(leaves.observe, [config_hash, tree_hash_atom(pool_slot_1st_curry_hash)]),
+        curry_tree_hash(leaves.collect, [config_hash]),
+        curry_tree_hash(leaves.dao_fee, [config_hash]),
+    )
+}
+
+// ---- the oracle ------------------------------------------------------------------
+
+// spot_i0 is the Balancer ratio (r_0 / w_0) / (r_i / w_i) scaled to an integer, on the
+// PRE-SPEND reserves, so a spend cannot move the price and record it in the same block.
+fn spots_rest(r0: Int, w0: Int, reserves: List<Int>, weights: List<Int>, price_scale: Int) -> List<Int> {
+    if reserves is nil {
+        assert weights is nil;
+        nil
+    } else {
+        inline let (ri, remaining_reserves) = unchecked_cast::<(Int, List<Int>)>(reserves);
+        inline let (wi, remaining_weights) = unchecked_cast::<(Int, List<Int>)>(weights);
+        let (spot, _) = divmod(r0 * wi * price_scale, ri * w0);
+        (spot, spots_rest(r0, w0, remaining_reserves, remaining_weights, price_scale))
+    }
+}
+
+export fn spots(reserves: List<Int>, weights: List<Int>, price_scale: Int) -> List<Int> {
+    inline let (r0, others) = unchecked_cast::<(Int, List<Int>)>(reserves);
+    inline let (w0, other_weights) = unchecked_cast::<(Int, List<Int>)>(weights);
+    spots_rest(r0, w0, others, other_weights, price_scale)
+}
+
+// cum_i += last_spot_i * tail + spot_i * current. The three lists have exactly the same
+// length; a state whose last_spot is the wrong length fails here.
+export fn credit(cums: List<Int>, last_spot: List<Int>, tail: Int, spot: List<Int>, current: Int) -> List<Int> {
+    if cums is nil {
+        assert last_spot is nil;
+        assert spot is nil;
+        nil
+    } else {
+        inline let (ci, remaining_cums) = unchecked_cast::<(Int, List<Int>)>(cums);
+        inline let (li, remaining_last) = unchecked_cast::<(Int, List<Int>)>(last_spot);
+        inline let (si, remaining_spot) = unchecked_cast::<(Int, List<Int>)>(spot);
+        (ci + li * tail + si * current, credit(remaining_cums, remaining_last, tail, remaining_spot, current))
+    }
+}
+
+// ---- the prologue ------------------------------------------------------------------
+
+export fn prologue(config: PoolConfig, truth: StateTruth, h: Int, birth: Int) -> Prologue {
+    let state = unchecked_cast::<ForgeState>(truth.actual_state);
+    if truth.ephemeral_state is nil {
+        // First action of this spend.
+        assert valid_config(config);
+        let n = count_bytes(config.asset_ids);
+        assert count_ints(state.reserves) == n;
+        assert count_ints(state.fees_owed) == n;
+        assert count_ints(state.dao_owed) == n;
+        // V13: a pool minted under the floor outside the registry cannot be spent at all,
+        // so it cannot trap a later depositor's LP -- second audit, LOCKED_BURN boundary.
+        assert state.total_lp >= LOCKED_BURN;
+        // V13: the exact oracle. The previous spend claimed `last_height` and was included
+        // in the block that created this coin, `birth`. Consensus checks a claimed height
+        // against the PREVIOUS transaction block, so birth > last_height on every real
+        // chain of spends -- and a successor created in this block cannot be spent in it,
+        // which is what closes the review's same-bundle backfill (P1). The previous state
+        // was in force over (last_height, birth] and is credited at the spot it recorded;
+        // this state is in force from birth and is credited, at the spot on the pre-spend
+        // reserves, over [birth, h]. Every block is credited once at the price in force.
+        // V12 credited only h - birth and lost the tail for good, so claiming h = birth
+        // stood the accumulator still -- second audit, "oracle interval discard".
+        // Understating h now defers credit to the next spend; nothing deletes it, and
+        // nothing fabricates it, because birth is a consensus fact and h cannot exceed
+        // the block that includes the spend.
+        assert birth > state.oracle.last_height;
+        assert h >= birth;
+        let spot = spots(state.reserves, config.weights, config.price_scale);
+        // The DAO rate is state, so it is validated here rather than in valid_config;
+        // a fee with no recipient would be burned rather than collected.
+        assert state.dao_fee_bps >= 0;
+        assert state.dao_fee_bps <= MAX_DAO_FEE_BPS;
+        assert state.dao_fee_bps == 0 || config.dao_puzzle_hash != zero_bytes32();
+        Prologue {
+            height: h,
+            state: ForgeState {
+                reserves: state.reserves,
+                total_lp: state.total_lp,
+                fees_owed: state.fees_owed,
+                oracle: Oracle {
+                    last_height: h,
+                    cums: credit(state.oracle.cums, state.oracle.last_spot,
+                                 birth - state.oracle.last_height, spot, h - birth),
+                    last_spot: spot,
+                },
+                // The state this spend started from, so the history chains.
+                prev_root: tree_hash(state),
+                dao_fee_bps: state.dao_fee_bps,
+                dao_owed: state.dao_owed,
+                reserve_parents: state.reserve_parents,
+            },
+            conditions: [
+                AssertMyBirthHeight { height: birth },
+                AssertHeightAbsolute { height: h },
+                AssertBeforeHeightAbsolute { height: h + config.oracle_window },
+                AssertMyAmount { amount: 1 },
+            ],
+        }
+    } else {
+        // Every action in a spend names the same height.
+        assert unchecked_cast::<Int>(truth.ephemeral_state) == h;
+        Prologue { height: h, state: state, conditions: nil }
+    }
+}
+
+// ---- reserves, settlements, LP -------------------------------------------------------
+
+// (-42 index . condition): routed by the finalizer to reserve `index`.
+export fn for_reserve(index: Int, condition: Condition) -> Condition {
+    unchecked_cast::<Condition>((RESERVE_TAG, (index, condition)))
+}
+
+export fn cat_puzzle_hash(asset_id: Bytes32, inner_puzzle_hash: Bytes32) -> Bytes32 {
+    curry_tree_hash(
+        CAT_MOD_HASH,
+        [CAT_MOD_HASH_HASH, tree_hash_atom(asset_id), inner_puzzle_hash],
+    )
+}
+
+export fn settlement_puzzle_hash(asset_id: Bytes32) -> Bytes32 {
+    if asset_id == zero_bytes32() {
+        OFFER_MOD_HASH
+    } else {
+        cat_puzzle_hash(asset_id, OFFER_MOD_HASH)
+    }
+}
+
+// The trader's input coin is an offer settlement spent under its own coin id
+// with no payments; asserting that announcement is what proves it was spent in
+// this bundle, and its mojos are what fund the growing reserve. As V10 did.
+export fn settlement_assert(asset_id: Bytes32, settlement_coin_id: Bytes32) -> Condition {
+    assert settlement_coin_id != zero_bytes32();
+    AssertPuzzleAnnouncement {
+        id: sha256(settlement_puzzle_hash(asset_id) + tree_hash((settlement_coin_id, nil))),
+    }
+}
+
+// V14: the settlement's id, DERIVED from its parent and amount rather than taken from the
+// solution. A coin id commits to its parent, its puzzle hash and its amount, so a leaf given
+// the parent and the amount knows exactly which coin it is being paid with -- and a coin at
+// the settlement puzzle holding a different amount has a different id.
+export fn settlement_coin_id(asset_id: Bytes32, settlement_parent: Bytes32, settlement_amount: Int) -> Bytes32 {
+    assert settlement_parent != zero_bytes32();
+    assert settlement_amount > 0;
+    coinid(settlement_parent, settlement_puzzle_hash(asset_id), settlement_amount)
+}
+
+// V14: the two halves of the input binding (spec 1.8). The puzzle announcement is V10's:
+// the settlement was spent in this bundle under its own id. ASSERT_CONCURRENT_SPEND on the
+// derived id is the new half: the coin that was spent holds AT LEAST `at_least` of the
+// asset, as a fact the puzzle checks rather than one the CAT ring and conservation happen
+// to enforce. The amount bound is the settlement's OWN -- the router carves its fee out of
+// the same coin, so it may exceed the action's input; the inequality ties it to the action.
+export fn settlement_binding(asset_id: Bytes32, settlement_parent: Bytes32, settlement_amount: Int, at_least: Int) -> List<Condition> {
+    assert settlement_amount >= at_least;
+    let id = settlement_coin_id(asset_id, settlement_parent, settlement_amount);
+    [
+        settlement_assert(asset_id, id),
+        AssertConcurrentSpend { coin_id: id },
+    ]
+}
+
+// V14: what a reserve launcher announces about the coin it created (forge_reserve_launcher).
+// `created_puzzle_hash` is the hash the launcher passed to CREATE_COIN -- the reserve's inner
+// hash, which the CAT layer wraps for a CAT reserve and which IS the full hash for XCH. The
+// ASCII prefix keeps the message from ever starting with 0xcb, which the CAT layer reserves
+// for its own ring announcements and refuses from an inner puzzle.
+export fn reserve_launcher_message(created_puzzle_hash: Bytes32, amount: Int, launcher_id: Bytes32) -> Bytes {
+    "forge-reserve-v14" + tree_hash([created_puzzle_hash, amount, launcher_id])
+}
+
+// V10's lock, part 1: the pool derives the LP action coin's id from its parent,
+// the LP CAT puzzle hash with the pinned inner for this mode, and the exact
+// amount it acts on. An impostor coin has a different id and never receives the
+// message.
+export fn lp_action_coin_id(config: PoolConfig, lp_parent_id: Bytes32, inner_hash: Bytes32, amount: Int) -> Bytes32 {
+    assert lp_parent_id != zero_bytes32();
+    sha256(lp_parent_id + cat_puzzle_hash(config.lp_tail_hash, inner_hash) + (amount as Bytes))
+}
+
+// Computed identically by the pool (SEND) and the TAIL (RECEIVE). The sender
+// puzzle and the receiver coin are committed by mode 23, so only what the pool
+// authorizes needs to be in the message.
+export fn lp_message(lp_delta: Int, new_total_lp: Int, next_state_root: Bytes32) -> Bytes32 {
+    tree_hash(["forge-lp-v14", lp_delta, new_total_lp, next_state_root])
+}
+
+// What a coin at the DAO's puzzle hash sends (mode 23, receiver = this pool coin)
+// to lower the DAO fee to `new_bps`. The receiver is committed by consensus, so the
+// message names only the rate.
+export fn dao_fee_message(new_bps: Int) -> Bytes32 {
+    tree_hash(["forge-dao-fee-v1", new_bps])
+}
+
+export fn lp_handshake(
+    config: PoolConfig,
+    lp_parent_id: Bytes32,
+    inner_hash: Bytes32,
+    amount: Int,
+    lp_delta: Int,
+    new_total_lp: Int,
+    next_state_root: Bytes32,
+) -> Condition {
+    SendMessage {
+        mode: SENDER_PUZZLE | RECEIVER_COIN,
+        message: lp_message(lp_delta, new_total_lp, next_state_root),
+        receiver: [lp_action_coin_id(config, lp_parent_id, inner_hash, amount)],
+    }
+}

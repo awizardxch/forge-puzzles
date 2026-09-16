@@ -206,7 +206,7 @@ def resync(payload: dict[str, Any]) -> dict[str, Any]:
     # because a resync is what the browser does when it finds a pool behind the chain,
     # that refusal stopped the swap rather than repairing it. Add the version here when
     # a revision ships; there is no sensible default for an unknown one.
-    REPLAY_LANES = {11: "forge_v11_resync", 13: "forge_v12_resync", 14: "forge_v13_resync"}
+    REPLAY_LANES = {11: "forge_v11_resync", 13: "forge_v12_resync", 14: "forge_v13_resync", 15: "forge_v14_resync"}
     lane = REPLAY_LANES.get(int((stale_snapshot or {}).get("protocol_version") or 0))
     if lane is not None:
         import importlib
