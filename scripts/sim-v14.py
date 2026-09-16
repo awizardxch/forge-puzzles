@@ -100,7 +100,8 @@ async def mint_registry(sim, client, wallet: Wallet) -> SimRegistry:
 
 async def create_pool(sim, client, wallet: Wallet, reg: SimRegistry, assets: list,
                       reserves: list[int], weights: list[int], fee_bps: int = 30,
-                      protocol_fee_bps: int = 5, label: str = "pool", push_now: bool = True):
+                      protocol_fee_bps: int = 5, label: str = "pool", push_now: bool = True,
+                      launcher_knobs: dict | None = None):
     """The deploy script's create-and-register bundle, with simulator coins.
 
     `push_now=False` returns (bundle, pool) instead of pushing, with the registry and
@@ -109,6 +110,11 @@ async def create_pool(sim, client, wallet: Wallet, reg: SimRegistry, assets: lis
     transaction -- the registry singleton is spent repeatedly inside the bundle, which
     is legal because the registry leaves assert no birth height the way the pool
     prologue does.
+
+    `launcher_knobs` is passed through to `reserve_launcher_spends` so a probe can make a
+    launcher create or announce the wrong thing and let the NODE answer. It exists so the
+    refusal probes run the same creation lane as the honest one: a probe that builds its
+    own bundle proves something about the probe.
     """
     total_lp = min(reserves)
     if total_lp < drv.LOCKED_BURN:
@@ -204,7 +210,7 @@ async def create_pool(sim, client, wallet: Wallet, reg: SimRegistry, assets: lis
 
     bundle, _ = drv.registry_spend(
         reg.registry, "forge_registry_register", drv.register_solution(pool, left, right),
-        extra_spends=[funding_spend, *cat_spends, *drv.reserve_launcher_spends(pool), launcher_spend, *eve_spends, fee_spend, *slot_spends])
+        extra_spends=[funding_spend, *cat_spends, *drv.reserve_launcher_spends(pool, **(launcher_knobs or {})), launcher_spend, *eve_spends, fee_spend, *slot_spends])
     if push_now:
         await push(client, sim, bundle, f"create + register {label}")
 

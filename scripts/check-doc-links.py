@@ -58,7 +58,8 @@ def published(rel: str) -> bool:
     if rel.startswith("scripts/"):
         return name in ("mutate-v14.py", "build-v14.py", "sim-v14.py", "sim-v14-batch-security.py",
                         "v14-squat-probe.py", "v14-settlement-probe.py", "v14-slack-probe.py",
-                        "v14-route-audit.py", "check-doc-links.py")
+                        "v14-route-audit.py", "check-doc-links.py",
+                        "sim-v14-review-derivations.py")
     if rel.startswith(("api/", "src/")):
         return False          # the interface lives in forge-ui
     return rel.startswith("contracts/")
