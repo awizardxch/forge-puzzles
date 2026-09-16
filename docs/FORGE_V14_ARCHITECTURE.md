@@ -382,7 +382,7 @@ never inputs to any decision.
 flowchart LR
     MINT["<b>Inception</b><br/>launcher creation memos: [name, symbol]<br/>written by the funding coin — the deployer's address"]
     RN["<b>Rename</b><br/>a coin the deployer's address creates for itself,<br/>hint = launcher id, memos [launcher, name, symbol]"]
-    RES["<b>Resolution</b> (forge_v11_names, shared)<br/>get_coin_records_by_hint(launcher) → coins at the deployer's<br/>puzzle hash whose parent sat there → newest wins, else genesis"]
+    RES["<b>Resolution</b> (forge_names, shared)<br/>get_coin_records_by_hint(launcher) → coins at the deployer's<br/>puzzle hash whose parent sat there → newest wins, else genesis"]
     UI["Frontend · Sage labels · index<br/>name = glyphs (TXCH by name) · symbol = tickers, weights"]
     PUZ["<b>Immutable</b>: assets, weights, LP fee, protocol fee, asset ids<br/>read from the puzzle through the snapshot"]
 
@@ -524,6 +524,6 @@ for confidence.
 | 1, 2, 4, 5 | `contracts/v14/puzzles/*.rue`, `forge_v14_driver.py` (`spend_actions`, `assemble`, `run_leaf`, `reserve_launcher_spends`, `settlement_ref`), `_test_v14_actions.py`, `_test_v14_finalizer.py`, `_test_v14_settlement_amount.py`, `_test_v14_action_binding.py` |
 | 3 | `forge_action_common.rue` (`PoolConfig`, `ForgeState`, `prologue`, `credit`, `spots`, `settlement_binding`), `forge_reserve_amount.rue`, `_test_v14_oracle.py` |
 | 6 | `forge_reserve_launcher.rue`, `forge_registry_*.rue`, `scripts/deploy-v14-testnet.py create-pool`, `forge_v14_create.py`, `_test_v14_registry.py`, `_test_v14_reserves_proved.py`, `_test_v14_lanes_agree.py`, `_test_v14_before_after.py` |
-| 7 | `forge_v11_names.py` (shared), `deploy-v14-testnet.py rename`, `forge_v14_index.py` |
+| 7 | `forge_names.py` (shared), `deploy-v14-testnet.py rename`, `forge_v14_index.py` |
 | 8 | `forge_v14_offer.py`, `forge_v14_route.py`, `api/_forgeResponder.js`, the index importer (in the private repository), `forge_resync.py` |
 | 9 | `forge_v14_offer.snapshot_to_pool`, `_test_v14_discoverability.py` |

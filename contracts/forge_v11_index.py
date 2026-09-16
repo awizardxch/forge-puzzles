@@ -146,8 +146,8 @@ def pool_from_record(record: dict) -> drv.V11Pool:
 
 
 def chain_names(state: dict) -> dict[str, dict]:
-    """launcher id -> what the chain says the pool is called (forge_v11_names.resolve)."""
-    import forge_v11_names as names
+    """launcher id -> what the chain says the pool is called (forge_names.resolve)."""
+    import forge_names as names
     out = {}
     for record in state["pools"]:
         try:

@@ -27,43 +27,13 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 import forge_stdin as fs
-from _test_v6_transition import USER_PH, cat_maker_spend, load_v6_pool, make_offer
+from _forge_testkit import DEV_BPS, DEV_PH, USER_PH, cat_maker_spend, cat_wrap, make_offer, payouts_to
+from _test_v6_transition import load_v6_pool
 from forge_offer import MODE_SWAP, ZERO_32
 from forge_math import swap_output
 from forge_transition import build_transition
 
-DEV_PH = bytes32.fromhex("de" * 32)
 NONCE = bytes32.fromhex("ee" * 32)
-DEV_BPS = 50
-
-
-def cat_wrap(asset_id: bytes32, inner_hash: bytes32) -> bytes32:
-    """The outer puzzle hash a CAT spend rewrites `inner_hash` into."""
-    quoted = calculate_hash_of_quoted_mod_hash(CAT_MOD.get_tree_hash())
-    return curry_and_treehash(
-        quoted, shatree_atom(CAT_MOD.get_tree_hash()), shatree_atom(asset_id), inner_hash)
-
-
-def payouts_to(bundle, asset_id: bytes32) -> dict[bytes32, int]:
-    """Total value each *inner* puzzle hash receives in `asset_id`.
-
-    CAT spends rewrite CREATE_COIN puzzle hashes into their wrapped form, so map
-    each candidate back through the same wrapping rather than matching raw.
-    """
-    totals: dict[bytes32, int] = {}
-    for spend in bundle.coin_spends:
-        cond = conditions_dict_for_solution(spend.puzzle_reveal, spend.solution, 11_000_000_000)
-        for c in cond.get(OP.CREATE_COIN, []):
-            amount = int.from_bytes(c.vars[1], "big") if c.vars[1] else 0
-            if amount > 0:
-                ph = bytes32(c.vars[0])
-                totals[ph] = totals.get(ph, 0) + amount
-    if asset_id == ZERO_32:
-        return totals
-    return {
-        inner: totals.get(cat_wrap(asset_id, inner), 0) + totals.get(inner, 0)
-        for inner in (USER_PH, DEV_PH)
-    }
 
 
 def main() -> int:

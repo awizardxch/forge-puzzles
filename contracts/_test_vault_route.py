@@ -29,7 +29,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 import forge_stdin as fs
-from _test_v6_transition import USER_PH, audit, make_offer, xch_maker_spend
+from _forge_testkit import USER_PH, audit, make_offer, xch_maker_spend
 from forge_offer import ZERO_32
 from forge_vault_route import (
     build_swap_then_redeem,

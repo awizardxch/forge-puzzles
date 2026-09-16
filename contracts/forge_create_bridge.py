@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""The wallet side of a keyless V11 creation, over Sage RPC (phase 8.1).
+"""The wallet side of a keyless pool creation, over Sage RPC.
 
-The builder (forge_v11_create via forge_stdin) never touches a key. What a creator's
+Revision-agnostic: nothing here depends on which protocol the pool will run, only on
+what the creator's wallet must hand over. The builder (forge_v14_create via
+forge_stdin) never touches a key. What a creator's
 wallet must do is exactly two things, and this bridge does them through the local
 Sage the interface already talks to:
 
@@ -21,6 +23,8 @@ stdout: one JSON object; `success` false with `error` on failure.
 """
 from __future__ import annotations
 
+import os
+import re
 import importlib.util
 import json
 import sys
@@ -34,9 +38,59 @@ sys.stdout.reconfigure(encoding="utf-8")
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 from chia.util.bech32m import decode_puzzle_hash  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("deploy_v11", ROOT / "scripts" / "deploy-v11-testnet.py")
-deploy = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(deploy)
+def _load_deploy():
+    """Load the CURRENT revision's deploy module for its Wallet and coin helpers.
+
+    This used to name `deploy-v11-testnet.py` outright, and every revision since kept
+    calling it -- so a live V14 creation picked its coins with a wallet three revisions
+    old, and any fix made to the newer wallet never reached the path a creator takes.
+    The bridge needs `Wallet`, `coin_to_json` and `strip`, which every revision's deploy
+    script has; what it must not do is pin one.
+
+    Highest version present wins, so cutting a revision needs no edit here.
+    `FORGE_DEPLOY_SCRIPT` overrides it for driving a retired revision on purpose.
+    """
+    override = os.environ.get("FORGE_DEPLOY_SCRIPT")
+    if override:
+        path = Path(override)
+        if not path.is_absolute():
+            path = ROOT / path
+    else:
+        found = sorted(
+            ((int(m.group(1)), p) for p in (ROOT / "scripts").glob("deploy-v*-testnet.py")
+             if (m := re.fullmatch(r"deploy-v(\d+)-testnet\.py", p.name))),
+            key=lambda t: t[0])
+        if not found:
+            raise SystemExit("[aWizard] no scripts/deploy-v<N>-testnet.py to load a wallet from")
+        path = found[-1][1]
+    spec = importlib.util.spec_from_file_location(path.stem.replace("-", "_"), path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for needed in ("Wallet", "coin_to_json", "strip"):
+        if not hasattr(module, needed):
+            raise SystemExit(f"[aWizard] {path.name} has no {needed}; this bridge needs it")
+    return module
+
+
+class _Deploy:
+    """The deploy module, loaded on FIRST USE rather than at import.
+
+    Importing this file must not need a deploy script. The public repository ships the
+    puzzles and their suites but not the scripts that drive a wallet, so resolving the
+    module at import time made `import forge_create_bridge` fail outright there -- the
+    same shape as the retired lane that made `forge_stdin` unimportable. This bridge
+    only ever needs a wallet when it actually runs an action.
+    """
+
+    _mod = None
+
+    def __getattr__(self, name: str):
+        if _Deploy._mod is None:
+            _Deploy._mod = _load_deploy()
+        return getattr(_Deploy._mod, name)
+
+
+deploy = _Deploy()
 
 
 def pick(payload: dict) -> dict:
