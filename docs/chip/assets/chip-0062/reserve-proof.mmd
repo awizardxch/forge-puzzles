@@ -1,0 +1,17 @@
+flowchart LR
+    subgraph lineage["One lineage per reserve, inside the registration bundle"]
+        GP["<b>Grandparent</b><br/>the creator's funding coin"]
+        LAUNCH["<b>Reserve launcher</b><br/>creates one coin at the hash<br/>it is given, for its whole amount"]
+        RES["<b>Reserve coin</b><br/>hinted with the launcher id"]
+        GP -->|"creates"| LAUNCH
+        LAUNCH -->|"creates"| RES
+    end
+
+    ANN["<b>CreateCoinAnnouncement</b><br/>'forge-reserve-v14' + tree_hash(<br/>created_puzzle_hash, amount, launcher_id )"]
+    REG["<b>register</b>, in the same transaction<br/>P_i = coinid( grandparent_i, launcher_hash_i, reserves[i] )<br/>builds the expected message from the reserve hash IT derives<br/>the grandparent is given; the reserve's own id is never named"]
+
+    LAUNCH -->|"announces what it created"| ANN
+    REG ==>|"ASSERT_COIN_ANNOUNCEMENT from P_i"| ANN
+
+    linkStyle 2 stroke:#dba063,stroke-width:2px,color:#dba063
+    linkStyle 3 stroke:#58b8a2,stroke-width:2.5px,color:#58b8a2

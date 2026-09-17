@@ -83,6 +83,10 @@ No endorsement by CHIP-0050's author or by CNI is claimed or implied; the design
 > listed under **Additional Assets**. What follows is the normative summary; the
 > detailed document is the part that allows a competing implementation.
 
+![A pool is born once, traded many times, and never dies; the dashed boundary marks the leaves this proposal specifies](../assets/chip-0062/lifecycle.svg)
+
+*The whole life of a pool. Everything inside the dashed boundary is a leaf this proposal specifies; the deployment index and the resync beneath it are the reference implementation's own bookkeeping and are out of scope.*
+
 ### Coin layout
 
 A Forge pool is:
@@ -94,7 +98,7 @@ A Forge pool is:
 
 ![One pool spend: a leaf emits a tagged condition, the finalizer routes it and derives the reserve's coin id from committed state](../assets/chip-0062/pool-spend.svg)
 
-*A leaf never addresses a reserve. It emits a tagged condition; the finalizer routes it, derives the receiver's coin id from state, and is the only thing that recreates the singleton.*
+*A leaf never addresses a reserve. It emits a tagged condition; the finalizer routes it, derives the receiver's coin id from committed state, and is the only thing that recreates the singleton. The red edge is the path that does not exist.*
 
 ### Configuration and state
 
@@ -126,6 +130,10 @@ across a swap, net of fees. A swap supplying `x` of asset `i` and claiming `y` o
 | DAO fee | Lowers the DAO rate on a message from the configured recipient. The new rate MUST be strictly lower than the current one. |
 
 One or more leaves may run in a single spend; the action layer threads state from each to the next, and the finalizer commits the last. A spend that runs no leaf is refused: the action layer asserts a non-empty action list, so the pool cannot be re-created without at least one action having been checked.
+
+![A trade end to end: the wallet signs, the router composes, and the dashed span is where the puzzle runs](../assets/chip-0062/offer-lane.svg)
+
+*A trade from signature to settlement. The router holds no key and takes no custody; everything above the dashed span is off chain, and the span itself is the only part this proposal specifies. A conforming implementation may compose that bundle however it likes.*
 
 The first leaf of a spend runs a prologue that pins the spend to a height: it asserts the claimed height `h` as an absolute height with a window for inclusion, and it asserts the pool coin's own birth height (`ASSERT_MY_BIRTH_HEIGHT`). It MUST also require `birth > last_height` and `h >= birth`. Both hold for every real chain of spends, because a claimed height is checked against the previous transaction block while the coin it creates is born in a later one, and together they make the two intervals below non-negative. They also close the cross-generation case outright: a successor created in the block being made cannot be spent in it, since the largest legal `h` is the previous transaction block's height while the successor's birth is one greater, so `h >= birth` has no solution.
 
@@ -234,7 +242,7 @@ These live alongside the reference implementation, in the public [`forge-puzzles
 * Comparison against publicly documented AMM failures - [`FORGE_AUDIT_TIBETSWAP.md`](https://github.com/awizardxch/forge-puzzles/blob/main/docs/FORGE_AUDIT_TIBETSWAP.md)
 * Reference implementation and test suites - <https://github.com/awizardxch/forge-puzzles>
 
-The three figures in **Specification** are carried in this repository, at `assets/chip-0062/`, so the proposal reads without a network fetch. The documents above remain in the reference repository so that the specification and the code it describes cannot drift apart; if the Editor would rather they were carried here too, they can be copied alongside the figures.
+The five figures in **Specification** are carried in this repository, at `assets/chip-0062/`, so the proposal reads without a network fetch. Each ships as the Mermaid source beside the rendered SVG, so a figure diffs like text and can be regenerated rather than redrawn; the SVGs are self-contained, referencing no font or script, and carry their own background. The documents above remain in the reference repository so that the specification and the code it describes cannot drift apart; if the Editor would rather they were carried here too, they can be copied alongside the figures.
 
 ## Revision History
 
@@ -248,7 +256,7 @@ The three figures in **Specification** are carried in this repository, at `asset
 
   Two further requirements are stated that the text had left to the implementation. A leaf that takes value must bind its settlement by **parent and amount** and assert the derived coin, rather than asserting an announcement that says nothing about how much the coin holds; and the section says plainly what that does *not* guarantee, since an assertion is not consumed and conservation is a property of the whole bundle. And the locked minimum is **one unit**: it exists so a pool is never spendable-but-empty, and a larger floor only strands liquidity, measured at a median 2.21% per pool against about 0.002%.
 
-  Test Cases gains the rule that a mutation verdict of "survived" means *unreached*, never *redundant* - the method error behind revision 7's correction, now written down as guidance rather than as an apology. Specification gains three figures, in `assets/chip-0062/`: one pool spend, the settlement binding against the shape it replaces, and the reserve proof at registration. The reference implementation has moved to V14 (protocol 15); V13's testnet liquidity was withdrawn and its sources removed from the public repository, as V12's and V11's were, and the Additional Assets list names the V14 documents.
+  Test Cases gains the rule that a mutation verdict of "survived" means *unreached*, never *redundant* - the method error behind revision 7's correction, now written down as guidance rather than as an apology. Specification gains five figures, in `assets/chip-0062/`, each with its Mermaid source beside it: the pool lifecycle, one pool spend, a trade end to end, the settlement binding against the shape it replaces, and the reserve proof at registration. The lifecycle and the trade carry a dashed boundary marking where this proposal's normative surface stops, because a reader of a CHIP needs to know which half of a diagram is being specified and which half is one implementation's choice. The reference implementation has moved to V14 (protocol 15); V13's testnet liquidity was withdrawn and its sources removed from the public repository, as V12's and V11's were, and the Additional Assets list names the V14 documents.
 
 * **Revision 7 (2026-09-15).** Two corrections, no design change. The Feasibility section said the puzzle uses CHIP-0050's upstream action layer and finalizer with no changes to either; the action layer is upstream and unchanged, but the pool's finalizer is this proposal's own multi-reserve finalizer, and the text now says so, because it is the custom code a reviewer must read and it is where the cross-leaf binding of revision 5 lives. And the author's reply to the fourth review stated that the `add` leaf's non-negative-deposit assertion was redundant; it is load-bearing, as that review demonstrated and the author has reproduced, so the reference implementation's regression suite now pins it. The reference implementation itself is unchanged by either.
 * **Revision 6 (2026-09-15).** Housekeeping, no design change. The Additional Assets list named the previous revision's specification, which was withdrawn from the reference repository when this revision replaced it, so the link resolved to nothing; it now names the current one. The architecture description and the written CLVM pass have been brought to this revision and are listed alongside it, restoring the three-document set the list carried before those two were withdrawn with the revision they described.
