@@ -1,0 +1,13 @@
+flowchart TB
+    subgraph named["The id is NAMED &mdash; what V13 did"]
+        N1["solution: settlement_coin_id"]
+        N2["assert announcement( asset, id )"]
+        N3["binds the asset and the id<br/>says nothing about how much it holds<br/><b>a one-mojo coin passes as a 250,000 input</b>"]
+        N1 --> N2 --> N3
+    end
+    subgraph derived["The id is DERIVED &mdash; what V14 requires"]
+        D1["solution: parent, amount"]
+        D2["id = coinid( parent, settlement_puzzle_hash, amount )<br/>the third input comes from the ASSET, not the solution"]
+        D3["assert announcement AND<br/>ASSERT_CONCURRENT_SPEND( id )<br/><b>with amount >= the input being credited</b>"]
+        D1 --> D2 --> D3
+    end
