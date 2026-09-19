@@ -41,8 +41,17 @@ import sys
 
 sys.path.insert(0, ".")
 
-from chia.consensus.check_time_locks import check_time_locks
-from chia.types.coin_record import CoinRecord
+try:
+    from chia.consensus.check_time_locks import check_time_locks      # chia-blockchain <= 2.5
+except ModuleNotFoundError:
+    # 2.7 moved it into the mempool manager. Without this fallback the suite died at
+    # import on a current install -- before reaching the skip that says which build is
+    # absent, and reading as a failing test (audit run 2026-09-19, QA-1).
+    from chia.full_node.mempool_manager import check_time_locks
+try:
+    from chia.types.coin_record import CoinRecord                      # chia-blockchain <= 2.5
+except ModuleNotFoundError:
+    from chia_rs import CoinRecord                                     # 2.7: the Rust type
 from chia.util.errors import Err
 from chia_rs import Coin, SpendBundle
 from chia_rs.sized_bytes import bytes32
@@ -82,7 +91,17 @@ def timelocks(kit, bundle, births, peak=PEAK):
             records[cid] = CoinRecord(cs.coin, uint32(peak + 1), uint32(0), False, uint64(TS))
         else:
             records[cid] = CoinRecord(cs.coin, uint32(births[cid]), uint32(0), False, uint64(TS))
-    return check_time_locks(records, conds, uint32(peak), uint64(TS)), ephemeral
+    # chia 2.7 moved this into chia_rs: it grew a fifth argument, `nowrap`, which the node
+    # binds to `peak >= HARD_FORK2_HEIGHT`, and it returns the error as an int code rather
+    # than an Err. Both handled here so the suite reads the same on 2.5 and 2.7 (QA-1).
+    import inspect
+    kwargs = {}
+    if "nowrap" in inspect.signature(check_time_locks).parameters:
+        kwargs["nowrap"] = int(peak) >= int(kit.DEFAULT_CONSTANTS.HARD_FORK2_HEIGHT)
+    result = check_time_locks(records, conds, uint32(peak), uint64(TS), **kwargs)
+    if isinstance(result, int) and not isinstance(result, Err):
+        result = Err(result)
+    return result, ephemeral
 
 
 def birth_asserts(kit, bundle):

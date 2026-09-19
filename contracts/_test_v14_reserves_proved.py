@@ -50,7 +50,11 @@ def refuses(label, thunk, expect_code=None):
         ok = expect_code is None or code == str(expect_code)
         return check(label, ok, f"{str(exc)[:48]}" + ("" if ok else f"  (expected {expect_code})"))
     except Exception as exc:
-        return check(label, True, f"{type(exc).__name__} (local run)")
+        # QA-2: only a CLVM failure is the puzzle refusing locally. Anything else is the
+        # probe failing to run it, and must not pass as a refusal.
+        reason = kit.refusal_reason(exc)
+        return check(label, reason is not None,
+                     "ValueError (local run)" if reason else f"probe broke: {type(exc).__name__}: {str(exc)[:60]}")
     return check(label, False, "ACCEPTED")
 
 
