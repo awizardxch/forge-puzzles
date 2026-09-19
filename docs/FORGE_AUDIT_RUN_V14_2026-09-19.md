@@ -6,10 +6,17 @@ the private monorepo it is sliced out of — so that what is recorded here is wh
 auditor gets by running the same commands. It is the runbook's first execution against the
 published tree, and the first thing it found was in the tooling, not the puzzles.
 
-**Verdict: no new finding against the puzzles.** Five findings against the published
-repository's own test tooling, documents and mutation arguments, all fixed in this run and
-re-verified. Three residuals already known from the CHIP-0062 disposition, restated below
-rather than rounded to closed.
+**Verdict: no new finding against the puzzles.** Seven findings against the published
+repository's own test tooling, documents and mutation arguments — five from the baseline
+run and two from an independent QA pass by a second model — all fixed in this run and
+re-verified on two versions of the Chia stack. Three residuals already known from the
+CHIP-0062 disposition, restated below rather than rounded to closed.
+
+**Who ran what.** The baseline run and its fixes: Claude (Opus 5, then Fable 5.1). The QA
+pass, in the runbook's simulator-and-QA role: GPT-6 Astra (Copilot), working from a clone
+of this repository with a *newer* Chia install than the baseline — which is what found
+QA-1. Its results and corrections are merged below rather than appended, and the record
+says where they changed something.
 
 ## Revision under audit
 
@@ -19,7 +26,8 @@ rather than rounded to closed.
 | Puzzles | `contracts/v14` — protocol 15, live on testnet11 with 32 pools since 2026-09-16 |
 | Compiled by | rue 0.8.4, `contracts/v14/compiled/manifest.json` built 2026-09-16T06:40:11Z, 41 outputs |
 | Fingerprint | sha256 over every `.rue`, `.hex`, `.hash` and the manifest under `contracts/v14`, sorted: `858ea64356943ff96eecb02d45888c195b246a362b15b66c8e6ab73eadd8090b` |
-| Toolchain | Python 3.11.9, chia-blockchain 2.5.5, chia_rs 0.27.0 |
+| Toolchain, baseline | Python 3.11.9, chia-blockchain 2.5.5, chia_rs 0.27.0 |
+| Toolchain, QA pass | Python 3.11.4, chia-blockchain 2.7.4, chia_rs 0.48.0, pytest 8.4.2 — deliberately kept different after QA-1 |
 | Chain | testnet11: peak 4,706,461 when the run began, 4,706,559 when the chain lane ran |
 
 The fingerprint was taken before and after the sync that published the runbook and the
@@ -64,7 +72,7 @@ The runbook's Rule 0.5: pick the lane that can answer the question.
 | `_test_v14_route_lane.py` | 150/150 |
 | `_test_v14_second_review.py` | 15/15 |
 | `_test_v14_settlement_amount.py` | 12/12 |
-| `_test_v14_solution_widths.py` | 33/33 at first run; 44/44 after T-5 added three lanes — new in this run, see below |
+| `_test_v14_solution_widths.py` | 33/33 at first run; 49/49 after T-5 and QA-2 added their lanes — new in this run, see below |
 | `_test_version_hygiene.py` | every crossing argued |
 | `_test_mips.py` | 146 |
 | `_test_v14_before_after.py` | skip: the V13 build is not published (was a crash — T-1 below) |
@@ -126,8 +134,10 @@ pools people are trading.
 
 ### Adversarial widths — the test the CHIP-0062 audit asked for
 
-`_test_v14_solution_widths.py`, new in this run: every solution-supplied `Bytes32` fed
-values of 0, 1, 4, 31, 33 and 64 bytes, with the honest 32-byte control beside each.
+`_test_v14_solution_widths.py`, new in this run: the solution-supplied `Bytes32` fields
+in the table below fed values of 0, 1, 4, 31, 33 and 64 bytes, with the honest 32-byte
+control beside each. Four fields across three puzzles — not every solution field the
+design has, and the suite's own header says which.
 
 | Puzzle | Field | Control | Widths refused |
 |---|---|---|---|
@@ -137,11 +147,16 @@ values of 0, 1, 4, 31, 33 and 64 bytes, with the honest 32-byte control beside e
 | LP TAIL | `pool_inner_puzzle_hash` | accepted | 6/6 |
 | LP TAIL | `next_state_root` | accepted | 6/6 |
 
-No length is asserted anywhere, and none needs to be: each field feeds a preimage whose
-hash is compared against something consensus committed — a coin id the bundle must spend
-or an announcement a coin must make — so a wrong width names a coin that exists nowhere.
-The suite pins that property, and it fails the day a derived hash is compared against
-anything consensus did not commit, which is the refactor the audit warned about.
+No length is asserted in these fields, and the refusal mechanism is field-dependent —
+a distinction the QA pass drew and the baseline had blurred. The swap's settlement parent
+fails in the **native `coinid` operator**, which hard-rejects any operand that is not 32
+bytes (`Invalid Parent Coin ID, not 32 bytes`) before any hash is compared. The other
+three feed a hand-written sha256 preimage whose result is compared against something
+consensus committed — a coin id the bundle must spend or an announcement a coin must make
+— so a wrong width names a coin that exists nowhere and fails on message pairing. The
+suite pins the refusal for the covered fields; it does not claim explicit length checks
+are unnecessary everywhere, and it fails the day a derived hash is compared against
+anything consensus did not commit.
 
 ### Mutation — `scripts/mutate-v14.py`
 
@@ -268,9 +283,67 @@ test as to a puzzle: a claim is worth what its execution is worth.
   runbook's preferred answer -- write the probe -- was taken: `_test_v14_solution_widths.py`
   feeds the zero hash to every solution-supplied `Bytes32` and gains a registry lane for
   the launcher parent and the reserve grandparent, and the mutation tool now runs that
-  suite, so all four lines read KILLED rather than argued. The mutation table above is
-  the run after that change.
+  suite, so **three** of the four lines read KILLED rather than argued; the fourth,
+  `lp_parent_id`, stays UNREACHED with its CAT-lineage argument, as the mutation section
+  says. (The baseline text of this bullet said all four; the QA pass caught the
+  inconsistency.) The mutation table above is the run after that change.
 - **Cost:** a suite, a tool list and a JSON file. No hash moves.
+
+### QA-1 — Five suites failed on a current Chia install
+
+- **Risk:** none to funds; an outside auditor on today's dependencies would see five
+  failing suites and could not tell them from findings
+- **Source:** `forge_v14_driver.validate()`, which every suite reads refusals through; the
+  time-lock suite's imports and its call
+- **Observed (QA pass, chia-blockchain 2.7.4 / chia_rs 0.48.0):** `_test_v14_asset_scope`
+  7/8, `_test_v14_reserves_proved` 14/21, `_test_v14_settlement_amount` 6/12,
+  `_test_v14_message_binding` six failures, `_test_v14_consensus_timelocks` an import
+  error. Every one a genuine refusal misread: chia_rs 0.48 raises
+  `ValueError("ValidationError", 12, "validation error: ...")` — a flat three-tuple —
+  where 0.27 raised a bare `TypeError: 12`, and the suites read the code off the end of
+  the message. The time-lock suite imported two modules that 2.7 moved into `chia_rs`,
+  and the Rust `check_time_locks` gained a fifth argument, `nowrap`, and returns an
+  integer code.
+- **Fixed:** at the one funnel. `validate()` normalises both shapes to a message ending
+  in the numeric code, so no suite changed its parsing. The time-lock suite falls back
+  to the 2.7 locations, passes `nowrap` exactly as the node does
+  (`peak >= HARD_FORK2_HEIGHT`), and converts an integer result to `Err`. Both wordings of
+  the native `coinid` refusal are recognised as the interpreter refusing.
+- **Re-verified on both stacks, whole set:** chia 2.5.5 — 32 suites pass, 1 skips
+  (provenance, which needs a git remote to check against); chia 2.7.4 — the same 32
+  pass, the same 1 skips. Nothing else changed between the two.
+
+### QA-2 — A broken probe could count as a refusal
+
+- **Risk:** none to funds; audit assurance — a harness that never reaches the puzzle
+  would pass forever
+- **Source:** `refuses()` in `_test_v14_reserves_proved.py` and
+  `_test_v14_settlement_amount.py`; `outcome()` in `_test_v14_solution_widths.py`
+- **Observed (QA pass, by fault injection):** a callable raising
+  `AttributeError("synthetic harness defect; no puzzle executed")` was reported by the
+  reserve helper as a refusal, and a synthetic `TypeError` by the width helper as
+  refused. The real probes in this run refused through real puzzle and consensus errors;
+  the defect is that a future broken one would not be noticed. This is the runbook's
+  "a failure for the wrong reason is not a fix" rule, turned on the helpers themselves.
+- **Fixed:** one predicate in the driver, `refusal_reason()`. A refusal is consensus
+  saying no (`Rejected`) or the interpreter saying no (a `ValueError` carrying a CLVM
+  failure: `clvm raise`, `div with 0`, the `coinid` wordings, and the rest of the
+  interpreter's vocabulary). Anything else — an `AttributeError`, a `TypeError` from a bad
+  call, a Python `ValueError` — is BROKEN and fails the check. All three helpers use it.
+  The fault injection is kept as a regression: `_test_v14_solution_widths.py` feeds its
+  own `outcome()` a synthetic `AttributeError`, `TypeError` and Python `ValueError` and
+  requires each to read BROKEN, and a `Rejected` and a `clvm raise` to read refused.
+
+### What the QA pass added beside the findings
+
+`_test_v14_audit_qa.py`, written by the QA pass and ported into the tree: on a real node,
+each reserve launcher omitted, mis-targeted, mis-hinted or short by one mojo is refused
+with the exact consensus code (`ASSERT_ANNOUNCE_CONSUMED_FAILED` four ways,
+`ASSERT_MY_AMOUNT_FAILED` once) and the unchanged honest registration then confirms; L-3
+reproduced — two zero-rate pools differing only in an inert DAO recipient register under
+two keys; L-5 narrowed as above. 7/7 on both stacks. One of its assertions matched on
+the wrong error text on arrival (`divmod|zero`, for an interpreter that says
+`div with 0`) and was corrected in the port.
 
 ## Residuals, restated
 
@@ -283,9 +356,13 @@ while the external audit runs; they are named here so this run cannot be read as
   zero-rate pool can never raise its rate, so the field is economically inert; what it
   buys is near-duplicate listings, each of which must fund real reserves (V14's reserve
   proof). One clause in `valid_pool` closes it, reaching the registry alone. Queued.
-- **L-5.** `reserves[i] > 0` is enforced by the registry, not the prologue. An
-  unregistered pool opened with a zero reserve divides by zero in its own prologue —
-  creator-self-inflicted and unreachable through the registry.
+- **L-5.** `reserves[i] > 0` is enforced by the registry, not the prologue. Narrowed by
+  the QA pass, which ran the compiled leaf rather than reading it: a zero **denominator**
+  reserve divides by zero in the prologue (`div with 0`); a zero **numerator** reserve is
+  accepted by `observe` and records a spot price of zero. Both are creator-self-inflicted
+  on an unregistered pool and unreachable through the registry, which enforces positive
+  reserves; neither is an exploit of a registered pool. Pinned in
+  `_test_v14_audit_qa.py`.
 - **L-6.** Observation slots are write-only: no leaf sends the message `upstream/slot.rue`
   requires, so every slot is permanent amount-0 dust and the live consumer path is the
   same-bundle announcement. A spender is designed (folded into `observe`, not a seventh
@@ -296,7 +373,7 @@ while the external audit runs; they are named here so this run cannot be read as
 | Requirement | Status |
 |---|---|
 | The exact compiled revision tested is identified | `5f26138c`, fingerprint `858ea643…8090b`, 41 manifest hashes |
-| The honest control passes in every lane | offline 28 suites, simulator 72/72 and 22/22, testnet11 34/34 and 364/364, every width sweep's control accepted |
+| The honest control passes in every lane | offline 32 suites pass on chia 2.5.5 and again on 2.7.4, simulator 72/72 and 22/22, QA 7/7, testnet11 34/34 and 364/364, every width sweep's control accepted |
 | Each finding has a reproducible probe, or is marked provisional | T-1–T-4 reproduced by running the suites and the checker in this clone; residuals cite their suites |
 | The fix is recompiled | no puzzle fix was needed; no hash moved (fingerprint identical) |
 | Positive and negative regression cases rerun after the fixes | offline lane re-run in the clone after T-1..T-4: 28 passed, 0 failed, 4 skipped with exit 2 (T-1's crash now a skip); `_test_v14_solution_widths.py` 44/44 in the clone, with the zero-hash width case, the registry lane and the consistent zero-parent lane added for T-5; checker exit 0 in both modes; fingerprint unchanged |

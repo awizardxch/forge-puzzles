@@ -766,13 +766,62 @@ def lp_melt_spend(pool: V14Pool, burn: int, new_total_lp: int, next_state_root: 
 
 # ---- validation ------------------------------------------------------------------------------------
 
+def validation_code(exc: BaseException):
+    """The consensus code inside a chia_rs validation error, whichever shape raised it;
+    otherwise the exception's own text."""
+    args = getattr(exc, "args", ())
+    # chia_rs 0.48 raises ValueError("ValidationError", 147, "validation error: ...") --
+    # a flat three-tuple, which is what str(exc) then prints as a tuple.
+    if len(args) >= 2 and args[0] == "ValidationError" and isinstance(args[1], int):
+        return args[1]
+    if len(args) == 1 and isinstance(args[0], tuple) and len(args[0]) >= 2             and args[0][0] == "ValidationError" and isinstance(args[0][1], int):
+        return args[0][1]
+    text = str(exc).strip()
+    return int(text) if text.isdigit() else text
+
+
+# What a CLVM runtime reports when a puzzle refuses or dies. A ValueError carrying one of
+# these came from the interpreter; a ValueError carrying anything else came from Python.
+CLVM_FAILURES = ("clvm raise", "div with 0", "path into atom", "first of non-cons",
+                 "rest of non-cons", "cost exceeded", "invalid operator", "not enough arguments",
+                 "too many arguments", "invalid operand", "ValidationError",
+                 # the native coinid operator hard-rejecting a non-32-byte operand: the
+                 # puzzle refusing, through the interpreter, before any hash is compared.
+                 # chia_rs 0.27 says "coinid: invalid parent coin id"; 0.48 says
+                 # "InvalidOperatorArg: CoinID Error: Invalid Parent Coin ID, not 32 bytes".
+                 "coinid", "CoinID Error", "InvalidOperatorArg")
+
+
+def refusal_reason(exc: BaseException):
+    """Why a probe was refused, or None if it was not refused but BROKEN.
+
+    A refusal is consensus saying no (Rejected) or the puzzle saying no (a CLVM failure).
+    An AttributeError, a TypeError from a bad call, a KeyError -- those are the harness
+    failing to run the puzzle at all, and a helper that counted them as refusals would
+    let a broken probe pass forever. Fault-injected and pinned in
+    _test_v14_solution_widths.py (audit run 2026-09-19, QA-2)."""
+    if isinstance(exc, Rejected):
+        return f"Rejected: {exc}"
+    if isinstance(exc, ValueError):
+        text = str(exc)
+        if any(marker in text for marker in CLVM_FAILURES):
+            return f"clvm: {text[:70]}"
+    return None
+
+
 def validate(bundle: SpendBundle):
     """Consensus-level validation: raises Rejected on any failure, else returns
     (conditions, additions) where additions is a list of (puzzle_hash, amount)."""
     try:
         conds = get_conditions_from_spendbundle(bundle, MAX_COST, DEFAULT_CONSTANTS, VALIDATION_HEIGHT)
-    except Exception as exc:  # chia_rs raises ValueError / TypeError with the validation code
-        raise Rejected(f"{type(exc).__name__}: {exc}") from exc
+    except Exception as exc:
+        # Two shapes, depending on chia_rs. Up to 0.27 a validation failure is a bare
+        # numeric code -- `TypeError: 12`. From 0.48 it is
+        # `ValueError(("ValidationError", 12, "validation error: AssertCoinAnnouncementFailed"))`.
+        # Every suite reads the code off the END of this message, so it is normalised here,
+        # once, rather than in each of them: an audit QA pass on the newer chia found four
+        # suites misreading intended refusals as failures (audit run 2026-09-19, QA-1).
+        raise Rejected(f"{type(exc).__name__}: {validation_code(exc)}") from exc
     # chia_rs reports create_coin as (puzzle_hash, amount, hint) tuples
     additions = [(bytes32(cc[0]), int(cc[1])) for s in conds.spends for cc in s.create_coin]
     removed = sum(int(cs.coin.amount) for cs in bundle.coin_spends)

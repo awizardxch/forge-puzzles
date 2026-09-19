@@ -79,9 +79,12 @@ def outcome(thunk):
     and fails whichever check reads it, so a harness bug cannot pass as a refusal."""
     try:
         return "accepted", thunk()
-    except (kit.Rejected, ValueError, TypeError) as exc:
-        return "refused", f"{type(exc).__name__}: {str(exc)[:80]}"
     except Exception as exc:  # noqa: BLE001
+        reason = kit.refusal_reason(exc)
+        if reason is not None:
+            return "refused", reason
+        # QA-2: a TypeError or AttributeError is not a refusal, it is the harness failing
+        # to reach the puzzle. It used to count as refused; a fault-injected probe passed.
         return "broken", f"the probe itself broke: {type(exc).__name__}: {str(exc)[:70]}"
 
 
@@ -298,6 +301,27 @@ def zero_parent_lane():
           verdict == "refused", f"{verdict}: {msg}")
 
 
+def helper_lane():
+    """QA-2's fault injection, kept as a regression: a probe that never reaches a puzzle
+    must not read as a refusal."""
+    print()
+    print("the helpers themselves, fault-injected:")
+
+    def raise_(exc):
+        raise exc
+
+    verdict, _ = outcome(lambda: raise_(AttributeError("synthetic harness defect; no puzzle executed")))
+    check("an AttributeError from the probe is BROKEN, not refused", verdict == "broken", verdict)
+    verdict, _ = outcome(lambda: raise_(TypeError("synthetic: wrong argument to a driver call")))
+    check("a TypeError from the probe is BROKEN, not refused", verdict == "broken", verdict)
+    verdict, _ = outcome(lambda: raise_(ValueError("synthetic Python ValueError, not a CLVM one")))
+    check("a Python ValueError that is not a CLVM failure is BROKEN, not refused", verdict == "broken", verdict)
+    verdict, _ = outcome(lambda: raise_(kit.Rejected("TypeError: 12")))
+    check("a consensus rejection is refused", verdict == "refused", verdict)
+    verdict, _ = outcome(lambda: raise_(ValueError(("clvm raise", "80"))))
+    check("a CLVM raise is refused", verdict == "refused", verdict)
+
+
 def main() -> int:
     if not kit.v14_available():
         print("  [skip] V14 build outputs are absent; run scripts/build-v14.py")
@@ -307,6 +331,7 @@ def main() -> int:
     tail_lane()
     registry_lane()
     zero_parent_lane()
+    helper_lane()
     print()
     print(f"{'ALL PASSED' if not FAILED else f'{FAILED} FAILED'} -- V14 solution-width checks")
     return 1 if FAILED else 0

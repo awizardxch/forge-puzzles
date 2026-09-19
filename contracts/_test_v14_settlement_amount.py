@@ -60,7 +60,10 @@ def refuses(label, thunk, expect=None):
         ok = expect is None or code_of(exc) == str(expect)
         return check(label, ok, f"code {code_of(exc)}" + ("" if ok else f"  expected {expect}"))
     except Exception as exc:
-        return check(label, expect is None or expect == "local", f"{type(exc).__name__} (local run)")
+        # QA-2: only a CLVM failure counts as the leaf refusing locally.
+        reason = kit.refusal_reason(exc)
+        ok = reason is not None and (expect is None or expect == "local")
+        return check(label, ok, "ValueError (local run)" if reason else f"probe broke: {type(exc).__name__}: {str(exc)[:60]}")
     return check(label, False, "ACCEPTED")
 
 
