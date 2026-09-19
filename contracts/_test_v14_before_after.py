@@ -22,7 +22,16 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from chia_rs.sized_bytes import bytes32
 
-import _v13_testkit as k13
+try:
+    import _v13_testkit as k13
+except ModuleNotFoundError:
+    # The public puzzle repository does not carry retired revisions, so the "before"
+    # half of this suite has nothing to run against there. That is a skip, and a skip
+    # exits 2 -- a traceback here read as a FAILURE to the first outside auditor who
+    # ran the suites, which is the opposite of what it means.
+    print("  [skip] the V13 build is not in this tree: retired revisions are not published, "
+          "so the before/after control runs from the private tree only")
+    raise SystemExit(2)
 import _v14_testkit as k14
 import forge_math
 

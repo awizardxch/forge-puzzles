@@ -210,7 +210,20 @@ def resync(payload: dict[str, Any]) -> dict[str, Any]:
     lane = REPLAY_LANES.get(int((stale_snapshot or {}).get("protocol_version") or 0))
     if lane is not None:
         import importlib
-        module = importlib.import_module(lane)
+        try:
+            module = importlib.import_module(lane)
+        except ImportError as exc:
+            # A deployment repository ships only the shipping revision, so a
+            # retired lane's module is absent there by design -- the same reason
+            # forge_stdin.py guards its lane imports. Without this, resyncing a
+            # retired pool raised ModuleNotFoundError out of importlib, which
+            # reaches the browser as a 500 rather than as "this build does not
+            # serve that revision".
+            raise ResyncError(
+                f"Protocol {(stale_snapshot or {}).get('protocol_version')} is a retired revision "
+                f"that this deployment does not carry ({lane} is not installed).",
+                "LANE_NOT_SHIPPED",
+            ) from exc
         try:
             return module.resync(payload)
         except module.ResyncError as exc:

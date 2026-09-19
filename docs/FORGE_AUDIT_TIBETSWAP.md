@@ -46,7 +46,8 @@ lp_action_coin_id = sha256(lp_parent_id
 ```
 
 — parent, the CAT puzzle hash with the **pinned** inner for that mode, and the
-exact amount ([`forge_action_common.rue:439`](../contracts/v13/puzzles/forge_action_common.rue)).
+exact amount ([`forge_action_common.rue:473`](../contracts/v14/puzzles/forge_action_common.rue),
+`lp_action_coin_id`; the V13 line this document first cited is retired with that revision).
 It is delivered by a CHIP-0025 `SendMessage` with mode `SENDER_PUZZLE |
 RECEIVER_COIN`, so consensus itself commits both the sending puzzle and the
 receiving coin. An impostor coin has a different id and never receives the
