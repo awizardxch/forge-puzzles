@@ -20,7 +20,7 @@ rather than rounded to closed.
 | Compiled by | rue 0.8.4, `contracts/v14/compiled/manifest.json` built 2026-09-16T06:40:11Z, 41 outputs |
 | Fingerprint | sha256 over every `.rue`, `.hex`, `.hash` and the manifest under `contracts/v14`, sorted: `858ea64356943ff96eecb02d45888c195b246a362b15b66c8e6ab73eadd8090b` |
 | Toolchain | Python 3.11.9, chia-blockchain 2.5.5, chia_rs 0.27.0 |
-| Chain | testnet11 at peak 4,706,461 when the run began |
+| Chain | testnet11: peak 4,706,461 when the run began, 4,706,559 when the chain lane ran |
 
 The fingerprint was taken before and after the sync that published the runbook and the
 fixes below, and is identical: the sync touched suites, a driver and documents, never a
@@ -99,12 +99,30 @@ market a third party can deepen (M-3). **22/22** in this clone: the chained bund
 
 ### Chain — testnet11
 
-Not pushed in this run. The chain lane builds against the deployed pools, which needs the
-private deployment record, so it cannot be reproduced from this tree. For the record: the
-CHIP-0062 disposition's live probe ran on 2026-09-18 at peak 4,704,266 against all 32
-pools — the chained bundle refused `EPHEMERAL_RELATIVE_CONDITION` by the public node, and
-the oracle's exact two-interval credit recomputed from the chain's own previous-generation
-state on every pool. That evidence sits with the deployment record, not here.
+Run against the 32 deployed pools at **peak 4,706,559**, from the private tree, because
+the chain lane builds against the deployment record and that record is not published.
+The commands are `scripts/v14-chip0062-live-probe.py --pools 32` and
+`contracts/_test_v14_discoverability.py`; what they did is reproducible by anyone who
+holds a record of the same pools, and the bundles pushed are refusals, so nothing moved.
+
+- **M-2 at the public node.** The pool spent twice inside one bundle, the successor
+  claiming the block the bundle would land in (4,706,562): refused,
+  `EPHEMERAL_RELATIVE_CONDITION`. The claim of the current peak is refused by the leaf
+  itself, before the node is asked. 2/2.
+- **L-4 against the chain's own state.** For every one of the 32 pools, the previous
+  generation's state was read out of the puzzle reveal the node holds for the parent coin,
+  and the credit between the two generations recomputed: `last_spot × (birth −
+  last_height)` plus `spot × (h − birth)`, with the parent's confirmed height as the
+  birth. Equal on all 32. The gap between each claimed height and its inclusion block —
+  three to eleven blocks — is carried into the next spend, not discarded. 32/32.
+- **Discoverability.** Every pool coin, every reserve, every LP coin and every registry
+  slot found on chain by hint, lineages unbroken across every generation, LP supply
+  reconciled to `total_lp` on every pool, every registration's configuration readable
+  from the registry's own spends. **364/364.**
+
+Together with the simulator this is the lane the runbook says a chained-bundle finding
+needs: a validator cannot judge it, a node can, and this is the node that holds the
+pools people are trading.
 
 ### Adversarial widths — the test the CHIP-0062 audit asked for
 
@@ -278,7 +296,7 @@ while the external audit runs; they are named here so this run cannot be read as
 | Requirement | Status |
 |---|---|
 | The exact compiled revision tested is identified | `5f26138c`, fingerprint `858ea643…8090b`, 41 manifest hashes |
-| The honest control passes in every lane | offline 28 suites, simulator 72/72, every width sweep's control accepted |
+| The honest control passes in every lane | offline 28 suites, simulator 72/72 and 22/22, testnet11 34/34 and 364/364, every width sweep's control accepted |
 | Each finding has a reproducible probe, or is marked provisional | T-1–T-4 reproduced by running the suites and the checker in this clone; residuals cite their suites |
 | The fix is recompiled | no puzzle fix was needed; no hash moved (fingerprint identical) |
 | Positive and negative regression cases rerun after the fixes | offline lane re-run in the clone after T-1..T-4: 28 passed, 0 failed, 4 skipped with exit 2 (T-1's crash now a skip); `_test_v14_solution_widths.py` 44/44 in the clone, with the zero-hash width case, the registry lane and the consistent zero-parent lane added for T-5; checker exit 0 in both modes; fingerprint unchanged |
