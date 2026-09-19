@@ -133,7 +133,11 @@ def main() -> int:
         DEFAULT_SUITES += [f"_test_{PROJECT}_genesis.py", f"_test_{PROJECT}_oracle.py", f"_test_{PROJECT}_finalizer.py"]
     if PROJECT == "v14":
         DEFAULT_SUITES += ["_test_v14_second_review.py", "_test_v14_reserves_proved.py",
-                           "_test_v14_settlement_amount.py", "_test_v14_action_binding.py"]
+                           "_test_v14_settlement_amount.py", "_test_v14_action_binding.py",
+                           # Feeds the zero hash to every solution-supplied Bytes32. Without it
+                           # the four `!= zero_bytes32()` asserts survive with an argument that
+                           # is only true on chain (audit run 2026-09-19, T-5).
+                           "_test_v14_solution_widths.py"]
 
     leaves = args.leaf or DEFAULT_LEAVES
     suites = args.suite or DEFAULT_SUITES

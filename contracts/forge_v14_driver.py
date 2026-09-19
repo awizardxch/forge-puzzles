@@ -203,6 +203,41 @@ def expected_cums(state, weights, h: int, birth: int | None = None, scale: int =
     return expected_oracle(state, weights, h, birth, scale)[1]
 
 
+def duplicate_outputs(conditions) -> list:
+    """(puzzle hash, amount) pairs one coin would create twice.
+
+    A coin id IS (parent, puzzle hash, amount), so two CreateCoins alike in the last two
+    from the same coin are one coin id twice, and a node rejects the WHOLE bundle as
+    DUPLICATE_OUTPUT without saying which pair did it -- CHIP-0062 audit L-7. The composer
+    is the only thing positioned to see it coming: on chain the information is already
+    gone. `collect` was the one case a single honest action could hit and V13 merges it;
+    what is left is composition, so it is caught where composition happens.
+    """
+    seen, clashes = set(), []
+    for condition in conditions:
+        try:
+            items = list(condition.as_iter())
+        except Exception:                      # not a proper list: not a CreateCoin
+            continue
+        if len(items) < 3 or items[0].atom is None or items[0].as_int() != CREATE_COIN:
+            continue
+        key = (bytes(items[1].as_atom()), items[2].as_int())
+        if key in seen:
+            clashes.append(key)
+        seen.add(key)
+    return clashes
+
+
+def assert_distinct_outputs(conditions, whose: str) -> None:
+    clashes = duplicate_outputs(conditions)
+    if clashes:
+        ph, amount = clashes[0]
+        raise Rejected(
+            f"{whose} would create the same coin twice: {amount} to {ph.hex()[:16]}... "
+            f"A node answers DUPLICATE_OUTPUT for the whole bundle (audit L-7). Vary an "
+            f"amount, or put the actions in separate spends.")
+
+
 def spend_actions(pool: V14Pool, steps: list, parent_ids: list | None = None, extra_spends: list = (),
                   extra_cats: dict | None = None, omit_proofs: bool = True, force_no_proofs: bool = False, **knobs):
     """Several leaves in ONE spend, in order. `steps` is [(leaf name, solution), ...].
@@ -218,11 +253,15 @@ def spend_actions(pool: V14Pool, steps: list, parent_ids: list | None = None, ex
     # walks the LAST action's conditions first and prepends each tagged one: the
     # per-reserve order it hashes is each action's tagged conditions reversed,
     # concatenated in execution order.
-    ordered_tagged = []
+    ordered_tagged, pool_conditions = [], []
     for name, solution in steps:
-        new_state, tagged_conds, _base, ephemeral = run_leaf(pool, name, solution, ephemeral=ephemeral, state=state)
+        new_state, tagged_conds, base, ephemeral = run_leaf(pool, name, solution, ephemeral=ephemeral, state=state)
         ordered_tagged.extend(reversed(tagged_conds))
+        pool_conditions.extend(base)
         state = new_state
+    # L-7: two `observe`s in one spend write the same amount-0 slot coin from the same pool
+    # coin. Named here rather than left to the node.
+    assert_distinct_outputs(pool_conditions, "the pool coin")
     puzzles, selector_of, entries = [], {}, []
     next_selector = SINGLE_LEAF_SELECTOR
     for name, _ in steps:
@@ -250,6 +289,9 @@ def spend_actions(pool: V14Pool, steps: list, parent_ids: list | None = None, ex
     for r in pool.reserves:
         recreate = Program.to([CREATE_COIN, r.inner_hash, amounts[r.index], [pool.hint]])
         mine = [c for (i, c) in ordered_tagged if i == r.index]
+        # L-7: a swap and a remove whose payouts to the same settlement puzzle happen to
+        # coincide, on one reserve, are one coin id twice.
+        assert_distinct_outputs([recreate, *mine], f"reserve {r.index}")
         dp = Program.to((1, [recreate, *mine]))
         p2_solution = Program.to([pool.inner_hash, dp])
         if r.asset_id is None:
@@ -565,7 +607,12 @@ def assemble(pool: V14Pool, leaf: Program, proof: list, solution: list, new_stat
         sender_inner = reserve_sender_inner_hash if reserve_sender_inner_hash is not None else pool.inner_hash
         cats = {k: list(v) for k, v in (extra_cats or {}).items()}
         for r in pool.reserves:
-            dp = (reserve_delegated or {}).get(r.index) or delegated_puzzle_for(pool, r, new_state, tagged_conditions)
+            substituted = (reserve_delegated or {}).get(r.index)
+            dp = substituted or delegated_puzzle_for(pool, r, new_state, tagged_conditions)
+            if substituted is None:
+                # L-7, the single-action path. A substituted delegated puzzle is an
+                # adversarial lane's own construction and is left exactly as it was given.
+                assert_distinct_outputs(list(dp.rest().as_iter()), f"reserve {r.index}")
             p2_solution = Program.to([sender_inner, dp])
             if r.asset_id is None:
                 spends.append(make_spend(r.coin, r.inner, p2_solution))

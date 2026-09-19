@@ -115,7 +115,8 @@ def main() -> int:
     import _v11_testkit as v11
     import _v14_testkit as v14
     if not (v11.v11_available() and v14.v14_available()):
-        print("  [skip] a build is absent; run scripts/build-v14.py and scripts/build-v14.py")
+        print("  [skip] a build is absent; the V11 control needs contracts/v11, which the public "
+              "repository does not carry, and V14 needs scripts/build-v14.py")
         return 2
 
     born = H - 39   # V14: a coin is born AFTER the height its state last claimed (H - 40)

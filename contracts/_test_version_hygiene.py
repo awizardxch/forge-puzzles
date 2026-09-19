@@ -48,6 +48,10 @@ ARGUED: dict[tuple[str, str], str] = {
     ("forge_stdin.py", "forge_v13_route"): "same optional lane",
     ("forge_stdin.py", "forge_v13_create"): "same optional lane",
     ("forge_stdin.py", "forge_v13_driver"): "same optional lane",
+    ("_test_v14_chip0062_audit.py", "_v11_testkit"):
+        "the CHIP-0062 audit read contracts/v11, so every finding is built against V11 "
+        "first: a finding that cannot be demonstrated where the auditors found it is as "
+        "much a failure as one V14 still allows",
     ("_test_v14_consensus_timelocks.py", "_v11_testkit"):
         "the before/after control: it proves V11 asserted no birth height where V14 "
         "does, which cannot be shown without building a V11 pool",
