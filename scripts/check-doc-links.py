@@ -77,6 +77,7 @@ PUBLISHED_DOCS = {
     "SKILL.md",
     # An audit run's record publishes beside the runbook it followed.
     "FORGE_AUDIT_RUN_V14_2026-09-19.md",
+    "FORGE_AUDIT_RUN_V14_2026-09-20.md",
 }
 
 
@@ -131,7 +132,10 @@ def published(rel: str) -> bool:
         return name in ("mutate-v14.py", "build-v14.py", "sim-v14.py", "sim-v14-batch-security.py",
                         "v14-squat-probe.py", "v14-settlement-probe.py", "v14-slack-probe.py",
                         "check-doc-links.py",
-                        "sim-v14-review-derivations.py", "sim-v14-chip0062.py")
+                        "sim-v14-review-derivations.py", "sim-v14-chip0062.py",
+                        # The runbook cites this one in prose: it is the answer to
+                        # "which build did you test", so an outside auditor needs it.
+                        "revision-fingerprint.py")
     if rel.startswith(("api/", "src/")):
         return False          # the interface lives in forge-ui
     if rel.startswith("skills/"):

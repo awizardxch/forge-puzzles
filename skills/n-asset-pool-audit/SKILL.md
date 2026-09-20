@@ -60,6 +60,26 @@ the private tree. Say which build you tested; that is the part that matters.
    puzzle's. Solve the bracket or the condition directly, then run the compiled leaf. A
    real finding was once reported as "does not reproduce" because the search ran through a
    wrapper that refused the very input the finding needed.
+8. **Identify the revision with a number the reader can recompute.** "Which build did you
+   test" is the one question every other answer depends on, and prose is not an answer:
+   a fingerprint described as "sha256 over every `.rue`, `.hex`, `.hash` and the manifest,
+   sorted" has several readings, and the one recorded on 2026-09-19 reproduced under none
+   of them. It appeared nowhere but the record that quoted it. Ship the command, not the
+   recipe — `scripts/revision-fingerprint.py` — and cite the command beside the digest so
+   a reader can disagree with you.
+9. **A failure must distinguish a stale record from a broken system.** Suites that compare
+   a local record against the chain fail for two unrelated reasons: the record is behind,
+   which is a fact about the checkout, or the chain never had what the record claims,
+   which is serious. `_test_v14_discoverability.py` printed the same line for both, so 42
+   ordinary drift failures were indistinguishable at a glance from one real one, and
+   telling them apart took a chain query per coin in a suite that already held the spent
+   flag. If a check can fail for a boring reason and an alarming one, it must say which.
+10. **Run tools at the coverage the audit claims, not at their defaults.** The testnet
+   probe takes `--pools`, defaulting to 8 of 32. Run plainly it covered a quarter of the
+   pools, and the first draft of the 2026-09-20 record explained that shortfall with the
+   index drift it had just been looking at — a tidy story, arrived at without reading the
+   argument parser. Check what produced a number before explaining it, and state the
+   coverage you actually exercised.
 
 ## Target asset architecture
 

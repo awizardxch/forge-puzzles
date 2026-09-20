@@ -97,10 +97,30 @@ def main() -> int:
             "message": message,
         }))
         return 0
+    except FileNotFoundError as exc:
+        # No wallet is installed on this host at all -- SageRpc raises this when
+        # the RPC certificate and key are absent. That is the normal, permanent
+        # state of a hosted responder: a container has no desktop wallet and
+        # never will. It is an answer, not a fault, so it gets its own exit code
+        # and the caller reports it as one. Reporting it as a server error made a
+        # perfectly healthy deployment look dead.
+        print(json.dumps({
+            "success": True,
+            "connected": False,
+            "available": False,
+            "reason": "no-local-wallet",
+            "error": str(exc),
+            "message": "No local Sage wallet on this host",
+        }))
+        return 2
     except Exception as exc:
+        # A wallet is installed but would not answer: wrong port, RPC disabled,
+        # not running. Worth surfacing as a fault, because it is one.
         print(json.dumps({
             "success": False,
             "connected": False,
+            "available": True,
+            "reason": "rpc-unreachable",
             "error": str(exc),
             "message": "Sage RPC disconnected",
         }))

@@ -149,9 +149,39 @@ def main() -> int:
               + (f"; {len(singles) - spends} settled through the offer lane" if len(singles) > spends else ""))
         check("  ...and the reserve coins", len(others) >= len(pool["asset_ids"]), f"{len(others)} reserve coins")
         live_reserves = {(strip(r["coin"]["puzzle_hash"]), int(r["coin"]["amount"])) for r in others if not r["spent"]}
+        # Say WHICH kind of "not live" this is.
+        #
+        # This check used to pass no detail, so a stale record and a vanished
+        # reserve failed with the same line: "recorded reserve X (N) is a live
+        # hinted coin". Read cold that says the pool is broken. In practice the
+        # common cause is the boring one -- the recorded generation was spent by
+        # an ordinary trade and the index has not caught up, which is a fact
+        # about the record and not about the pool. The alarming cause, a
+        # recorded reserve the chain never had, looks identical.
+        #
+        # The two are distinguishable from data already in hand: `others` carries
+        # the spent flag, so a spent coin at the same puzzle hash means the
+        # reserve moved on, and an unspent coin at that hash is the successor to
+        # resync to. Says so, and names the remedy.
+        spent_reserves = {(strip(r["coin"]["puzzle_hash"]), int(r["coin"]["amount"]))
+                          for r in others if r["spent"]}
+        live_at_ph = {strip(r["coin"]["puzzle_hash"]): int(r["coin"]["amount"])
+                      for r in others if not r["spent"]}
         for res in pool["reserves"]:
+            key = (res["coin"]["puzzle_hash"], int(res["coin"]["amount"]))
+            if key in live_reserves:
+                detail = ""
+            elif key in spent_reserves:
+                now = live_at_ph.get(res["coin"]["puzzle_hash"])
+                detail = ("this generation was SPENT on chain; the record is behind the chain"
+                          + (f" (the live coin at this puzzle hash holds {now})" if now is not None
+                             else " and no successor is hinted here")
+                          + " — resync with contracts/forge_resync.py")
+            else:
+                detail = ("no coin at this puzzle hash and amount was ever hinted here, "
+                          "spent or unspent — this is NOT ordinary index drift")
             check(f"  recorded reserve {res['coin']['puzzle_hash'][:8]}… ({res['coin']['amount']}) is a live hinted coin",
-                  (res["coin"]["puzzle_hash"], int(res["coin"]["amount"])) in live_reserves)
+                  key in live_reserves, detail)
         # LP coins: hinted with the recipient's puzzle hash, at the LP CAT puzzle hash for that recipient
         recipient = bytes32.fromhex(pool["lp_recipient_ph"])
         lp_ph = construct_cat_puzzle(CAT_MOD, bytes32.fromhex(pool["lp_asset_id"]), Program.to(recipient)).get_tree_hash_precalc(recipient).hex()
