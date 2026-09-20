@@ -19,6 +19,8 @@ It checks, for each markdown file:
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import os
 import re
 import sys
 from pathlib import Path
@@ -58,27 +60,80 @@ def project_context(text: str, upto: int) -> str | None:
     return current
 CODEPATH = re.compile(r"`((?:contracts|scripts|docs|api|src)/[A-Za-z0-9_./\-]+?)(?::\d+)?`")
 
-# what the public slice ships, from sync-subrepos.ps1: contracts/ minus the retired trees,
-# a named set of documents, and two scripts.
-PUBLISH_EXCLUDED_DIRS = ("contracts/v11", "contracts/v12", "contracts/v13",
-                         "contracts/development", "contracts/greenwood")
-PUBLISH_EXCLUDED_GLOBS = ("_test_v11_", "_test_v12_", "_test_v13_", "forge_v12_", "forge_v13_",
-                          "_v12_testkit", "_v13_testkit", "_sim_future_", "_sim_v14_vault_",
-                          "_sim_v14_rcat_", "_sim_v14_layered_", "_sim_v14_matrix")
-PUBLISHED_DOCS = {
-    "FORGE_PUZZLE_V14.md", "FORGE_PUZZLE_V14_SPEC.md", "FORGE_V14_ARCHITECTURE.md",
-    "FORGE_V14_CLVM_PASS.md", "FORGE_DAO_FEE_V14.md", "FORGE_AUDIT_TIBETSWAP.md",
-    "FORGE_CHIP_WORKFLOW.md", "FORGE_ROUTER_PROTOCOL_V1.md", "FORGE_MULTISIG.md",
-    "FORGE_LOCK_MIPS.md", "FORGE_LOCK_SAFE_MODEL.md",
-    # The audit runbook publishes with the puzzles (skills/ in the forge-puzzles slice),
-    # so every path it cites has to exist THERE, not only here. It is the document an
-    # outside auditor works from, which makes a citation it cannot follow worse than one
-    # in a document only we read.
-    "SKILL.md",
-    # An audit run's record publishes beside the runbook it followed.
-    "FORGE_AUDIT_RUN_V14_2026-09-19.md",
-    "FORGE_AUDIT_RUN_V14_2026-09-20.md",
-}
+# What the public slice ships -- read from sync-subrepos.ps1, not restated here.
+#
+# This used to be a hand-kept copy: a tuple of excluded directories, a set of
+# published document names, a tuple of published script names. Two sources of
+# truth for one fact, with nothing making them agree. Adding the 2026-09-20 audit
+# record and its fingerprint tool to the slice left this file still believing they
+# were unpublished, so it flagged a citation that was about to be perfectly valid.
+# The same drift the other way is the one that matters: a checker that thinks a
+# path publishes when it does not says nothing about the citation that will point
+# at a 404 -- which is the failure this whole check exists to catch.
+#
+# So the slice file is the source and this parses it. A sub-repo's Slices block is
+# a list of `@{ From = "..."; To = "..." }` entries, some of them directories
+# carrying `Except` and `ExceptFiles`. That is enough structure to answer the only
+# question asked here: would the public repository contain this path?
+SLICE_TARGET = "forge-puzzles"
+
+
+def _slice_file():
+    """sync-subrepos.ps1, if this checkout has it.
+
+    It is absent from the published repository by design -- the public clone gets
+    the puzzles and the audit tooling, not the machinery that publishes them. So
+    the publish gate is skipped there rather than failed, and says that it skipped.
+    """
+    override = os.environ.get("FORGE_SYNC_MANIFEST")
+    if override:
+        p = Path(override)
+        return p.resolve() if p.is_file() else None
+    candidates = [ROOT / ".." / ".." / "sync-subrepos.ps1",
+                   ROOT / ".." / ".." / "sync" / "sync-subrepos.ps1",
+                   ROOT / "sync-subrepos.ps1"]
+    for c in candidates:
+        if c.is_file():
+            return c.resolve()
+    return None
+
+
+def _parse_slice(text, target):
+    """(exact file map, directory slices) for one sub-repo's Slices block."""
+    block = re.search('"' + re.escape(target) + r'"\s*=\s*@\{(.*?)\n    \}', text, re.S)
+    if not block:
+        return {}, []
+    slices = re.search(r"Slices\s*=\s*@\((.*)", block.group(1), re.S)
+    if not slices:
+        return {}, []
+
+    files, dirs = {}, []
+    for chunk in slices.group(1).split("@{")[1:]:
+        chunk = chunk.split("}", 1)[0]
+        frm = re.search(r'From\s*=\s*"([^"]+)"', chunk)
+        to = re.search(r'To\s*=\s*"([^"]+)"', chunk)
+        if not frm or not to:
+            continue
+        src = frm.group(1).replace("\\", "/")
+        dst = to.group(1).replace("\\", "/")
+        # Every slice is rooted at the project; strip that for a repo-relative path.
+        src = re.sub(r"^projects/[^/]+/", "", src)
+
+        def _arr(name):
+            m = re.search(name + r'\s*=\s*@\(([^)]*)\)', chunk)
+            return re.findall(r'"([^"]+)"', m.group(1)) if m else []
+
+        if (ROOT / src).is_dir():
+            dirs.append((src, dst, _arr("Except"), _arr("ExceptFiles")))
+        else:
+            files[src] = dst
+    return files, dirs
+
+
+_SLICE_PATH = _slice_file()
+_SLICE_TEXT = _SLICE_PATH.read_text(encoding="utf-8", errors="replace") if _SLICE_PATH else ""
+SLICE_FILES, SLICE_DIRS = _parse_slice(_SLICE_TEXT, SLICE_TARGET)
+SLICE_KNOWN = bool(SLICE_FILES or SLICE_DIRS)
 
 
 # A few files publish under a different name than they carry here, because the slice
@@ -110,37 +165,66 @@ HISTORICAL = {
     "contracts/sync_pool_from_chain.py": None,
 }
 
-PUBLISHED_ALIASES = {
-    "docs/FORGE_SECURITY.md": "docs/subrepo/forge-puzzles.SECURITY.md",
-    "README.md": "docs/subrepo/forge-puzzles.README.md",
-}
+# Published name -> the file it is published FROM, for the entries the slice
+# renames. A document written for the public repository cites the published name,
+# which resolves nowhere here -- correct for its reader, broken for this checker.
+#
+# Derived from the slice rather than listed, for the same reason as everything
+# above it: the rename is already stated once, in the `From`/`To` pair that
+# performs it. Empty when no slice file is present, which is exactly when the
+# publish gate is skipped anyway.
+PUBLISHED_ALIASES = {dst: src for src, dst in SLICE_FILES.items() if dst != src}
+
+# Without a slice file the renames are unknown, and a document citing its published
+# name would be reported as a broken link. In the public repository that never
+# happens -- the file is there under that name, so the citation simply resolves. It
+# happens in a partial checkout of this project without the workspace around it,
+# where the citation is correct and the checker merely cannot see why.
+#
+# These two are a statement about the public repository's layout rather than a copy
+# of the slice, and the derived map above wins whenever the slice can be read.
+if not SLICE_KNOWN:
+    PUBLISHED_ALIASES = {
+        "docs/FORGE_SECURITY.md": "docs/subrepo/forge-puzzles.SECURITY.md",
+        "README.md": "docs/subrepo/forge-puzzles.README.md",
+    }
 
 
-def published(rel: str) -> bool:
+def published(rel):
     """Would the public slice carry this path?"""
     rel = rel.replace("\\", "/")
+    if not SLICE_KNOWN:
+        return True           # no slice file in this checkout; skipped, not guessed
     if rel in PUBLISHED_ALIASES:
         return True           # published under exactly this name, from a renamed source
-    if rel.startswith(tuple(PUBLISH_EXCLUDED_DIRS)):
+    if rel in SLICE_FILES:
+        return True
+    for src, _dst, except_dirs, except_files in SLICE_DIRS:
+        prefix = src.rstrip("/") + "/"
+        if not rel.startswith(prefix):
+            continue
+        head = rel[len(prefix):].split("/", 1)[0]
+        if head in except_dirs:
+            return False
+        name = rel.rsplit("/", 1)[-1]
+        if any(fnmatch.fnmatch(name, pat) for pat in except_files):
+            return False
+        return True
+    return False
+
+
+def is_published_doc(path) -> bool:
+    """Is this document one the public repository carries?
+
+    Asked of the document's own repo-relative path, through the same slice the
+    citations are gated against -- so "which documents are public" and "which
+    paths are public" can no longer disagree with each other.
+    """
+    try:
+        rel = path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
         return False
-    name = rel.rsplit("/", 1)[-1]
-    if any(g in name for g in PUBLISH_EXCLUDED_GLOBS):
-        return False
-    if rel.startswith("docs/"):
-        return name in PUBLISHED_DOCS or rel.startswith("docs/chip/")
-    if rel.startswith("scripts/"):
-        return name in ("mutate-v14.py", "build-v14.py", "sim-v14.py", "sim-v14-batch-security.py",
-                        "v14-squat-probe.py", "v14-settlement-probe.py", "v14-slack-probe.py",
-                        "check-doc-links.py",
-                        "sim-v14-review-derivations.py", "sim-v14-chip0062.py",
-                        # The runbook cites this one in prose: it is the answer to
-                        # "which build did you test", so an outside auditor needs it.
-                        "revision-fingerprint.py")
-    if rel.startswith(("api/", "src/")):
-        return False          # the interface lives in forge-ui
-    if rel.startswith("skills/"):
-        return True           # the whole directory is a slice
-    return rel.startswith("contracts/")
+    return published(rel)
 
 
 def main() -> int:
@@ -152,7 +236,7 @@ def main() -> int:
     # The audit runbook sits with the puzzles rather than under docs/, and publishes.
     docs += sorted((ROOT / "skills").glob("*/SKILL.md"))
     skills = sorted((WORKSPACE / "docs" / "skills").glob("*.md"))
-    targets = [d for d in docs if (not args.publish_only or d.name in PUBLISHED_DOCS)]
+    targets = [d for d in docs if (not args.publish_only or is_published_doc(d))]
     if not args.publish_only:
         targets += skills
 
@@ -221,7 +305,7 @@ def main() -> int:
                         unchecked.append((path.name, cited, proj))
                         continue
                 broken.append((path.name, cited, "cited path"))
-            elif path.name in PUBLISHED_DOCS and (ROOT / cited).exists() and not published(cited):
+            elif is_published_doc(path) and (ROOT / cited).exists() and not published(cited):
                 # `api/` and `src/` are the interface repository's, and naming them is fine so
                 # long as the document says so -- otherwise an external reader follows a path
                 # that does not exist in the repository they are holding.
@@ -250,7 +334,14 @@ def main() -> int:
             print(f"  {name:<34} {cited}")
         print("  (each of these resolves for us and points at nothing for an external reader)")
     else:
-        print("every citation in a published document is also published")
+        if SLICE_KNOWN:
+            print("every citation in a published document is also published")
+        else:
+            # Say that the gate did not run. "Passed" and "was not checked" are
+            # different answers and a reader acts differently on each; printing the
+            # first for the second is how a check quietly stops being one.
+            print("publish gate SKIPPED: no sync-subrepos.ps1 in this checkout, so which "
+                  "paths are public is unknown here")
 
     return 1 if (broken or slice_gaps) else 0
 
