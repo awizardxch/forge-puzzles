@@ -236,6 +236,30 @@ Re-run after the change: all 42 failures report the drift cause and **0** report
 serious one. The suite still fails, correctly — the record really is stale — but it now
 fails legibly.
 
+## Re-run, after the record was resynced and the tooling fixed
+
+The whole runbook once more, from a clean state, under a different model again (Claude
+Fable 5.1). The point was to see the run as an outside auditor would see it after the
+fixes above — and to check that "green" was green, not green-with-caveats.
+
+| Lane | Result |
+|---|---|
+| Offline, 32 suites, `FORGE_REPO` at a tracking clone | **32 pass, 0 fail, 0 skip** — 1405 checks pass, 0 fail |
+| Integrity | 122/122 |
+| Provenance | 86/86 |
+| Discoverability | 364/364 |
+| Simulator `sim-v14.py` | 72/72 |
+| Simulator `sim-v14-chip0062.py` | 22/22 |
+| Testnet11 `--pools 32`, peak 4,710,936 | 34/34, M-2 refused `EPHEMERAL_RELATIVE_CONDITION` |
+| Mutation | 48 assertions: 24 killed, 24 UNREACHED each argued, 0 unbuildable, exit 0 |
+| Fingerprint | `6298777ef1ac2ecf835b2323d9f6a8805c7ced1c9a8764d195f5b9960e147ab4` — identical |
+| Doc links | exit 0; the publish gate now parses the slice rather than restating it |
+
+No skips anywhere, for the first time in this series: the provenance skip closes when the
+suite is given a clone that tracks `contracts/v14`, and the discoverability failures
+closed with the resync. The fingerprint did not move between the two runs, which is what
+"no puzzle changed" means when the number is one anyone can recompute.
+
 ## Residuals, carried forward
 
 Unchanged from the CHIP-0062 disposition. None is a fund-loss path and none is reachable
