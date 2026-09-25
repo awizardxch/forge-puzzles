@@ -81,6 +81,16 @@ the private tree. Say which build you tested; that is the part that matters.
    argument parser. Check what produced a number before explaining it, and state the
    coverage you actually exercised.
 
+11. **Pin the exact refusal code, and run a probe away from the fixture it was written
+   on.** The 2026-09-24 pass found two of its own probes passing for the wrong reason. One
+   gave a put-back coin its grandparent's lineage, so the CAT layer died
+   (`GENERATOR_RUNTIME_ERROR`) before the finalizer could refuse it. A helper that built
+   layered reserves had the fixture's asset id hard-coded, and passed offline because every
+   fixture used that asset. Only pinned codes caught them, and the second only when the
+   probe met a live pool with a different asset (`WRONG_PUZZLE_HASH` where
+   `MESSAGE_NOT_SENT_OR_RECEIVED` was expected). `startswith("refused")` would have passed
+   both.
+
 ## Target asset architecture
 
 - **Current:** native XCH and Standard CATs (CAT2).
@@ -185,11 +195,43 @@ its type. Where neither holds, an explicit length assertion becomes mandatory.
 Test it adversarially: feed every solution-supplied `Bytes32` at 0, 1, 4, 31, 33 and 64
 bytes, plus a non-canonically encoded integer, and require each one to be refused.
 
-### rCAT roadmap
+### rCAT and layered assets
 
-Inspect transfer-hook and authorizer callbacks for re-entrancy and ordering. Flag any
-path that mutates reserves or emits a successor before proving that the hook returns a
-valid authorization and that the resulting delta is conserved.
+A revocable CAT (CHIP-0038) is an ordinary CAT whose inner puzzle sits inside a public
+revocation layer curried with one value, the hidden puzzle hash H. Its inner path re-wraps
+every child; its hidden path passes conditions through untouched. The TAIL runs only at
+issuance and melt, so **any holder of any CAT can put the layer on their own coin with any
+H**, including `sha256tree(1)`, which anyone can satisfy. chia's wallet classifier reads H
+from the coin. So:
+
+- **An rCAT is the pair (asset id, H), never a coin shape.** A fake and a genuine coin are
+  the same program, asset and p2, differing only in H. The chain records the issuer's H in
+  one place: the coins the TAIL-revealing issuance spend created. Walk a coin's ancestry
+  to that spend to tell them apart; it cannot see a second revoker nested inside a genuine
+  outer layer, so only an exact-hash check is complete.
+- **Probe every lane with three layers**: the issuer's H, an imprinted H, and the keyless
+  H. The lanes are the trader's settlement (swap and add), the reserve itself, and
+  creation. Pin the refusal code for each.
+- **Probe the combination.** A CAT ring balances by asset id, so a fake can ride in the
+  same swap or add as a genuine coin. Check that it cannot change the reserve's shape, and
+  that a twin planted at the reserve's exact (public) puzzle hash is ignored and cannot be
+  spent back. Any design that decides revocability at run time from a coin it is shown is a
+  flag a fake can set; that is the finding to look for.
+- **A revocation does not have to steal to brick.** Where a pool names a reserve by
+  (parent, hash, amount), any hidden-path spend strands it, even one that puts an identical
+  coin straight back. Test the put-back, with its own valid lineage and a control proving
+  the coin sound, and check that one revocable reserve cannot freeze the others.
+- **Corporate actions must go through the pool.** A k:1 split or merge the pool does not
+  take part in is a k:1 price move arbitraged against the LPs. Measure LP value at the true
+  price across the action.
+
+Worked record: `docs/FORGE_AUDIT_RUN_V14_2026-09-24.md`, with
+`contracts/_sim_v14_rcat_imprint.py` (offline), `scripts/sim-v14-rcat-imprint.py`
+(simulator) and `scripts/v14-rcat-imprint-live-probe.py` (testnet11).
+
+For assets with transfer hooks or authorizers beyond the revocation layer: inspect the
+callbacks for re-entrancy and ordering, and flag any path that mutates reserves or emits a
+successor before proving the hook returns a valid authorization and the delta is conserved.
 
 ### NFT and singleton roadmap
 
@@ -280,6 +322,16 @@ anyway. Read the verdict three ways -- `success: false` is a refusal carrying a 
 code, `success: true` with `PENDING` is held rather than included (time-lock conditions
 land here, and one that can never become true is never included), and anything else is
 acceptance.
+
+**A refusal probe against a live pool needs no wallet.** Forge's pool spends ask for no
+signature, and a node checks conditions (message pairing, `ASSERT_CONCURRENT_SPEND`)
+during pre-validation, before it looks removals up in its coin store. So build every
+probe as a pair from the pool's real tip: the attack, whose made-up coin should be
+refused by the guard, and the same bundle with the honest shape, which should get past
+every guard and be refused only for `UNKNOWN_UNSPENT`. The control's answer is what makes
+the attack's meaningful, and a bundle that names a coin that does not exist can never be
+included, so a wrong expectation costs nothing. `scripts/v14-rcat-imprint-live-probe.py`
+is the pattern.
 
 Observe and report condition failures such as `COIN_AMOUNT_EXCEEDS_MAX`, announcement
 failures, lineage failures, or mempool rejection. Do not imply that a command succeeded
