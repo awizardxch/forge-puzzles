@@ -59,9 +59,20 @@ class SageRPC:
                 "Ensure Sage is installed and RPC is enabled."
             )
 
-        self._ctx = ssl.create_default_context()
-        self._ctx.check_hostname = False
-        self._ctx.verify_mode = ssl.CERT_NONE
+        # Peer verification is opt-in through SAGE_RPC_CA (a PEM the server's
+        # certificate chains to). Sage ships one self-signed wallet.crt used
+        # for both sides, and a responder without a wallet has nothing to
+        # verify against, so the default stays unverified -- but the host is
+        # no longer chosen by a request (2026-09-26 review, finding 01).
+        ca_path = os.environ.get("SAGE_RPC_CA", "").strip()
+        if ca_path:
+            self._ctx = ssl.create_default_context(cafile=ca_path)
+            self._ctx.check_hostname = False
+            self._ctx.verify_mode = ssl.CERT_REQUIRED
+        else:
+            self._ctx = ssl.create_default_context()
+            self._ctx.check_hostname = False
+            self._ctx.verify_mode = ssl.CERT_NONE
         self._ctx.load_cert_chain(
             certfile=str(self.cert_path),
             keyfile=str(self.key_path),

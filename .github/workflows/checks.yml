@@ -1,0 +1,34 @@
+# The puzzle suites that need no node, on every push.
+#
+# The 2026-09-26 external review's last recommendation: the fail-closed guards
+# this repository already has should run on every commit. These are the ones
+# that run offline -- the pure-Python router checks, the builder, and the
+# composer regressions the review's findings 13 and 14 added.
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Offer builder
+        run: python contracts/_test_offer_build.py
+      - name: Split shares
+        run: python contracts/_test_split_shares.py
+      - name: Surplus refund binding
+        run: python contracts/_test_surplus_refund_binding.py
+      - name: push_tx acceptance in the lock tools
+        run: python contracts/_test_push_acceptance.py
+      - name: Sage bridge result shaping
+        run: python contracts/_test_sage_bridge_result.py
+      - name: Curve equivalence
+        run: python contracts/_test_v14_curve_equivalence.py

@@ -1916,11 +1916,19 @@ def cmd_assemble(payload: dict[str, Any], factory: Callable[[str], Node]) -> dic
         node = node_for(payload, plan.network, factory)
         pushed = node.push_tx(bundle)
         status = str(pushed.get("status") or "").upper()
-        ok = bool(pushed.get("success")) and status in ("", "SUCCESS", "PENDING")
-        result["push"] = {"ok": ok, "status": status or None, "raw": pushed}
+        # PENDING means the node is holding the bundle, not that it is in the
+        # mempool: a proposal is not `submitted` on it and its siblings are not
+        # staled (2026-09-26 external review, finding 08).
+        pending = status == "PENDING"
+        ok = bool(pushed.get("success")) and status in ("", "SUCCESS")
+        result["push"] = {"ok": ok, "pending": pending, "status": status or None, "raw": pushed}
         if not ok:
             result["success"] = False
-            result["error"] = f"push_tx rejected: {pushed.get('error') or status or json.dumps(pushed)[:300]}"
+            result["error"] = (
+                "push_tx answered PENDING: the bundle is held, not included; nothing is marked submitted"
+                if pending
+                else f"push_tx rejected: {pushed.get('error') or status or json.dumps(pushed)[:300]}"
+            )
     return result
 
 

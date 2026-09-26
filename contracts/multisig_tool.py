@@ -1189,6 +1189,32 @@ def cmd_verify_share(payload: dict[str, Any], _node_factory: Callable[[str], Nod
     }
 
 
+def cmd_verify_owner(payload: dict[str, Any], _node_factory: Callable[[str], Node]) -> dict[str, Any]:
+    """Does `signature` prove that `pubkey` signed `message`?
+
+    The board's authentication (api/_multisigAuth.js, 2026-09-26): a raw BLS
+    signature over a 32-byte digest of the action, its subject and a timestamp.
+    A wallet makes one by partially signing a synthetic spend whose only
+    condition is AGG_SIG_UNSAFE over that digest -- AGG_SIG_UNSAFE appends
+    nothing to the message, so the signature verifies here as a plain
+    AugSchemeMPL signature. Nothing about a safe is consulted: the route checks
+    membership; this checks possession.
+    """
+    key = parse_pubkey(payload.get("pubkey"), "owner public key")
+    raw_msg = strip0x(payload.get("message"))
+    if len(raw_msg) != 64:
+        raise MultisigError("message must be a 32-byte digest (64 hex chars)")
+    raw_sig = strip0x(payload.get("signature"))
+    if len(raw_sig) != 192:
+        raise MultisigError("signature must be a 96-byte BLS G2 element (192 hex chars)")
+    try:
+        signature = G2Element.from_bytes(bytes.fromhex(raw_sig))
+    except Exception as exc:
+        raise MultisigError(f"signature is not a valid BLS G2 element: {exc}") from exc
+    verified = bool(AugSchemeMPL.verify(key, bytes.fromhex(raw_msg), signature))
+    return {"success": True, "verified": verified, "pubkey": pubkey_hex(key)}
+
+
 def cmd_assemble(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> dict[str, Any]:
     plan = Plan.from_json(payload.get("plan"))
     shares = parse_shares(payload.get("shares"))
@@ -1226,11 +1252,19 @@ def cmd_assemble(payload: dict[str, Any], node_factory: Callable[[str], Node]) -
         node = node_factory(str(payload.get("node_url") or config["node_url"]))
         pushed = node.push_tx(bundle)
         status = str(pushed.get("status") or "").upper()
-        ok = bool(pushed.get("success")) and status in ("", "SUCCESS", "PENDING")
-        result["push"] = {"ok": ok, "status": status or None, "raw": pushed}
+        # PENDING means the node is holding the bundle, not that it is in the
+        # mempool: a proposal is not `submitted` on it and its siblings are not
+        # staled (2026-09-26 external review, finding 08).
+        pending = status == "PENDING"
+        ok = bool(pushed.get("success")) and status in ("", "SUCCESS")
+        result["push"] = {"ok": ok, "pending": pending, "status": status or None, "raw": pushed}
         if not ok:
             result["success"] = False
-            result["error"] = f"push_tx rejected: {pushed.get('error') or status or json.dumps(pushed)[:300]}"
+            result["error"] = (
+                "push_tx answered PENDING: the bundle is held, not included; nothing is marked submitted"
+                if pending
+                else f"push_tx rejected: {pushed.get('error') or status or json.dumps(pushed)[:300]}"
+            )
     return result
 
 
@@ -1264,6 +1298,7 @@ COMMANDS: dict[str, Callable[[dict[str, Any], Callable[[str], Node]], dict[str, 
     "propose": cmd_propose,
     "sign-request": cmd_sign_request,
     "verify-share": cmd_verify_share,
+    "verify-owner": cmd_verify_owner,
     "assemble": cmd_assemble,
     "status": cmd_status,
 }

@@ -1,0 +1,5 @@
+# Floors and ceilings both: two builds of one commit must not run different
+# consensus libraries (2026-09-26 external review). Bump deliberately.
+chia-rs>=0.17.0,<0.30
+chia-blockchain>=2.3.0,<3
+clvm_tools>=0.4.6,<0.5

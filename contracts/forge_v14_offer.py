@@ -230,10 +230,57 @@ def _own_group(coin: Coin, extra_groups: list | None = None) -> Program:
     return Program.to([[coin.name()], *(extra_groups or [])])
 
 
+ASSERT_PUZZLE_ANNOUNCEMENT = 63
+
+
+def _asserted_announcements(offer: Offer) -> set[bytes]:
+    """Every puzzle announcement the maker's SIGNED spends assert."""
+    asserted: set[bytes] = set()
+    for spend in _trader_spends(offer):
+        try:
+            conditions = Program.from_bytes(bytes(spend.puzzle_reveal)).run(Program.from_bytes(bytes(spend.solution)))
+        except Exception:  # noqa: BLE001 -- a spend that does not run asserts nothing
+            continue
+        for condition in conditions.as_iter():
+            try:
+                items = list(condition.as_iter())
+                if len(items) >= 2 and items[0].as_int() == ASSERT_PUZZLE_ANNOUNCEMENT:
+                    asserted.add(bytes(items[1].as_atom()))
+            except Exception:  # noqa: BLE001 -- not a condition shape we read
+                continue
+    return asserted
+
+
 def _trader_ph(offer: Offer, asset: bytes32 | None) -> bytes32 | None:
-    """Where the offer asks for `asset` to be paid -- the trader's own puzzle hash."""
+    """Where the offer asks for `asset` to be paid -- the trader's own puzzle hash.
+
+    Requested payment groups are unsigned offer metadata: anyone relaying the
+    offer can prepend a group of their own and become "the first requested
+    payment", which is where the surplus refund went (2026-09-26 external
+    review, finding 14). What a relayer cannot forge is the maker's signed
+    ASSERT_PUZZLE_ANNOUNCEMENT of its own group. So the refund goes to the
+    first group whose announcement the maker's spends assert; a prepended
+    group carries a nonce nothing asserts and never receives it. An offer
+    that asks for the asset but binds none of its groups is refused rather
+    than paid to a stranger.
+    """
     payments = offer.get_requested_payments().get(asset, [])
-    return bytes32(payments[0].puzzle_hash) if payments else None
+    if not payments:
+        return None
+    asserted = _asserted_announcements(offer)
+    settlement_ph = settle_ph(asset)
+    groups: dict[bytes32, list] = {}
+    for payment in payments:
+        groups.setdefault(payment.nonce, []).append(payment)
+    for nonce, group in groups.items():
+        message = Program.to((nonce, [p.as_condition_args() for p in group])).get_tree_hash()
+        announcement = hashlib.sha256(bytes(settlement_ph) + bytes(message)).digest()
+        if announcement in asserted:
+            return bytes32(group[0].puzzle_hash)
+    raise OfferRejected(
+        "no requested payment of this asset is bound by the maker's signed spends; "
+        "the surplus refund goes only to a payment group the maker asserts"
+    )
 
 
 def payout_solution(offer: Offer, asset: bytes32 | None, payout_coin: Coin, surplus_ph: bytes32,

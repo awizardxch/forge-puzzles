@@ -205,7 +205,7 @@ singleton struct and never with the policy.
 
 What this buys: passkey and secp members, a `singleton_member` seat whose
 authority is held by whoever can spend an NFT or a DID, and the `timelock` and
-`prevent_*` guards — all shipped and audited by CNI rather than written here.
+`prevent_*` guards — all shipped by CNI in `chia_puzzles` rather than written here.
 `docs/FORGE_LOCK_MIPS.md` records the composition, the measured hashes, the
 migration rule and the two restriction-layer corrections it took to match.
 

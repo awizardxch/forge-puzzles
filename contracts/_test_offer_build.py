@@ -186,6 +186,16 @@ offered = {
 }
 check("it gives up what the trader offered", offered == {"xch": 250_000}, str(offered))
 
+# 2026-09-26: found while remediating the external review. A maker spend with
+# only CREATE_COINs is a gift, not an offer: whoever settles the settlement coin
+# may pay anyone. The maker's spend must assert the announcement the settlement
+# puzzle makes when it pays the notarized requested payments.
+asserted = {bytes(c.rest().first().as_atom()) for spend in built["coin_spends"]
+            for c in conditions_of(spend) if c.first().as_int() == 63}
+expected = {ann.msg_calc for ann in Offer.calculate_announcements(parsed.requested_payments, parsed.driver_dict)}
+check("the maker's spend asserts the settlement announcement of its requested payments", bool(expected) and expected <= asserted,
+      f"asserted {[a.hex()[:10] for a in asserted]} expected {[e.hex()[:10] for e in expected]}")
+
 print("\nbad input is refused, not guessed at:")
 short = run({
     "action": "build",
@@ -194,6 +204,29 @@ short = run({
     "requested": [{"asset_id": None, "amount": 1}],
 })
 check("coins that cannot cover the offer are refused", short.get("success") is False, str(short)[:120])
+
+# 2026-09-26 external review, finding 15: the builder executed every caller-supplied
+# CAT inner puzzle before anything checked the coin could exist. Now a coin whose
+# puzzle hash is not the hash of its reveal is refused first, by a tree hash.
+wrong_xch = xch_coin(1_000_000, 0x16)
+wrong_xch["coin"]["puzzle_hash"] = "0x" + ("de" * 32)
+mismatch = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": None, "amount": 500_000, "coins": [wrong_xch]}],
+    "requested": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 1}],
+})
+check("an XCH coin whose hash is not its reveal's is refused", mismatch.get("success") is False, str(mismatch)[:160])
+check("...and the refusal names the mismatch", "cannot be spent with this reveal" in str(mismatch.get("error")), str(mismatch.get("error"))[:160])
+wrong_cat = cat_coin(5_000, 0x17)
+wrong_cat["inner_puzzle"] = bytes(Program.to((1, [[51, CHANGE_PH, 1]]))).hex()   # a different inner: the CAT hash no longer matches
+mismatch_cat = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 1_000, "coins": [wrong_cat]}],
+    "requested": [{"asset_id": None, "amount": 1}],
+})
+check("a CAT coin whose inner does not produce its hash is refused before it runs", mismatch_cat.get("success") is False, str(mismatch_cat)[:160])
 
 print()
 if FAILED:

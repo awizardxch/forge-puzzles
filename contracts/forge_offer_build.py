@@ -81,23 +81,60 @@ def _coin(record: dict[str, Any]) -> Coin:
     return Coin(_b32(coin["parent_coin_info"]), _b32(coin["puzzle_hash"]), uint64(int(coin["amount"])))
 
 
+def _assert_reveal_matches(coin: Coin, puzzle_hash: bytes32, what: str) -> None:
+    """Refuse a coin whose puzzle hash is not the hash of the reveal supplied.
+
+    The build used to execute every caller-supplied CAT inner puzzle before
+    anything checked that the coin could exist (2026-09-26 external review,
+    finding 15). A coin that is not what its reveal says can never be spent,
+    so there is nothing to build -- and the check is a tree hash, not an
+    execution, so it costs the caller's puzzle nothing to fail.
+    """
+    if coin.puzzle_hash != puzzle_hash:
+        raise ValueError(
+            f"{what} {coin.name().hex()[:10]} has puzzle hash {coin.puzzle_hash.hex()[:10]} "
+            f"but its reveal hashes to {puzzle_hash.hex()[:10]}; the coin cannot be spent with this reveal"
+        )
+
+
 def _condition_list(outputs: list[tuple[bytes32, int]]) -> Program:
     """Create exactly the coins named, and nothing else."""
     return Program.to([[CREATE_COIN, puzzle_hash, amount] for puzzle_hash, amount in outputs])
 
 
-def _p2_solution(outputs: list[tuple[bytes32, int]]) -> Program:
+def _p2_solution(outputs: list[tuple[bytes32, int]], asserts: list[Program] | None = None) -> Program:
     """The standard puzzle's solution for those conditions.
 
     A delegated puzzle is a *program* that returns conditions, not the condition
     list itself -- `puzzle_for_conditions` quotes them. Passing the bare list
     produces a solution the coin cannot run, which is the kind of thing that only
     shows up when something tries to execute it.
+
+    `asserts` are the ASSERT_PUZZLE_ANNOUNCEMENT conditions that make the spend
+    an offer rather than a gift: see `_announcements`.
     """
-    return solution_for_conditions(_condition_list(outputs))
+    conditions = list(_condition_list(outputs).as_iter()) + list(asserts or [])
+    return solution_for_conditions(Program.to(conditions))
 
 
-def _xch_spends(coins: list[dict[str, Any]], offered: int, change_ph: bytes32, fee: int) -> list:
+def _announcements(requested: list[dict[str, Any]], puzzle_hash: bytes32, coins: list[Coin]) -> list[Program]:
+    """The conditions that bind the trader's coins to being paid.
+
+    A maker's spend must assert the announcement the settlement puzzle makes
+    when it pays the notarized requested payments; without that assertion the
+    coins it spends into the settlement coin can be released to anyone by
+    whoever settles. Until 2026-09-26 this builder produced spends with the
+    CREATE_COINs and nothing else -- found while remediating the external
+    review's finding 14 (which binds the surplus refund to exactly these
+    assertions) and not among the review's findings. The announcements are the
+    ones `finalize` will notarize, over the same coins and the same requested
+    side, so build and finalize agree by construction.
+    """
+    notarized = _requested_payments(requested, puzzle_hash, coins)
+    return [ann.to_program() for ann in Offer.calculate_announcements(notarized, _drivers(requested))]
+
+
+def _xch_spends(coins: list[dict[str, Any]], offered: int, change_ph: bytes32, fee: int, asserts: list[Program]) -> list:
     """Spend the trader's XCH into a settlement coin, with change back to them.
 
     The first coin carries the whole delegated puzzle: it creates the settlement
@@ -116,12 +153,14 @@ def _xch_spends(coins: list[dict[str, Any]], offered: int, change_ph: bytes32, f
     spends = []
     for index, record in enumerate(coins):
         puzzle = Program.fromhex(str(record["puzzle"]))
-        solution = _p2_solution(outputs) if index == 0 else _p2_solution([])
-        spends.append(make_spend(_coin(record), puzzle, solution))
+        coin = _coin(record)
+        _assert_reveal_matches(coin, puzzle.get_tree_hash(), "XCH coin")
+        solution = _p2_solution(outputs, asserts) if index == 0 else _p2_solution([])
+        spends.append(make_spend(coin, puzzle, solution))
     return spends
 
 
-def _cat_spends(asset: bytes32, coins: list[dict[str, Any]], offered: int, change_ph: bytes32) -> list:
+def _cat_spends(asset: bytes32, coins: list[dict[str, Any]], offered: int, change_ph: bytes32, asserts: list[Program]) -> list:
     """The CAT ring for one asset: settlement out, change back, value conserved."""
     total = sum(int(record["coin"]["amount"]) for record in coins)
     change = total - offered
@@ -131,11 +170,14 @@ def _cat_spends(asset: bytes32, coins: list[dict[str, Any]], offered: int, chang
     spendables = []
     for index, record in enumerate(coins):
         inner = Program.fromhex(str(record["inner_puzzle"]))
+        # The CAT puzzle over this asset and inner must hash to the coin's own
+        # puzzle hash, or the coin is not this CAT and nothing below can run.
+        _assert_reveal_matches(_coin(record), construct_cat_puzzle(CAT_MOD, asset, inner).get_tree_hash(), f"CAT {asset.hex()[:8]} coin")
         if index == 0:
             outputs: list[tuple[bytes32, int]] = [(bytes32(OFFER_MOD_HASH), offered)]
             if change > 0:
                 outputs.append((change_ph, change))
-            inner_solution = _p2_solution(outputs)
+            inner_solution = _p2_solution(outputs, asserts)
         else:
             inner_solution = _p2_solution([])
 
@@ -188,6 +230,11 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     fee = int(payload.get("fee", 0))
     spends = []
 
+    # Every coin the offer spends, in leg order: the nonce over these is what
+    # the requested payments are notarized against, in build and in finalize.
+    all_coins = [_coin(record) for leg in payload["offered"] for record in leg["coins"]]
+    asserts = _announcements(payload["requested"], change_ph, all_coins)
+
     for leg in payload["offered"]:
         asset = _asset_id(leg.get("asset_id"))
         amount = int(leg["amount"])
@@ -197,9 +244,9 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         if not coins:
             raise ValueError("an offered leg needs at least one coin")
         spends.extend(
-            _xch_spends(coins, amount, change_ph, fee)
+            _xch_spends(coins, amount, change_ph, fee, asserts)
             if asset is None
-            else _cat_spends(asset, coins, amount, change_ph)
+            else _cat_spends(asset, coins, amount, change_ph, asserts)
         )
 
     return {

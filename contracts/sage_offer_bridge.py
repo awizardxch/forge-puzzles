@@ -124,8 +124,16 @@ def main() -> int:
             if not transaction_id:
                 transaction_id = take_transaction_id
 
+            # A take is a success only when something was broadcast. A bundle
+            # the wallet signed but never submitted (submit raised, or Sage
+            # returned no id) is "signed-not-submitted": reporting it as
+            # success made the taker record a pending confirmation for a
+            # transaction that did not exist (2026-09-26 review, finding 09).
+            submitted = bool(transaction_id)
             return emit({
-                'success': True,
+                'success': submitted,
+                'state': 'submitted' if submitted else 'signed-not-submitted',
+                **({} if submitted else {'error': submit_error or 'take_offer returned no transaction id; nothing was submitted.'}),
                 'offer_id': result.get('offer_id') or imported_offer_id,
                 'transaction_id': transaction_id,
                 'take_transaction_id': take_transaction_id,

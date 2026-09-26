@@ -30,6 +30,17 @@ will be published with the audit request.
 What is kept here is the part that is useful to a reviewer: what was tested, how,
 and what the tests found.
 
+## External review
+
+An external security review of the responder and these puzzles was received on
+2026-09-26. It is described here as exactly that -- a review, with a date -- and
+not as a guarantee: the reviewers asked that their work not be presented as an
+endorsement or a certification, and this project does not describe its code as
+"audited and found secure" by them or by anyone. Its findings were all in the
+off-chain responder and router; it found no value-extraction path in the V14
+puzzles, and that statement is theirs, about the commits they read, not a
+standing property. The fixes are in this repository's history from that date.
+
 ## What has been checked
 
 Every suite runs the compiled puzzles rather than hashing them. That discipline

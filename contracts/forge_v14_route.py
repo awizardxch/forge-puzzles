@@ -88,6 +88,39 @@ def _key(asset: Asset) -> bytes:
     return bytes(ZERO_32 if asset is None else asset)
 
 
+def nudge_equal_shares(grosses: list[int]) -> list[int]:
+    """Make every share distinct while holding the total.
+
+    Two children of one parent with the same amount would be the same coin (a
+    50/50 split is exactly that), so equal shares are moved apart by a mojo,
+    from the later share to the earlier one. The first version did this in one
+    pass over index pairs and never re-checked a pair it had already visited:
+    with four equal shares the second nudge recreated a pair the first had
+    separated, and `new_coin` refused the route -- after the trader had signed
+    (2026-09-26 external review, finding 13). This repeats until no two shares
+    are equal. It terminates because every nudge moves a mojo from a share to
+    one at least as large, which strictly raises the sum of squares, and that
+    sum is bounded by the total squared. A share that would fall to zero is a
+    refusal, not a collision: the old `> 1` guard let two 1-mojo shares through
+    as the same coin.
+    """
+    shares = [int(g) for g in grosses]
+    while True:
+        collided = False
+        for i in range(len(shares)):
+            for j in range(i + 1, len(shares)):
+                if shares[i] == shares[j]:
+                    if shares[j] <= 1:
+                        raise OfferRejected(
+                            "two equal shares of one hub cannot be told apart without emptying one of them; "
+                            "route less of the entry through this hub"
+                        )
+                    shares[i] += 1
+                    shares[j] -= 1
+                    collided = True
+        if not collided:
+            return shares
+
 @dataclass(eq=False)
 class Leg:
     """One pool action in the route.
@@ -305,15 +338,7 @@ class _Composer:
             return self.children(producers, [spendable], asset,
                                  extra_payments=[[self.fee_ph, fee, [self.fee_ph]]])
         # the declared shares of what the producers actually hold, net of the fee
-        grosses = [d * spendable // sum(declared) for d in declared]
-        # Two children of one parent with the same amount would be the same coin
-        # (a 50/50 split is exactly that), so equal shares are nudged apart by a
-        # mojo, moved from the later share to the earlier one; the total holds.
-        for i in range(len(grosses)):
-            for j in range(i + 1, len(grosses)):
-                if grosses[i] == grosses[j] and grosses[j] > 1:
-                    grosses[i] += 1
-                    grosses[j] -= 1
+        grosses = nudge_equal_shares([d * spendable // sum(declared) for d in declared])
         for c, g in zip(consumers, grosses):
             c.gross = g
             if g <= 0:
