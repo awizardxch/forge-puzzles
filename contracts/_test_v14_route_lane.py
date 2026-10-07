@@ -67,6 +67,24 @@ def attempt(label, payload, expect_ok=True):
     return out
 
 
+def exact_offer(payload: dict, offered: dict, out_asset, salt: int, bps: int = 0, fee_asset="auto"):
+    """The offer a quote produces for this route (F3, 2026-10-07): the router's rate paid by
+    the trader's own spend beside the entry settlement, and EXACTLY what the route releases
+    asked for -- read from the composer's own preview of the same payload. Returns the
+    offer and the amount it asks for."""
+    offered = dict(offered)
+    payments = None
+    if bps:
+        asset = next(iter(offered)) if fee_asset == "auto" else fee_asset
+        fee = offered[asset] * bps // 10_000
+        offered[asset] -= fee
+        payments = {asset: [(ROUTER_PH, fee)]}
+    probe = fabricate_offer(offered, {out_asset: 1}, salt=salt, payments=payments)
+    preview = run({**payload, "offer": probe.to_bech32(), "preview": True})
+    want = int(preview["forge"]["releases"][hx(out_asset)])
+    return fabricate_offer(offered, {out_asset: want}, salt=salt, payments=payments), want
+
+
 def main() -> int:
     if not drv.v14_available():
         print("  [skip] V11 puzzles not built"); return 2
@@ -84,17 +102,15 @@ def main() -> int:
     gross = 100_000_000
     o1 = swap_out(xa, 0, 1, gross)
     o2 = swap_out(ab, 0, 1, o1)
-    want = o2 * 99 // 100
-    offer = fabricate_offer({None: gross}, {T_B: want}, salt=0x61)
-    out = attempt("2-hop", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), snap(ab)],
-                            "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H, "dev_fee": fee})
+    hop2 = {"action": "multihop-swap", "pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H, "dev_fee": fee}
+    offer, want = exact_offer(hop2, {None: gross}, T_B, salt=0x61)
+    check("  the composer's preview releases what the chain computes", want == o2, f"{want} vs {o2}")
+    out = attempt("2-hop", {**hop2, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         check("  amounts follow the chain", [int(a) for a in out["amounts"]] == [gross, o1, o2], f"{out['amounts']}")
-        # The router was paid on the ENTRY, so nothing is owed out of the output: the
-        # trader receives every mojo the last pool released, their notarised floor plus
-        # the overage above it.
-        check("  trader is paid at least the request", paid_to(bundle, TRADER_PH, T_B) >= want)
+        # The router is paid on the ENTRY (nothing, at 0 bps), so the trader receives every
+        # mojo the last pool released: exactly what the offer asked for, nothing left over.
         check("  the whole output reaches the trader", paid_to(bundle, TRADER_PH, T_B) == o2, f"{o2}")
         check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, T_B) == 0)
         check("  the intermediate A never reaches anyone", paid_to(bundle, TRADER_PH, T_A) == 0 and paid_to(bundle, ROUTER_PH, T_A) == 0)
@@ -108,16 +124,14 @@ def main() -> int:
         net_in = gross - entry_fee
         n1 = swap_out(xa, 0, 1, net_in)
         n2 = swap_out(ab, 0, 1, n1)
-        asked = n2 * 99 // 100
-        offer_n = fabricate_offer({None: gross}, {T_B: asked}, salt=0x70 + (bps % 100))
-        out_n = attempt(f"2-hop at {bps} bps",
-                        {"action": "multihop-swap", "offer": offer_n.to_bech32(),
-                         "pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)],
-                         "current_height": H, "dev_fee": charged})
+        # the trader's own spend pays the fee beside the entry settlement, which holds the net
+        offer_n, asked = exact_offer({**hop2, "dev_fee": charged}, {None: gross}, T_B, salt=0x70 + (bps % 100), bps=bps)
+        check(f"  {bps} bps: the preview prices the route on the net entry", asked == n2, f"{asked} vs {n2}")
+        out_n = attempt(f"2-hop at {bps} bps", {**hop2, "dev_fee": charged, "offer": offer_n.to_bech32()})
         if not out_n:
             continue
         b = SpendBundle.from_json_dict(out_n["bundle"])
-        check(f"  {bps} bps: the router is paid in the ENTRY asset, not the output",
+        check(f"  {bps} bps: the router is paid in the ENTRY asset by the trader's own spend, not out of the output",
               paid_to(b, ROUTER_PH, None) == entry_fee and paid_to(b, ROUTER_PH, T_B) == 0,
               f"{paid_to(b, ROUTER_PH, None)} vs {entry_fee}")
         check(f"  {bps} bps: the route is priced on the NET input",
@@ -126,41 +140,45 @@ def main() -> int:
         check(f"  {bps} bps: the response reports what was actually taken",
               int(out_n["dev_fee_collected"]) == entry_fee, out_n["dev_fee_collected"])
         check("  two successors, in input order", [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex(), ab.launcher_id.hex()])
-    attempt("2-hop, greedy trader", {"action": "multihop-swap", "offer": fabricate_offer({None: gross}, {T_B: o2 + 1}, salt=0x62).to_bech32(),
-                                     "pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H, "dev_fee": fee},
+    attempt("2-hop, greedy trader", {**hop2, "offer": fabricate_offer({None: gross}, {T_B: o2 + 1}, salt=0x62).to_bech32()}, expect_ok=False)
+    attempt("2-hop, a stale quote (one mojo under)", {**hop2, "offer": fabricate_offer({None: gross}, {T_B: o2 - 1}, salt=0x62).to_bech32()},
             expect_ok=False)
 
     print("multi-hop XCH -> A -> B -> C (three pools, CAT bridges)")
     o3 = swap_out(bc, 0, 1, o2)
-    offer = fabricate_offer({None: gross}, {T_C: o3 * 99 // 100}, salt=0x63)
-    out = attempt("3-hop", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), snap(ab), snap(bc)],
-                            "path": [hx(None), hx(T_A), hx(T_B), hx(T_C)], "current_height": H, "dev_fee": fee})
+    hop3 = {"action": "multihop-swap", "pools": [snap(xa), snap(ab), snap(bc)], "path": [hx(None), hx(T_A), hx(T_B), hx(T_C)],
+            "current_height": H, "dev_fee": fee}
+    offer, want = exact_offer(hop3, {None: gross}, T_C, salt=0x63)
+    check("  the preview follows the chain", want == o3)
+    out = attempt("3-hop", {**hop3, "offer": offer.to_bech32()})
     if out:
         check("  amounts follow the chain", [int(a) for a in out["amounts"]] == [gross, o1, o2, o3])
 
     print("split XCH -> A across two pools")
     g1, g2 = 60_000_000, 40_000_000
     s1, s2 = swap_out(xa, 0, 1, g1), swap_out(xa2, 0, 1, g2)
-    want = (s1 + s2) * 99 // 100
-    offer = fabricate_offer({None: g1 + g2}, {T_A: want}, salt=0x64)
-    out = attempt("split", {"action": "split-swap", "offer": offer.to_bech32(), "current_height": H, "dev_fee": fee,
-                            "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": g1},
-                                         {"pools": [snap(xa2)], "path": [hx(None), hx(T_A)], "amountIn": g2}]})
+    split2 = {"action": "split-swap", "current_height": H, "dev_fee": fee,
+              "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": g1},
+                           {"pools": [snap(xa2)], "path": [hx(None), hx(T_A)], "amountIn": g2}]}
+    offer, want = exact_offer(split2, {None: g1 + g2}, T_A, salt=0x64)
+    check("  the preview sums the branches", want == s1 + s2)
+    out = attempt("split", {**split2, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         check("  branch amounts are the declared shares of the offered XCH", [[int(a) for a in b] for b in out["branch_amounts"]] == [[g1, s1], [g2, s2]])
         check("  total_out is the sum", int(out["total_out"]) == s1 + s2)
-        check("  trader is paid at least the request, once", paid_to(bundle, TRADER_PH, T_A) >= want)
-        check("  both branches' output reaches the trader", paid_to(bundle, TRADER_PH, T_A) == s1 + s2)
+        check("  both branches' output reaches the trader, exactly", paid_to(bundle, TRADER_PH, T_A) == s1 + s2)
         check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, T_A) == 0)
     # an equal split would create two identical entry children; the composer nudges the
     # shares apart by one mojo so the coins differ and the total still matches the offer
     ge = 50_000_000
     se = swap_out(xa, 0, 1, ge + 1) + swap_out(xa2, 0, 1, ge - 1)
-    offer_eq = fabricate_offer({None: 2 * ge}, {T_A: se * 99 // 100}, salt=0x6A)
-    out = attempt("equal split", {"action": "split-swap", "offer": offer_eq.to_bech32(), "current_height": H, "dev_fee": fee,
-                                  "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": ge},
-                                               {"pools": [snap(xa2)], "path": [hx(None), hx(T_A)], "amountIn": ge}]})
+    spliteq = {"action": "split-swap", "current_height": H, "dev_fee": fee,
+               "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": ge},
+                            {"pools": [snap(xa2)], "path": [hx(None), hx(T_A)], "amountIn": ge}]}
+    offer_eq, want_eq = exact_offer(spliteq, {None: 2 * ge}, T_A, salt=0x6A)
+    check("  the preview prices the nudged shares", want_eq == se)
+    out = attempt("equal split", {**spliteq, "offer": offer_eq.to_bech32()})
     if out:
         check("  equal shares were nudged apart by a mojo, total preserved",
               [int(b[0]) for b in out["branch_amounts"]] == [ge + 1, ge - 1], f"{out['branch_amounts']}")
@@ -173,10 +191,12 @@ def main() -> int:
     b1 = swap_out(ab, 0, 1, ga1)
     x2 = swap_out(xa, 1, 0, ga2)
     b2 = swap_out(xb, 0, 1, x2)
-    offer = fabricate_offer({T_A: ga1 + ga2}, {T_B: (b1 + b2) * 99 // 100}, salt=0x65)
-    out = attempt("CAT split", {"action": "split-swap", "offer": offer.to_bech32(), "current_height": H, "dev_fee": fee,
-                                "branches": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": ga1},
-                                             {"pools": [snap(xa), snap(xb)], "path": [hx(T_A), hx(None), hx(T_B)], "amountIn": ga2}]})
+    splitc = {"action": "split-swap", "current_height": H, "dev_fee": fee,
+              "branches": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": ga1},
+                           {"pools": [snap(xa), snap(xb)], "path": [hx(T_A), hx(None), hx(T_B)], "amountIn": ga2}]}
+    offer, want = exact_offer(splitc, {T_A: ga1 + ga2}, T_B, salt=0x65)
+    check("  the preview sums both branches", want == b1 + b2)
+    out = attempt("CAT split", {**splitc, "offer": offer.to_bech32()})
     if out:
         check("  branch amounts", [[int(a) for a in b] for b in out["branch_amounts"]] == [[ga1, b1], [ga2, x2, b2]])
 
@@ -185,13 +205,13 @@ def main() -> int:
     lp_out = swap_out(xlp, 0, 1, gross)
     vf = forge_math.vault_fee_bps(1, 10, vault.fee_bps)
     redeemed = forge_math.withdrawal_amounts(vault.state[0], lp_out, vault.state[1], vf)[0]
-    offer = fabricate_offer({None: gross}, {T_A: redeemed * 99 // 100}, salt=0x66)
-    out = attempt("vault route", {"action": "vault-route", "offer": offer.to_bech32(), "current_height": H, "dev_fee": fee,
-                                  "swapPool": snap(xlp), "assetIn": hx(None), "vault": snap(vault)})
+    vroute = {"action": "vault-route", "current_height": H, "dev_fee": fee, "swapPool": snap(xlp), "assetIn": hx(None), "vault": snap(vault)}
+    offer, want = exact_offer(vroute, {None: gross}, T_A, salt=0x66)
+    check("  the preview is the redeemed amount", want == redeemed)
+    out = attempt("vault route", {**vroute, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         check("  swap_out and redeemed as quoted", int(out["swap_out"]) == lp_out and int(out["redeemed"]) == redeemed, f"{out['swap_out']} LP -> {out['redeemed']}")
-        check("  trader is paid at least the request", paid_to(bundle, TRADER_PH, T_A) >= redeemed * 99 // 100)
         check("  the redeemed amount reaches the trader in full", paid_to(bundle, TRADER_PH, T_A) == redeemed)
         check("  the vault's LP supply fell by the burn", int(out["pools"][1]["state"]["total_lp"]) == vault.state[1] - lp_out)
 
@@ -201,16 +221,16 @@ def main() -> int:
     a_out, lp_mint, x_back = v14r.simulate_chain([xa, vault, xlp], [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], gross_w)
     check("  the fixed point splits the offered XCH into entry and backing", gross_w + backing == offered_x and backing == lp_mint,
           f"gross {gross_w} backing {backing} mint {lp_mint}")
-    want_w = x_back * 99 // 100
-    offer = fabricate_offer({None: offered_x}, {None: want_w}, salt=0x6b)
-    out = attempt("wrap route", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), snap(vault), snap(xlp)],
-                                 "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee})
+    wroute = {"action": "multihop-swap", "pools": [snap(xa), snap(vault), snap(xlp)],
+              "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee}
+    offer, want_w = exact_offer(wroute, {None: offered_x}, None, salt=0x6b)
+    check("  the preview is the XCH the LP pool releases", want_w == x_back, f"{want_w} vs {x_back}")
+    out = attempt("wrap route", {**wroute, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         check("  amounts follow the chain: entry, A, LP minted, XCH back", [int(a) for a in out["amounts"]] == [gross_w, a_out, lp_mint, x_back], f"{out['amounts']}")
         check("  the wrap reports its deposit, mint and backing",
               int(out["wrap"]["deposit"]) == a_out and int(out["wrap"]["minted"]) == lp_mint and int(out["wrap"]["leftover_xch"]) == 0, f"{out['wrap']}")
-        check("  trader is paid at least the request in XCH", paid_to(bundle, TRADER_PH, None) >= want_w)
         check("  the whole XCH output reaches the trader", paid_to(bundle, TRADER_PH, None) == x_back)
         check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, None) == 0)
         check("  no LP leaves the route", paid_to(bundle, TRADER_PH, vault.lp_asset_id) == 0 and paid_to(bundle, ROUTER_PH, vault.lp_asset_id) == 0)
@@ -225,47 +245,34 @@ def main() -> int:
         gross_x = forge_math.swap_output(l0, x0, lp_mint, xlp.fee_bps, xlp.weights[1], xlp.weights[0])
         check("  the LP pool took the minted LP and released the XCH", [int(r) for r in xlp_after["reserves"]] == [x0 - gross_x, l0 + lp_mint], f"{xlp_after['reserves']}")
 
-    # The same wrap route WITH the router charging. The case above runs at 0 bps, which is
-    # why it never caught this: the split between the entry and the wrap's backing was taken
-    # on the GROSS offered XCH, while `compose` carves the router's fee out of those same
-    # coins -- so entry + fee + backing exceeded the offer and the wrap was refused for the
-    # shortfall. Found on 2026-09-16 driving this lane at live pools (a 30,000,000 offer at
-    # 300 bps came up 56 mojos short); the split is now taken net of the fee.
-    print("wrap route with the router charging: the fee comes out of the same XCH as the backing")
+    # The same wrap route WITH the router charging. The fee is paid by the trader's own spend
+    # beside the entry settlement (F3, 2026-10-07), so the settlement holds the net and the
+    # split between the entry and the wrap's backing is taken on exactly that: nothing is
+    # carved from the hub any more. (Until then the split had to be fee-aware, found on
+    # 2026-09-16 when a 30,000,000 offer at 300 bps came up 56 mojos short.)
+    print("wrap route with the router charging: the fee is paid beside the entry, the split is on the net")
     charged_w = {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}
     wpath = [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)]
-    spend_c = offered_x - offered_x * 300 // 10_000
-    netshare = lambda x: x * spend_c // offered_x
-    gross_c, backing_c = v14r.wrap_backing([xa, vault, xlp], wpath, offered_x, 300)
-    a_c, mint_c, back_c = v14r.simulate_chain([xa, vault, xlp], wpath, netshare(gross_c))
-    check("  the two declared shares use up the whole offer",
-          gross_c + backing_c == offered_x, f"gross {gross_c} backing {backing_c} offered {offered_x}")
-    check("  the backing's share, net of the fee, covers the mint of the entry's share",
-          netshare(backing_c) >= mint_c and netshare(backing_c) - mint_c <= 1,
-          f"backing net {netshare(backing_c)} vs mint {mint_c}")
-    gross_sized = v14r.simulate_chain([xa, vault], wpath[:3], gross_c)[-1]
-    check("  sizing the mint on the declared gross would have come up short (the bug)",
-          gross_sized > netshare(backing_c), f"gross-sized mint {gross_sized} vs backing net {netshare(backing_c)}")
-    offer = fabricate_offer({None: offered_x}, {None: back_c * 99 // 100}, salt=0x6c)
-    out = attempt("wrap route, router charging", {"action": "multihop-swap", "offer": offer.to_bech32(),
-                                                  "pools": [snap(xa), snap(vault), snap(xlp)], "path": wpath,
-                                                  "current_height": H, "dev_fee": charged_w})
+    fee_c = offered_x * 300 // 10_000
+    spend_c = offered_x - fee_c
+    gross_c, backing_c = v14r.wrap_backing([xa, vault, xlp], wpath, spend_c)
+    a_c, mint_c, back_c = v14r.simulate_chain([xa, vault, xlp], wpath, gross_c)
+    check("  the two declared shares use up the net entry",
+          gross_c + backing_c == spend_c, f"gross {gross_c} backing {backing_c} net {spend_c}")
+    check("  the backing covers the mint of the entry's share", backing_c >= mint_c, f"backing {backing_c} vs mint {mint_c}")
+    offer, want_c = exact_offer({**wroute, "dev_fee": charged_w}, {None: offered_x}, None, salt=0x6c, bps=300)
+    check("  the preview is the XCH released plus the backing left over from the mint",
+          want_c == back_c + (backing_c - mint_c), f"{want_c} vs {back_c} + {backing_c - mint_c}")
+    out = attempt("wrap route, router charging", {**wroute, "dev_fee": charged_w, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         amts = [int(a) for a in out["amounts"]]
-        check("  it composes at all (it did not before the split was fee-aware)", True)
-        check("  the entry is the declared gross less the hub's fee",
-              abs(amts[0] - netshare(gross_c)) <= 1, f"builder {amts[0]} vs {netshare(gross_c)}")
-        check("  the router is paid its cut of the whole hub, once",
-              paid_to(bundle, ROUTER_PH, None) == offered_x * 300 // 10_000,
-              f"{paid_to(bundle, ROUTER_PH, None)} vs {offered_x * 300 // 10_000}")
-        # The two shares are floors of the same proration, so they can leave a mojo or two
-        # of the hub unspent. That dust is the trader's and leaves with the output -- the
-        # check is that it goes to them and not to the router, and that it IS dust.
-        dust = paid_to(bundle, TRADER_PH, None) - amts[-1]
-        check("  the trader is paid the route's whole output, plus any proration dust",
-              0 <= dust <= 2 and abs(amts[-1] - back_c) <= 2,
-              f"trader {paid_to(bundle, TRADER_PH, None)}, route out {amts[-1]}, dust {dust}, offline {back_c}")
+        check("  the entry is the declared gross of the net settlement", amts[0] == gross_c, f"builder {amts[0]} vs {gross_c}")
+        check("  the router is paid its cut of the whole entry, once, by the trader's own spend",
+              paid_to(bundle, ROUTER_PH, None) == fee_c, f"{paid_to(bundle, ROUTER_PH, None)} vs {fee_c}")
+        check("  the trader is paid exactly the route's output, the leftover backing included",
+              paid_to(bundle, TRADER_PH, None) == want_c and amts[-1] == back_c,
+              f"trader {paid_to(bundle, TRADER_PH, None)}, route out {amts[-1]}, offline {back_c}")
         check("  successors in path order (charged)",
               [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex(), vault.launcher_id.hex(), xlp.launcher_id.hex()])
         vc = out["pools"][1]["state"]
@@ -281,20 +288,49 @@ def main() -> int:
     print("wrap as the entry: the trader offers A plus the backing, and is paid XCH")
     dep_a = 50_000
     lp_mint2, x_back2 = v14r.simulate_chain([vault, xlp], [hx(T_A), hx(vault.lp_asset_id), hx(None)], dep_a)
-    offer = fabricate_offer({T_A: dep_a, None: lp_mint2 + 777}, {None: x_back2 * 99 // 100}, salt=0x6d)
-    out = attempt("wrap entry", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(vault), snap(xlp)],
-                                 "path": [hx(T_A), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee})
+    wentry = {"action": "multihop-swap", "pools": [snap(vault), snap(xlp)], "path": [hx(T_A), hx(vault.lp_asset_id), hx(None)],
+              "current_height": H, "dev_fee": fee}
+    offer, want_e = exact_offer(wentry, {T_A: dep_a, None: lp_mint2 + 777}, None, salt=0x6d)
+    check("  the preview is the XCH released plus the 777 over-supplied", want_e == x_back2 + 777, f"{want_e}")
+    out = attempt("wrap entry", {**wentry, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         check("  the whole offered A is wrapped", int(out["wrap"]["deposit"]) == dep_a and int(out["wrap"]["minted"]) == lp_mint2)
-        # The 777 mojos the trader over-supplied above the mint's backing are theirs, and
-        # so is the gap between what the route released and what they asked for. Both now
-        # leave with the output instead of stopping at the router.
+        # The 777 mojos the trader over-supplied above the mint's backing are theirs: they
+        # leave with the output, inside the group the trader signed for.
         check("  XCH beyond the backing comes back to the TRADER with the output",
               int(out["wrap"]["leftover_xch"]) == 777
               and paid_to(bundle, TRADER_PH, None) == x_back2 + 777
               and paid_to(bundle, ROUTER_PH, None) == 0,
               f"trader {paid_to(bundle, TRADER_PH, None)} of {x_back2 + 777}")
+
+    # The same wrap entry WITH the router charging. The case above runs at 0 bps, where
+    # "the whole offered A is wrapped" holds trivially. Charging, the entry hub carves the
+    # fee out of the offered A before the vault sees it -- while the XCH backing is taken
+    # from the offer directly and is NOT charged. A quote that wraps the whole A (the TS
+    # mirror did, pinned by wrapRoute.check) promises a mint the vault never makes, and an
+    # offer sized from it is refused. Found 2026-10-02 reading the lane after the same
+    # mismatch on plain multi-hop paths ("route releases 142 ... asks 143").
+    print("wrap as the entry with the router charging: the fee comes off the A, not the backing")
+    charged_e = {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}
+    net_a = dep_a - dep_a * 300 // 10_000
+    lp_net, x_net = v14r.simulate_chain([vault, xlp], [hx(T_A), hx(vault.lp_asset_id), hx(None)], net_a)
+    offer, want_n = exact_offer({**wentry, "dev_fee": charged_e}, {T_A: dep_a, None: lp_net}, None, salt=0x6e, bps=300, fee_asset=T_A)
+    check("  the preview prices the wrap on the net A", want_n == x_net, f"{want_n} vs {x_net}")
+    out = attempt("wrap entry, router charging", {**wentry, "dev_fee": charged_e, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  the vault receives the A less the router's cut, and mints on that",
+              int(out["wrap"]["deposit"]) == net_a and int(out["wrap"]["minted"]) == lp_net,
+              f"{out['wrap']} vs deposit {net_a} mint {lp_net}")
+        check("  the router is paid in A, its cut of the entry, by the trader's own spend, and nothing in XCH",
+              paid_to(bundle, ROUTER_PH, T_A) == dep_a * 300 // 10_000 and paid_to(bundle, ROUTER_PH, None) == 0,
+              f"A {paid_to(bundle, ROUTER_PH, T_A)} XCH {paid_to(bundle, ROUTER_PH, None)}")
+        check("  the backing is exactly the net mint: none of it is charged, none left over",
+              int(out["wrap"]["leftover_xch"]) == 0, f"{out['wrap']}")
+    # An offer that pays no router fee at all, with the router charging, is refused.
+    offer = fabricate_offer({T_A: dep_a, None: lp_mint2}, {None: x_back2}, salt=0x6f)
+    attempt("an offer paying no router fee, router charging", {**wentry, "dev_fee": charged_e, "offer": offer.to_bech32()}, expect_ok=False)
 
     print("revisiting route: XCH -> A on xa, wrapped in the vault, the LP sold for XCH on xlp, that XCH buying A again on xa2")
     rpools = [xa, vault, xlp, xa2]
@@ -302,14 +338,13 @@ def main() -> int:
     offered_r = 400_000_000
     gross_r, backing_r = v14r.wrap_backing(rpools, rpath, offered_r)
     outs_r = v14r.simulate_chain(rpools, rpath, gross_r)
-    want_r = outs_r[-1] * 99 // 100
-    offer = fabricate_offer({None: offered_r}, {T_A: want_r}, salt=0x6e)
-    out = attempt("revisiting route", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(p) for p in rpools],
-                                       "path": rpath, "current_height": H, "dev_fee": fee})
+    rroute = {"action": "multihop-swap", "pools": [snap(p) for p in rpools], "path": rpath, "current_height": H, "dev_fee": fee}
+    offer, want_r = exact_offer(rroute, {None: offered_r}, T_A, salt=0x6e)
+    check("  the preview is the second pass's output", want_r == outs_r[-1], f"{want_r} vs {outs_r[-1]}")
+    out = attempt("revisiting route", {**rroute, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         check("  amounts follow the chain through both passes", [int(a) for a in out["amounts"]] == [gross_r, *outs_r], f"{out['amounts']}")
-        check("  trader is paid at least the A of the second pass", paid_to(bundle, TRADER_PH, T_A) >= want_r)
         check("  the second pass's whole output reaches the trader", paid_to(bundle, TRADER_PH, T_A) == outs_r[-1])
         check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, T_A) == 0)
         check("  the XCH released mid-route reached xa2, not the trader", paid_to(bundle, TRADER_PH, None) == 0 and paid_to(bundle, ROUTER_PH, None) == 0)
@@ -324,11 +359,13 @@ def main() -> int:
     fa = swap_out(xa, 0, 1, gross)
     fb = swap_out(ab, 0, 1, fa)
     fx = swap_out(xb, 1, 0, fb)
-    offer = fabricate_offer({None: gross}, {None: fx * 99 // 100 if fx < gross else gross // 2}, salt=0x67)
-    out = attempt("triangle flow", {"action": "flow-balance", "offer": offer.to_bech32(), "current_height": H, "startAsset": hx(None),
-                                    "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": gross // 2},
-                                             {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": 1},
-                                             {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": 1}]})
+    tri = {"action": "flow-balance", "current_height": H, "startAsset": hx(None),
+           "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": gross // 2},
+                    {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": 1},
+                    {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": 1}]}
+    offer, want_t = exact_offer(tri, {None: gross}, None, salt=0x67)
+    check("  the preview is the XCH the triangle returns", want_t == fx, f"{want_t} vs {fx}")
+    out = attempt("triangle flow", {**tri, "offer": offer.to_bech32()})
     if out:
         check("  legs re-derived in order", [[int(a), int(b)] for a, b in out["leg_amounts"]] == [[gross, fa], [fa, fb], [fb, fx]], f"{out['leg_amounts']}")
         check("  total_out is the XCH released", int(out["total_out"]) == fx)
@@ -342,12 +379,13 @@ def main() -> int:
     a_out = swap_out(xa, 0, 1, ga)
     b_from_xb = swap_out(xb, 0, 1, gb)
     b_from_ab = swap_out(ab, 0, 1, a_out)
-    offer = fabricate_offer({None: gx}, {None: 1}, salt=0x68)
-    out = attempt("merge flow", {"action": "flow-balance", "offer": offer.to_bech32(), "current_height": H, "startAsset": hx(None),
-                                 "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": d1},
-                                          {"pool": snap(xb), "assetIn": hx(None), "assetOut": hx(T_B), "amountIn": d2},
-                                          {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": 1},
-                                          {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": 1}]})
+    merge = {"action": "flow-balance", "current_height": H, "startAsset": hx(None),
+             "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": d1},
+                      {"pool": snap(xb), "assetIn": hx(None), "assetOut": hx(T_B), "amountIn": d2},
+                      {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": 1},
+                      {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": 1}]}
+    offer, _want_m = exact_offer(merge, {None: gx}, None, salt=0x68)
+    out = attempt("merge flow", {**merge, "offer": offer.to_bech32()})
     if out:
         legs = [[int(a), int(b)] for a, b in out["leg_amounts"]]
         check("  entry legs got their declared shares", legs[0][0] == ga and legs[1][0] == gb, f"{legs}")
@@ -371,9 +409,17 @@ def main() -> int:
     deposits = [0, dep_a - sell_a, b_bought]
     # the XCH deposit is what is left of the offered XCH after the backing
     mint = forge_math.invariant_lp_mint(triple.state[0], [dep_x, *deposits[1:]], triple.state[1], triple.fee_bps, triple.weights, version=10)
-    offer = fabricate_offer({None: dep_x + mint, T_A: dep_a}, {triple.lp_asset_id: mint * 95 // 100}, salt=0x69)
-    out = attempt("routed deposit", {"action": "routed-deposit", "offer": offer.to_bech32(), "current_height": H, "pool": snap(triple),
-                                     "sales": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": sell_a}], "dev_fee": fee})
+    rdep = {"action": "routed-deposit", "current_height": H, "pool": snap(triple),
+            "sales": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": sell_a}], "dev_fee": fee}
+    offer, want_d = exact_offer(rdep, {None: dep_x + mint, T_A: dep_a}, triple.lp_asset_id, salt=0x69)
+    check("  the preview is the mint", want_d == mint, f"{want_d} vs {mint}")
+    # the same preview sized from amounts alone, a probe standing in for the offer: what
+    # the page asks for before the wallet has built anything
+    probe_out = run({**rdep, "preview": True, "probe": {"offered": {hx(None): str(dep_x + mint), hx(T_A): str(dep_a)},
+                                                          "requested": [hx(triple.lp_asset_id)]}})
+    check("  a preview from a probe (no offer) reports the same mint", int(probe_out["minted"]) == mint
+          and probe_out.get("preview") is True and "bundle" not in probe_out, f"{probe_out.get('minted')} vs {mint}")
+    out = attempt("routed deposit", {**rdep, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         minted = int(out["minted"])
@@ -381,8 +427,7 @@ def main() -> int:
         check("  deposits: the unsold A, the bought B, and XCH net of backing",
               int(out["deposits"][hx(T_A)]) == dep_a - sell_a and int(out["deposits"][hx(T_B)]) == b_bought
               and int(out["deposits"][hx(None)]) + minted == dep_x + mint, f"{out['deposits']} minted {minted}")
-        check("  trader receives at least the requested LP", paid_to(bundle, TRADER_PH, triple.lp_asset_id) >= mint * 95 // 100)
-        check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, triple.lp_asset_id) == minted)
+        check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, triple.lp_asset_id) == minted == want_d)
         check("  the router takes no LP", paid_to(bundle, ROUTER_PH, triple.lp_asset_id) == 0)
         check("  successors: the sale pool then the target", [s["launcher_id"] for s in out["pools"]] == [ab.launcher_id.hex(), triple.launcher_id.hex()])
         check("  target snapshot grew total_lp by the mint", int(out["target"]["state"]["total_lp"]) == triple.state[1] + minted)
@@ -394,9 +439,10 @@ def main() -> int:
     a_out = gross_a - gross_a * xa.protocol_fee_bps // 10_000
     post = [x0 + zap_swap, a0 - gross_a]
     est = forge_math.invariant_lp_mint(post, [zap_x - zap_swap, a_out], xa.state[1], xa.fee_bps, xa.weights, version=10)
-    offer = fabricate_offer({None: zap_x + est}, {xa.lp_asset_id: est * 95 // 100}, salt=0x6a)
-    out = attempt("zap through the target", {"action": "routed-deposit", "offer": offer.to_bech32(), "current_height": H, "pool": snap(xa),
-                                            "sales": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": zap_swap}], "dev_fee": fee})
+    zap = {"action": "routed-deposit", "current_height": H, "pool": snap(xa),
+           "sales": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": zap_swap}], "dev_fee": fee}
+    offer, want_z = exact_offer(zap, {None: zap_x + est}, xa.lp_asset_id, salt=0x6a)
+    out = attempt("zap through the target", {**zap, "offer": offer.to_bech32()})
     if out:
         bundle = SpendBundle.from_json_dict(out["bundle"])
         minted = int(out["minted"])
@@ -407,8 +453,7 @@ def main() -> int:
               f"{out['deposits']} minted {minted}")
         check("  the mint is priced on the post-swap state", minted == forge_math.invariant_lp_mint(
             post, [zap_x + est - zap_swap - minted, a_out], xa.state[1], xa.fee_bps, xa.weights, version=10), f"{minted} vs {est}")
-        check("  trader receives at least the requested LP", paid_to(bundle, TRADER_PH, xa.lp_asset_id) >= est * 95 // 100)
-        check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, xa.lp_asset_id) == minted)
+        check("  the whole mint reaches the depositor, as the preview said", paid_to(bundle, TRADER_PH, xa.lp_asset_id) == minted == want_z)
         check("  the router takes no LP", paid_to(bundle, ROUTER_PH, xa.lp_asset_id) == 0)
         after = out["target"]["state"]
         check("  reserves reflect swap then add", [int(r) for r in after["reserves"]] == [post[0] + int(out["deposits"][hx(None)]), post[1] + a_out],

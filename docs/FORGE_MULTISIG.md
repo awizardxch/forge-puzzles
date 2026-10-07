@@ -1196,6 +1196,18 @@ expectations of my own.
   safe's coins move — the same property Safe has before the nonce advances.
   Cancel in the UI is bookkeeping; to kill a fully signed proposal, spend its
   coins (a payment from the safe to itself).
+- **What a reader of the board gets.** Anyone who can name a lock reads its
+  queue: what is proposed, who has signed (`shares[].keys`), status, ids. The
+  bearer material in the record stays behind: the partial signatures are never
+  served (assembly is the service's job), and an executed offer's file and the
+  assembled bundle go only to a reader carrying an owner proof over
+  `('read', safeId)` — in the GET query, or in the refresh body — and, once, in
+  the execute response to whoever executed. A proof is good for one request:
+  the gate remembers each accepted `(key, digest)` until its ten-minute window
+  closes and refuses a second use, so a captured proof cannot be replayed to
+  read the file again or repeat a mutation (2026-10-07 audit, U7). An offer string is a bearer
+  instrument, and public locks' ids are listed for everyone (2026-10-07 audit,
+  U2; `api/_multisigIndex.js publicProposal`, `api/__checks__/multisigProposalPrivacy.check.mjs`).
 - **AGG_SIG_UNSAFE, not AGG_SIG_ME.** Mitigated by the coin-id pin above; a
   future revision on the vault puzzles moves to `AGG_SIG_ME` for free.
 - **An outstanding offer is cancelled by any other spend.** Every proposal spends

@@ -132,6 +132,8 @@ def _allowlist(raw) -> set[str]:
         if not item:
             continue
         if item.lower().startswith(("txch1", "xch1")):
+            import forge_network as _net
+            _net.check_address_network(item, "creation allowlist entry")
             out.add(bytes32(decode_puzzle_hash(item)).hex())
         else:
             out.add(item.lower().removeprefix("0x"))

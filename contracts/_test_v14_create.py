@@ -12,6 +12,7 @@ a duplicate configuration, a wrong bracket. Exit 0 all pass, 1 otherwise.
 """
 from __future__ import annotations
 
+import hashlib
 import sys
 
 sys.path.insert(0, ".")
@@ -45,6 +46,12 @@ def check(label, ok, detail=""):
     print(f"  [{'PASS' if ok else 'FAIL'}] {label}{'  ' + detail if detail else ''}")
     results.append(bool(ok))
     return bool(ok)
+
+
+def run_spend(cs) -> list:
+    """A spend's conditions, as it runs on chain; only the opcode-led ones."""
+    out = Program.from_bytes(bytes(cs.puzzle_reveal)).run(Program.from_bytes(bytes(cs.solution)))
+    return [c for c in out.as_iter() if c.first().atom is not None]
 
 
 def creator_xch(amount: int, salt: int) -> create.CreatorXch:
@@ -134,6 +141,55 @@ def main() -> int:
         check("  a router paying the genesis LP to itself is refused", False)
     except drv.Rejected as exc:
         check("  a router paying the genesis LP to itself is refused", True, str(exc)[:60])
+
+    # F1 (2026-10-07 review, confirmed on the simulator): the registry's `register` and slot
+    # spends hold no key, and until now the creator's spends asserted only the LP payment. A
+    # farmer could drop those three spends, point each reserve launcher and the fee settlement
+    # at itself, and reuse the creator's signed spends byte for byte: the creator paid for a
+    # pool whose reserves were never created. The creator's XCH spend now asserts an
+    # announcement of every binding router spend, so the bundle is whole or refused.
+    print("the creator's spends require the whole bundle (F1)")
+    H = lambda b: hashlib.sha256(b).digest()  # noqa: E731
+    xch_spend = next(cs for cs in p.creator_spends if cs.coin == xch.coin)
+    asserted = {bytes(c.rest().first().as_atom()) for c in run_spend(xch_spend) if c.first().as_int() in (61, 63)}
+    reg_spend = next(cs for cs in p.router_spends if cs.coin == reg.coin)
+    registered = [H(bytes(reg.coin.puzzle_hash) + bytes(c.rest().first().as_atom())) for c in run_spend(reg_spend) if c.first().as_int() == 62]
+    check("  the creator asserts the registry's forge-registered-v14 announcement", len(registered) == 1 and registered[0] in asserted)
+    check("  and the singleton launcher's", H(bytes(p.pool.launcher_id) + bytes(
+        Program.to([p.pool.coin.puzzle_hash, 1, [50_000, p.pool.extra["eve_coin_id"]]]).get_tree_hash())) in asserted)
+    check("  and every reserve launcher's", len(p.pool.reserves) == 2 and all(
+        H(bytes(Coin(r.grandparent, drv.reserve_launcher_full_hash(r.asset_id), uint64(int(r.coin.amount))).name())
+          + drv.reserve_launcher_message(r.inner_hash, int(r.coin.amount), p.pool.launcher_id)) in asserted
+        for r in p.pool.reserves))
+    check("  and the fee settlement's", H(bytes(create.OFFER_PH) + bytes(
+        Program.to([p.pool.launcher_id, [reg.treasury_ph, 1_000_000, [reg.treasury_ph]]]).get_tree_hash())) in asserted)
+
+    def farmer(drop_registry: bool, redirect: bool) -> list:
+        """What a farmer can do to the router's spends without touching the creator's."""
+        slot_parent = Coin(bytes32.fromhex(slots[drv.MIN_KEY.hex()]["parent"]["parent_coin_info"]),
+                           bytes32.fromhex(slots[drv.MIN_KEY.hex()]["parent"]["puzzle_hash"]), uint64(1)).name()
+        launcher_hashes = {drv.reserve_launcher_full_hash(a) for a in cfg.asset_ids}
+        out = []
+        for cs in p.router_spends:
+            if drop_registry and (cs.coin == reg.coin or cs.coin.parent_coin_info == slot_parent):
+                continue
+            sol = bytes(cs.solution)
+            if redirect and cs.coin.puzzle_hash in launcher_hashes:
+                for r in p.pool.reserves:
+                    sol = sol.replace(bytes(r.inner_hash), bytes(ROUTER_PH))
+            elif redirect and cs.coin.puzzle_hash == create.OFFER_PH and cs.coin.parent_coin_info == xch.coin.name():
+                sol = sol.replace(bytes(reg.treasury_ph), bytes(ROUTER_PH))
+            out.append(drv.make_spend(cs.coin, Program.from_bytes(bytes(cs.puzzle_reveal)), Program.from_bytes(sol)))
+        return out
+
+    for label, spends in (("dropping the registry spends and redirecting the reserves and the fee", farmer(True, True)),
+                          ("dropping only the registry spends", farmer(True, False)),
+                          ("redirecting the reserves with the registry spends kept", farmer(False, True))):
+        try:
+            drv.validate(drv.SpendBundle([*p.creator_spends, *spends], G2Element()))
+            check(f"  {label} is refused", False)
+        except drv.Rejected as exc:
+            check(f"  {label} is refused", True, str(exc)[:60])
 
     print("refusals")
     for label, fn in (

@@ -230,16 +230,32 @@ def _own_group(coin: Coin, extra_groups: list | None = None) -> Program:
     return Program.to([[coin.name()], *(extra_groups or [])])
 
 
+CREATE_COIN = 51
 ASSERT_PUZZLE_ANNOUNCEMENT = 63
+
+
+# A maker's puzzle reveal is untrusted input: it arrived in an offer string. It runs under the
+# cost cap forge_offer applies to the same reveals, so a reveal that never halts is cut off
+# instead of stalling the responder in here (F2, 2026-10-07 review).
+MAX_REVEAL_COST = 11_000_000_000
+
+
+def _reveal_conditions(spend, max_cost: int = MAX_REVEAL_COST) -> Program | None:
+    """What an untrusted spend's reveal produces, or None when it fails or exceeds `max_cost`."""
+    try:
+        _, conditions = Program.from_bytes(bytes(spend.puzzle_reveal)).run_with_cost(
+            max_cost, Program.from_bytes(bytes(spend.solution)))
+        return conditions
+    except Exception:  # noqa: BLE001 -- a spend that does not run asserts nothing
+        return None
 
 
 def _asserted_announcements(offer: Offer) -> set[bytes]:
     """Every puzzle announcement the maker's SIGNED spends assert."""
     asserted: set[bytes] = set()
     for spend in _trader_spends(offer):
-        try:
-            conditions = Program.from_bytes(bytes(spend.puzzle_reveal)).run(Program.from_bytes(bytes(spend.solution)))
-        except Exception:  # noqa: BLE001 -- a spend that does not run asserts nothing
+        conditions = _reveal_conditions(spend)
+        if conditions is None:
             continue
         for condition in conditions.as_iter():
             try:
@@ -251,22 +267,24 @@ def _asserted_announcements(offer: Offer) -> set[bytes]:
     return asserted
 
 
-def _trader_ph(offer: Offer, asset: bytes32 | None) -> bytes32 | None:
-    """Where the offer asks for `asset` to be paid -- the trader's own puzzle hash.
+def _asset_name(asset: bytes32 | None) -> str:
+    return "XCH" if asset is None else asset.hex()[:8]
 
-    Requested payment groups are unsigned offer metadata: anyone relaying the
-    offer can prepend a group of their own and become "the first requested
-    payment", which is where the surplus refund went (2026-09-26 external
-    review, finding 14). What a relayer cannot forge is the maker's signed
-    ASSERT_PUZZLE_ANNOUNCEMENT of its own group. So the refund goes to the
-    first group whose announcement the maker's spends assert; a prepended
-    group carries a nonce nothing asserts and never receives it. An offer
-    that asks for the asset but binds none of its groups is refused rather
-    than paid to a stranger.
+
+def bound_groups(offer: Offer, asset: bytes32 | None) -> list[Program]:
+    """The offer's requested groups of `asset`, every one of them asserted by the maker's
+    signed spends: the settlement solution nobody but the trader could have written.
+
+    Requested payment groups are unsigned offer metadata (2026-09-26 external review,
+    finding 14): anyone relaying the offer can add a group of their own. What a relayer
+    cannot forge is the maker's ASSERT_PUZZLE_ANNOUNCEMENT of a group. Since 2026-10-07
+    a pool pays only the groups the maker asserts, so an added group is refused here
+    rather than paid, and an offer that asks for the asset but binds none of its groups
+    is a gift, not an offer, and is refused too.
     """
     payments = offer.get_requested_payments().get(asset, [])
     if not payments:
-        return None
+        return []
     asserted = _asserted_announcements(offer)
     settlement_ph = settle_ph(asset)
     groups: dict[bytes32, list] = {}
@@ -274,46 +292,90 @@ def _trader_ph(offer: Offer, asset: bytes32 | None) -> bytes32 | None:
         groups.setdefault(payment.nonce, []).append(payment)
     for nonce, group in groups.items():
         message = Program.to((nonce, [p.as_condition_args() for p in group])).get_tree_hash()
-        announcement = hashlib.sha256(bytes(settlement_ph) + bytes(message)).digest()
-        if announcement in asserted:
-            return bytes32(group[0].puzzle_hash)
-    raise OfferRejected(
-        "no requested payment of this asset is bound by the maker's signed spends; "
-        "the surplus refund goes only to a payment group the maker asserts"
-    )
+        if hashlib.sha256(bytes(settlement_ph) + bytes(message)).digest() not in asserted:
+            raise OfferRejected(f"a requested payment group of {_asset_name(asset)} is not asserted by the maker's "
+                                "signed spends; a pool pays only what the trader signed for")
+    return list(requested_solution(offer, asset))
 
 
-def payout_solution(offer: Offer, asset: bytes32 | None, payout_coin: Coin, surplus_ph: bytes32,
-                    payout: int, requested: int, fee_cap: int | None = None) -> Program:
-    """The payout coin pays the trader exactly what the offer requested, then splits
-    whatever is left over.
+def exact_payout_solution(offer: Offer, asset: bytes32 | None, amount: int) -> Program:
+    """The settlement solution paying out `amount` of `asset`: the maker's bound groups, which
+    must add up to exactly `amount`.
 
-    The requested groups carry the offer's nonces, which is what the trader's spends
-    assert. Anything above the request used to go to `surplus_ph` in full, and that is
-    what made the router's fee "whatever the quote happened to under-ask for" rather
-    than a rate: raise the slippage tolerance and the router silently collected the
-    tolerance too. `fee_cap` is the most the router may take out of the overage -- the
-    caller sets it from the configured bps -- and every mojo above the cap goes back to
-    the trader instead of to the router. `None` keeps the old unbounded behaviour for
-    the callers that have not been converted.
+    A pool pays exactly what it releases, to exactly whom the trader signed for, and
+    nothing is left over. It used to pay the trader's notarised minimum and split the
+    overage into a router-fee group and a refund group that no signature covered -- so
+    whoever put the bundle in a block could point both at itself with every other spend
+    byte for byte the same (F3, 2026-10-07 review, confirmed on the simulator). An offer
+    that asks for less than the pool pays is not a bargain for anyone; it is a stale
+    quote, and the trader signs again at the current price.
     """
-    groups = list(requested_solution(offer, asset))
-    surplus = payout - requested
-    if surplus <= 0:
-        return Program.to(groups)
-    fee = surplus if fee_cap is None else min(fee_cap, surplus)
-    payments: list[list[object]] = []
-    if fee > 0:
-        payments.append([surplus_ph, fee, [surplus_ph]])
-    refund = surplus - fee
-    if refund > 0:
-        back = _trader_ph(offer, asset)
-        if back is None:
-            raise OfferRejected("offer requests no payment of the asset it is being paid in")
-        payments.append([back, refund, [back]])
-    if payments:
-        groups.append(Program.to((payout_coin.name(), payments)))
+    groups = bound_groups(offer, asset)
+    requested = sum(int(p.amount) for p in offer.get_requested_payments().get(asset, []))
+    if requested != amount:
+        raise OfferRejected(f"the pool pays {amount} of {_asset_name(asset)}, the offer asks {requested}: an offer asks "
+                            "for exactly what the pool pays at this state; quote again")
     return Program.to(groups)
+
+
+def maker_payment_to(offer: Offer, asset: bytes32 | None, puzzle_hash: bytes32) -> int:
+    """What the maker's own signed spends pay to `puzzle_hash` in `asset` (CAT-wrapped for a
+    CAT), read off the spends as they run."""
+    target = puzzle_hash if asset is None else \
+        construct_cat_puzzle(CAT_MOD, asset, Program.to(puzzle_hash)).get_tree_hash_precalc(puzzle_hash)
+    total = 0
+    for spend in _trader_spends(offer):
+        conditions = _reveal_conditions(spend)
+        if conditions is None:
+            continue
+        for condition in conditions.as_iter():
+            try:
+                items = list(condition.as_iter())
+                if len(items) >= 3 and items[0].as_int() == CREATE_COIN and bytes32(items[1].as_atom()) == target:
+                    total += items[2].as_int()
+            except Exception:  # noqa: BLE001 -- not a condition shape we read
+                continue
+    return total
+
+
+def requested_to(offer: Offer, asset: bytes32 | None, puzzle_hash: bytes32) -> int:
+    """What the offer's requested payments of `asset` pay to `puzzle_hash`."""
+    return sum(int(p.amount) for p in offer.get_requested_payments().get(asset, []) if bytes32(p.puzzle_hash) == puzzle_hash)
+
+
+def minimum_router_fee(settled: int, fee_bps: int) -> int:
+    """The smallest fee that covers the rate on an entry whose settlement holds `settled`:
+    what a quote tells the trader to pay beside the settlement coin (see router_fee_paid)."""
+    if fee_bps <= 0:
+        return 0
+    if fee_bps >= 10_000:
+        raise OfferRejected("the router's rate would consume the whole entry")
+    fee = settled * int(fee_bps) // (10_000 - int(fee_bps))
+    while fee < (settled + fee) * int(fee_bps) // 10_000:
+        fee += 1
+    while fee > 0 and fee - 1 >= (settled + fee - 1) * int(fee_bps) // 10_000:
+        fee -= 1
+    return fee
+
+
+def router_fee_paid(offer: Offer, asset: bytes32 | None, fee_ph: bytes32, settled: int, fee_bps: int) -> int:
+    """The router's rate on an entry, as the trader's own spend paid it.
+
+    The fee is no longer carved out of the settlement coin by the router: the trader's
+    signed spend creates the fee coin itself, beside the settlement coin that holds the
+    net (the lane the Dexie-only swap already used, PR 73). It is therefore inside the
+    trader's signature, where a farmer cannot redirect it, and it exists exactly when
+    the swap does. The rate is on what the trader put in -- the net that settles plus
+    the fee itself -- so an offer that pays less than that is refused.
+    """
+    if fee_bps <= 0:
+        return 0
+    paid = maker_payment_to(offer, asset, fee_ph)
+    required = (settled + paid) * int(fee_bps) // 10_000
+    if paid < required:
+        raise OfferRejected(f"the router's fee is {fee_bps} bps of the {settled + paid} {_asset_name(asset)} put in, "
+                            f"{required}; the offer's own spends pay {paid}: rebuild the offer with the fee payment")
+    return paid
 
 
 def _trader_spends(offer: Offer) -> list:
@@ -350,11 +412,10 @@ def router_fee_side(asset_in: bytes32 | None, asset_out: bytes32 | None) -> str:
       * receiving XCH -> 'output'
       * CAT for CAT  -> 'input'
 
-    CAT-for-CAT lands on the input because an input carve is an explicit payment out
-    of a coin the trader has already given up, while an output carve can only be
-    taken out of the gap between what the pool pays and what the trader asked for.
-    That gap belongs to the trader, and treating all of it as the fee is the bug the
-    cap in `payout_solution` closes.
+    CAT-for-CAT lands on the input: an input fee is an explicit payment by the trader's
+    own spend out of a coin they have already given up. On either side the fee is
+    inside the trader's signature -- a maker-side payment on the input, a requested
+    payment to the router on the output -- never a carve by the router (F3, 2026-10-07).
 
     Both sides of the wire derive this from the pool's assets rather than negotiating
     it, so a crafted request cannot move the fee to the cheaper leg: the front end's
@@ -377,31 +438,29 @@ def settle_swap(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: bytes3
         raise OfferRejected("a swap offer cannot request the asset it offers")
     i_in, i_out = pool.asset_ids.index(asset_in), pool.asset_ids.index(asset_out)
     settlement = offered[asset_in]
-    offered_amount = int(settlement.coin.amount)
-    # The router's fee comes off ONE leg, never both. On the input leg it is carved out
-    # of the settlement coin here, so the curve only ever sees the net; on the output
-    # leg it is capped out of the payout overage further down. `in_fee` and `fee_cap`
-    # are mutually exclusive by construction.
+    gross = int(settlement.coin.amount)
+    # The router's fee comes off ONE leg, never both, and the router never carves it: on
+    # the input leg the trader's own signed spend pays it beside the settlement coin, which
+    # holds the net the curve sees; on the output leg it is one of the payments in the
+    # trader's own requested group. Either way it exists only inside the trader's
+    # signature, where a farmer cannot redirect it (F3, 2026-10-07 review). `in_fee` and
+    # `out_fee` are mutually exclusive by construction.
     side = router_fee_side(asset_in, asset_out)
-    in_fee = offered_amount * int(fee_bps) // 10_000 if side == "input" else 0
-    if in_fee >= offered_amount:
-        raise OfferRejected("router fee would consume the whole offered amount")
-    gross = offered_amount - in_fee
+    in_fee = router_fee_paid(offer, asset_in, surplus_ph, gross, int(fee_bps)) if side == "input" else 0
     r, w = pool.state[0], pool.weights
     honest = forge_math.swap_output(r[i_in], r[i_out], gross, pool.fee_bps, w[i_in], w[i_out])
     pfee = honest * pool.protocol_fee_bps // 10_000 + honest * pool.dao_fee_bps // 10_000   # protocol + DAO slices
     payout = honest - pfee
+    out_fee = payout * int(fee_bps) // 10_000 if side == "output" else 0
+    if out_fee > 0 and requested_to(offer, asset_out, surplus_ph) < out_fee:
+        raise OfferRejected(f"the router's fee is {fee_bps} bps of the {payout} {_asset_name(asset_out)} paid out, {out_fee}; "
+                            f"the offer's requested payments pay the router {requested_to(offer, asset_out, surplus_ph)}: "
+                            "rebuild the offer with the fee payment")
     requested = wanted[asset_out]
-    if payout < requested:
-        raise OfferRejected(f"pool pays {payout}, trader asks {requested}: the offer cannot settle at this state")
 
     extra_spends, extra_cats = [], {}
-    # The leaf asserts the settlement coin's OWN group -- nonce = its coin id, no
-    # payments -- so a second group paying the router does not disturb it. The ring
-    # still balances: the reserve rises by `gross`, the router takes `in_fee`, and the
-    # two are the coin. Nothing in the puzzle changes.
-    fee_group = [Program.to((settlement.coin.name(), [[surplus_ph, in_fee, [surplus_ph]]]))] if in_fee > 0 else []
-    in_solution = _own_group(settlement.coin, fee_group)
+    # The leaf asserts the settlement coin's OWN group -- nonce = its coin id, no payments.
+    in_solution = _own_group(settlement.coin)
     if asset_in is None:
         extra_spends.append(make_spend(settlement.coin, OFFER_MOD, in_solution))
     else:
@@ -409,8 +468,7 @@ def settle_swap(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: bytes3
             settlement.coin, asset_in, OFFER_MOD, in_solution, lineage_proof=settlement.lineage_proof))
     reserve = pool.reserves[i_out]
     payout_coin = Coin(reserve.coin.name(), settle_ph(asset_out), uint64(payout))
-    fee_cap = payout * int(fee_bps) // 10_000 if side == "output" else 0
-    sol = payout_solution(offer, asset_out, payout_coin, surplus_ph, payout, requested, fee_cap)
+    sol = exact_payout_solution(offer, asset_out, payout)
     if asset_out is None:
         extra_spends.append(make_spend(payout_coin, OFFER_MOD, sol))
     else:
@@ -423,14 +481,14 @@ def settle_swap(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: bytes3
     return _finish(offer, pool, pool_bundle, new_state, {
         "asset_in": _hex(ZERO_32 if asset_in is None else asset_in), "asset_out": _hex(ZERO_32 if asset_out is None else asset_out),
         "gross": gross, "out": honest, "protocol_fee": pfee, "requested": requested,
-        "surplus": payout - requested, "h": int(height),
-        # What the ROUTER actually took, and from which leg. The old "surplus" key is
-        # the whole overage, which is no longer the same number: the part above the cap
-        # is refunded to the trader.
-        "router_fee": in_fee + min(fee_cap, max(payout - requested, 0)),
+        # Exact settlement: nothing above the request exists, so there is no surplus
+        # and no refund. Both keys are kept at zero for the readers of this record.
+        "surplus": 0, "h": int(height),
+        # What the ROUTER was paid, by the trader's own spend, and on which leg.
+        "router_fee": in_fee + out_fee,
         "router_fee_side": side, "router_fee_bps": int(fee_bps),
-        "refund": max(payout - requested - fee_cap, 0),
-        "offered": offered_amount,
+        "refund": 0,
+        "offered": gross + in_fee,
     })
 
 
@@ -475,22 +533,21 @@ def settle_add(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: bytes32
             raise OfferRejected(f"offered XCH {offered_xch} does not cover the LP backing {honest}")
     if honest <= 0:
         raise OfferRejected("the deposit mints no LP")
-    if honest < requested:
-        raise OfferRejected(f"pool mints {honest}, trader asks {requested}: the offer cannot settle at this state")
+    if honest != requested:
+        raise OfferRejected(f"the pool mints {honest} LP, the offer asks {requested}: a deposit asks for exactly what "
+                            "the pool mints at this state; quote again")
+    if excess > 0:
+        # XCH above the backing used to come back to the depositor through a group nothing
+        # signed (F3). A deposit now offers exactly the backing, and the quote says what it is.
+        raise OfferRejected(f"the offer's XCH exceeds the mint's backing by {excess}: a deposit offers exactly "
+                            "the backing; quote again")
     new_total = pool.state[1] + honest
 
     eve_ph = construct_cat_puzzle(CAT_MOD, pool.lp_asset_id, drv.LP_MINT_INNER).get_tree_hash()
-    # The XCH settlement creates the one-mojo eve (and returns any excess above
-    # the backing to the router) through a second group; its first group is the
-    # no-payment announcement the leaf asserts when XCH is a pool asset.
+    # The XCH settlement creates the one-mojo eve through a second group; its first group
+    # is the no-payment announcement the leaf asserts when XCH is a pool asset.
     eve_nonce = bytes32(hashlib.sha256(bytes(xch.coin.name()) + b"forge-lp-eve").digest())
-    eve_payments = [[eve_ph, 1]]
-    if excess > 0:
-        # XCH the depositor supplied above what the mint needed to back. Theirs, not the
-        # router's; the LP they asked for names the wallet to send it to.
-        back = _trader_ph(offer, pool.lp_asset_id) or surplus_ph
-        eve_payments.append([back, excess, [back]])
-    extra_spends = [make_spend(xch.coin, OFFER_MOD, _own_group(xch.coin, [(eve_nonce, eve_payments)]))]
+    extra_spends = [make_spend(xch.coin, OFFER_MOD, _own_group(xch.coin, [(eve_nonce, [[eve_ph, 1]])]))]
     extra_cats, parents, amounts = {}, [], []
     for asset in pool.asset_ids:
         s = offered.get(asset)
@@ -508,11 +565,9 @@ def settle_add(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: bytes32
     action = [honest, new_total, probe_state.get_tree_hash(), pool.inner_hash, ZERO_32]
     eve_spends = drv.lp_eve_ring(pool, eve, OFFER_PH, honest, action)
     lp_settlement = Coin(eve.name(), settle_ph(pool.lp_asset_id), uint64(honest))
-    # A deposit is not a trade, so the router has no claim on it. Any LP minted above
-    # what the offer asked for is the depositor's own rounding margin and is paid back
-    # to them: `fee_cap=0` sends the whole overage to the trader. It used to go to the
-    # router, which quietly took a slice of every deposit that asked for a round number.
-    sol = payout_solution(offer, pool.lp_asset_id, lp_settlement, surplus_ph, honest, requested, 0)
+    # A deposit is not a trade, so the router has no claim on it: the LP goes to the
+    # depositor, all of it, in the groups they signed for.
+    sol = exact_payout_solution(offer, pool.lp_asset_id, honest)
     lp_settle_spends = unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
         lp_settlement, pool.lp_asset_id, OFFER_MOD, sol,
         lineage_proof=LineageProof(eve.parent_coin_info, drv.LP_MINT_INNER.get_tree_hash(), eve.amount))]).coin_spends
@@ -520,8 +575,8 @@ def settle_add(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: bytes32
         pool, "forge_action_add", solution,
         extra_spends=[*extra_spends, *eve_spends, *lp_settle_spends], extra_cats=extra_cats)
     return _finish(offer, pool, pool_bundle, new_state, {
-        "deposits": deposits, "lp_minted": honest, "requested": requested, "surplus": honest - requested,
-        "backing": honest, "excess_xch": excess, "h": int(height),
+        "deposits": deposits, "lp_minted": honest, "requested": requested, "surplus": 0,
+        "backing": honest, "excess_xch": 0, "h": int(height),
     })
 
 
@@ -540,9 +595,9 @@ def settle_remove(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: byte
     vf = forge_math.vault_fee_bps(len(pool.state[0]), MATH_VERSION, pool.fee_bps)
     payouts = forge_math.withdrawal_amounts(pool.state[0], burn, pool.state[1], vf)
     for asset, pay in zip(pool.asset_ids, payouts):
-        if pay < wanted.get(asset, 0):
-            raise OfferRejected(f"pool pays {pay} of {'XCH' if asset is None else asset.hex()[:8]}, "
-                                f"trader asks {wanted.get(asset, 0)}: the offer cannot settle at this state")
+        if pay != wanted.get(asset, 0):
+            raise OfferRejected(f"the pool pays {pay} of {_asset_name(asset)}, the offer asks {wanted.get(asset, 0)}: "
+                                "a withdrawal asks for exactly what the pool pays at this state; quote again")
     if burn <= 0 or burn > pool.state[1]:
         raise OfferRejected("burn must be positive and at most the LP supply")
     new_total = pool.state[1] - burn
@@ -567,9 +622,9 @@ def settle_remove(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: byte
         if pay <= 0:
             continue
         payout_coin = Coin(reserve.coin.name(), settle_ph(asset), uint64(pay))
-        # As with a deposit: a withdrawal is not a trade, so anything above the request
-        # goes back to the withdrawer rather than to the router.
-        sol = payout_solution(offer, asset, payout_coin, surplus_ph, pay, wanted.get(asset, 0), 0)
+        # As with a deposit: a withdrawal is not a trade, and every mojo the pool releases
+        # goes to the withdrawer in the groups they signed for.
+        sol = exact_payout_solution(offer, asset, pay)
         if asset is None:
             extra_spends.append(make_spend(payout_coin, OFFER_MOD, sol))
         else:
@@ -579,7 +634,7 @@ def settle_remove(pool: drv.V14Pool, offer: Offer, height: int, surplus_ph: byte
     pool_bundle, new_state = drv.spend_action(pool, "forge_action_remove", solution, extra_spends=extra_spends, extra_cats=extra_cats)
     return _finish(offer, pool, pool_bundle, new_state, {
         "burn": burn, "payouts": [int(p) for p in payouts], "requested": [int(wanted.get(a, 0)) for a in pool.asset_ids],
-        "surplus": [int(p) - int(wanted.get(a, 0)) for a, p in zip(pool.asset_ids, payouts)], "h": int(height),
+        "surplus": [0 for _ in pool.asset_ids], "h": int(height),
     })
 
 

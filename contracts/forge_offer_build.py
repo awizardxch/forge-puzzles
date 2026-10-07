@@ -38,10 +38,13 @@ from chia.types.blockchain_format.program import Program
 from chia.types.coin_spend import make_spend
 from chia.wallet.cat_wallet.cat_utils import (
     CAT_MOD,
+    CAT_MOD_HASH,
     SpendableCAT,
     construct_cat_puzzle,
+    match_cat_puzzle,
     unsigned_spend_bundle_for_spendable_cats,
 )
+from chia.wallet.uncurried_puzzle import uncurry_puzzle
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import (
     puzzle_for_conditions,
@@ -54,6 +57,8 @@ from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_rs import Coin, G2Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
+
+from untrusted_clvm import parse_untrusted_hex
 
 ZERO_32 = bytes32([0] * 32)
 CREATE_COIN = 51
@@ -134,42 +139,117 @@ def _announcements(requested: list[dict[str, Any]], puzzle_hash: bytes32, coins:
     return [ann.to_program() for ann in Offer.calculate_announcements(notarized, _drivers(requested))]
 
 
-def _xch_spends(coins: list[dict[str, Any]], offered: int, change_ph: bytes32, fee: int, asserts: list[Program]) -> list:
+MAX_PAYMENTS = 4
+
+
+def _payments(leg: dict[str, Any]) -> list[tuple[bytes32, int]]:
+    """Extra coins a leg's own spend creates, in that leg's asset.
+
+    The router's fee on a Dexie-only swap (owner, 2026-10-05: "the dexie only route
+    should charge our protocol fee"). Dexie fills the offer with its own liquidity,
+    so nothing of ours settles it; the fee coin is instead created by the trader's
+    spend itself, the spend that also funds the settlement coin and asserts the
+    settlement's announcement. It therefore exists exactly when the swap does: the
+    offer taken, the fee paid; the offer never taken, nothing paid. It is not part
+    of the offered amount, so the offer still reads as what it trades.
+    """
+    entries = list(leg.get("payments") or [])
+    if len(entries) > MAX_PAYMENTS:
+        raise ValueError(f"at most {MAX_PAYMENTS} payments per leg")
+    payments = []
+    for entry in entries:
+        amount = int(entry["amount"])
+        if amount <= 0:
+            raise ValueError("a payment amount must be positive")
+        payments.append((_b32(entry["puzzle_hash"]), amount))
+    return payments
+
+
+def _payment_conditions(payments: list[tuple[bytes32, int]]) -> list[Program]:
+    """CREATE_COIN for each payment, hinted to its own puzzle hash so the
+    recipient's wallet finds it (an unhinted CAT coin is invisible to wallets)."""
+    return [Program.to([CREATE_COIN, puzzle_hash, amount, [puzzle_hash]]) for puzzle_hash, amount in payments]
+
+
+def _xch_spends(coins: list[dict[str, Any]], offered: int, change_ph: bytes32, fee: int, asserts: list[Program],
+                payments: list[tuple[bytes32, int]] | None = None) -> list:
     """Spend the trader's XCH into a settlement coin, with change back to them.
 
     The first coin carries the whole delegated puzzle: it creates the settlement
-    coin and the change. Every other coin is spent to nothing, which is how its
-    value reaches the same transaction. The fee is simply value not recreated.
+    coin, any payments, and the change. Every other coin is spent to nothing, which
+    is how its value reaches the same transaction. The fee is simply value not
+    recreated.
     """
+    payments = payments or []
+    paid = sum(amount for _, amount in payments)
     total = sum(int(record["coin"]["amount"]) for record in coins)
-    change = total - offered - fee
+    change = total - offered - paid - fee
     if change < 0:
-        raise ValueError(f"coins hold {total} mojos, which does not cover {offered} plus a fee of {fee}")
+        raise ValueError(f"coins hold {total} mojos, which does not cover {offered} plus payments of {paid} plus a fee of {fee}")
 
-    outputs: list[tuple[bytes32, int]] = [(bytes32(OFFER_MOD_HASH), offered)]
+    # offered == 0 is a fee-only spend (fee_coins): nothing goes to the settlement.
+    outputs: list[tuple[bytes32, int]] = [(bytes32(OFFER_MOD_HASH), offered)] if offered > 0 else []
     if change > 0:
         outputs.append((change_ph, change))
 
+    # The fee is ALSO stated, as RESERVE_FEE (52), the way a wallet's own offers state
+    # theirs. Left implicit, the value was paid but invisible: Sage's approval sums
+    # only RESERVE_FEE conditions (sage-wallet transaction.rs), so the Sage app showed
+    # "FEE 0" on every swap whatever fee was chosen (2026-10-03). Stated, the wallet
+    # shows it and the chain requires the whole bundle to leave at least that much.
+    conditions = _payment_conditions(payments) + list(asserts) + ([Program.to([52, fee])] if fee > 0 else [])
+
     spends = []
     for index, record in enumerate(coins):
-        puzzle = Program.fromhex(str(record["puzzle"]))
+        puzzle = parse_untrusted_hex(record["puzzle"])
         coin = _coin(record)
         _assert_reveal_matches(coin, puzzle.get_tree_hash(), "XCH coin")
-        solution = _p2_solution(outputs, asserts) if index == 0 else _p2_solution([])
+        solution = _p2_solution(outputs, conditions) if index == 0 else _p2_solution([])
         spends.append(make_spend(coin, puzzle, solution))
     return spends
 
 
-def _cat_spends(asset: bytes32, coins: list[dict[str, Any]], offered: int, change_ph: bytes32, asserts: list[Program]) -> list:
-    """The CAT ring for one asset: settlement out, change back, value conserved."""
+def _cat_inner(asset: bytes32, coin: Coin, supplied: Program) -> Program:
+    """The inner puzzle of a CAT coin, from either reveal a wallet may send.
+
+    Sage's getAssetCoins returns a CAT coin's FULL puzzle (the CAT layer already
+    around the p2 puzzle: `cat.info.construct_puzzle(ctx, p2_puzzle)` in its
+    wallet_connect endpoint), while the CHIP-0002 relay path and
+    contracts/wallet_coins.py send the inner one. Wrapping the full puzzle again
+    made every CAT-paid swap from the Sage app fail the reveal check below
+    (2026-10-01: "CAT 7f4c27d7 coin ... has puzzle hash 9cdfcd9bed but its reveal
+    hashes to 1c3c4bfc62").
+
+    The full puzzle is accepted only when it IS this coin's puzzle -- its hash
+    is the coin's puzzle hash -- and it is the CAT layer over this asset; the
+    inner puzzle is then read out of it, and the usual check still runs on the
+    re-wrapped result. Anything else is returned unchanged for that check to
+    judge, so this widens nothing the review's finding 15 closed.
+    """
+    if supplied.get_tree_hash() != coin.puzzle_hash:
+        return supplied
+    matched = match_cat_puzzle(uncurry_puzzle(supplied))
+    if matched is None:
+        return supplied
+    mod_hash, tail_hash, inner = matched
+    if bytes(mod_hash.as_atom()) != bytes(CAT_MOD_HASH) or bytes(tail_hash.as_atom()) != bytes(asset):
+        return supplied
+    return inner
+
+
+def _cat_spends(asset: bytes32, coins: list[dict[str, Any]], offered: int, change_ph: bytes32, asserts: list[Program],
+                payments: list[tuple[bytes32, int]] | None = None) -> list:
+    """The CAT ring for one asset: settlement out, payments, change back, value conserved."""
+    payments = payments or []
+    paid = sum(amount for _, amount in payments)
     total = sum(int(record["coin"]["amount"]) for record in coins)
-    change = total - offered
+    change = total - offered - paid
     if change < 0:
-        raise ValueError(f"CAT {asset.hex()[:8]} holds {total}, which does not cover {offered}")
+        raise ValueError(f"CAT {asset.hex()[:8]} holds {total}, which does not cover {offered} plus payments of {paid}")
 
     spendables = []
     for index, record in enumerate(coins):
-        inner = Program.fromhex(str(record["inner_puzzle"]))
+        inner = _cat_inner(asset, _coin(record), parse_untrusted_hex(record["inner_puzzle"]))
         # The CAT puzzle over this asset and inner must hash to the coin's own
         # puzzle hash, or the coin is not this CAT and nothing below can run.
         _assert_reveal_matches(_coin(record), construct_cat_puzzle(CAT_MOD, asset, inner).get_tree_hash(), f"CAT {asset.hex()[:8]} coin")
@@ -177,7 +257,7 @@ def _cat_spends(asset: bytes32, coins: list[dict[str, Any]], offered: int, chang
             outputs: list[tuple[bytes32, int]] = [(bytes32(OFFER_MOD_HASH), offered)]
             if change > 0:
                 outputs.append((change_ph, change))
-            inner_solution = _p2_solution(outputs, asserts)
+            inner_solution = _p2_solution(outputs, _payment_conditions(payments) + list(asserts))
         else:
             inner_solution = _p2_solution([])
 
@@ -211,7 +291,11 @@ def _requested_payments(requested: list[dict[str, Any]], puzzle_hash: bytes32, c
         amount = int(entry["amount"])
         if amount <= 0:
             raise ValueError("a requested amount must be positive")
-        payments.setdefault(asset, []).append(CreateCoin(puzzle_hash, uint64(amount), [puzzle_hash]))
+        # Paid to the trader unless the entry names another recipient: the router's fee on
+        # a swap that pays out XCH is a requested payment to the router in the trader's own
+        # group, so it is covered by the trader's signature like the rest (F3, 2026-10-07).
+        recipient = _b32(entry["puzzle_hash"]) if entry.get("puzzle_hash") else puzzle_hash
+        payments.setdefault(asset, []).append(CreateCoin(recipient, uint64(amount), [recipient]))
     return Offer.notarize_payments(payments, coins)
 
 
@@ -228,11 +312,25 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     """Unsigned maker spends for everything the trader is giving up."""
     change_ph = _b32(payload["change_puzzle_hash"])
     fee = int(payload.get("fee", 0))
+    if fee < 0:
+        raise ValueError("a fee cannot be negative")
     spends = []
 
-    # Every coin the offer spends, in leg order: the nonce over these is what
-    # the requested payments are notarized against, in build and in finalize.
+    # The network fee rides on the XCH the offer gives up. An offer that gives up
+    # none -- a CAT-paid swap -- pays it from `fee_coins`, XCH coins spent only for
+    # that. It used to be dropped silently: the Sage app showed a 0.010693 TXCH fee
+    # on a T6-paid 7-pool split (2026-10-02), the bundle went out with fee 0, and
+    # it waited minutes for a block with room to spare.
+    pays_xch = any(_asset_id(leg.get("asset_id")) is None for leg in payload["offered"])
+    fee_coins = list(payload.get("fee_coins") or []) if fee > 0 and not pays_xch else []
+    if fee > 0 and not pays_xch and not fee_coins:
+        raise ValueError("a network fee is set but the offer gives up no XCH to pay it: send fee_coins")
+
+    # Every coin the offer spends, in leg order then the fee coins: the nonce over
+    # these is what the requested payments are notarized against, in build and in
+    # finalize (which takes every spend's coin, fee coins included).
     all_coins = [_coin(record) for leg in payload["offered"] for record in leg["coins"]]
+    all_coins += [_coin(record) for record in fee_coins]
     asserts = _announcements(payload["requested"], change_ph, all_coins)
 
     for leg in payload["offered"]:
@@ -243,11 +341,16 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         coins = leg["coins"]
         if not coins:
             raise ValueError("an offered leg needs at least one coin")
+        payments = _payments(leg)
         spends.extend(
-            _xch_spends(coins, amount, change_ph, fee, asserts)
+            _xch_spends(coins, amount, change_ph, fee, asserts, payments)
             if asset is None
-            else _cat_spends(asset, coins, amount, change_ph, asserts)
+            else _cat_spends(asset, coins, amount, change_ph, asserts, payments)
         )
+    if fee_coins:
+        # Change back to the trader, the fee left unrecreated, and the same
+        # assertions: the fee coin cannot be spent apart from the offer it pays for.
+        spends.extend(_xch_spends(fee_coins, 0, change_ph, fee, asserts))
 
     return {
         "success": True,
@@ -275,8 +378,8 @@ def finalize(payload: dict[str, Any]) -> dict[str, Any]:
                 _b32(entry["coin"]["puzzle_hash"]),
                 uint64(int(entry["coin"]["amount"])),
             ),
-            Program.fromhex(str(entry["puzzle_reveal"])),
-            Program.fromhex(str(entry["solution"])),
+            parse_untrusted_hex(entry["puzzle_reveal"]),
+            parse_untrusted_hex(entry["solution"]),
         )
         for entry in payload["coin_spends"]
     ]

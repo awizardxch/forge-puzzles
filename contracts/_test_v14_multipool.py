@@ -67,6 +67,15 @@ def snap(pool):
     return v14.pool_to_snapshot(pool)
 
 
+def exact(payload, offered, out_asset, salt):
+    """The payload with an offer asking for exactly what the route releases (F3, 2026-10-07),
+    from the composer's own preview."""
+    probe = fabricate_offer(offered, {out_asset: 1}, salt=salt)
+    preview = forge_stdin.build(json.loads(json.dumps({**payload, "offer": probe.to_bech32(), "preview": True})))
+    want = int(preview["forge"]["releases"][hx(out_asset)])
+    return {**payload, "offer": fabricate_offer(offered, {out_asset: want}, salt=salt).to_bech32()}
+
+
 def lane(label, payload, pools):
     """Build through the stdin lane (consensus-validated) and pin every pool's value per LP."""
     try:
@@ -97,39 +106,38 @@ def main() -> int:
 
     print("the composer's lanes, every pool never poorer:")
     g = 200_000_000
-    lane("multihop XCH -> A -> B", {"action": "multihop-swap", "offer": fabricate_offer({None: g}, {T_B: 1}, salt=0x71).to_bech32(),
-                                    "pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H, "dev_fee": fee}, [xa, ab])
-    lane("split XCH -> B two ways", {"action": "split-swap", "offer": fabricate_offer({None: g}, {T_B: 1}, salt=0x72).to_bech32(), "current_height": H, "dev_fee": fee,
-                                     "branches": [{"pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)], "amountIn": 1},
-                                                  {"pools": [snap(xb)], "path": [hx(None), hx(T_B)], "amountIn": 1}]}, [xa, ab, xb])
+    lane("multihop XCH -> A -> B", exact({"action": "multihop-swap", "pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)],
+                                          "current_height": H, "dev_fee": fee}, {None: g}, T_B, 0x71), [xa, ab])
+    lane("split XCH -> B two ways", exact({"action": "split-swap", "current_height": H, "dev_fee": fee,
+                                           "branches": [{"pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)], "amountIn": 1},
+                                                        {"pools": [snap(xb)], "path": [hx(None), hx(T_B)], "amountIn": 1}]}, {None: g}, T_B, 0x72), [xa, ab, xb])
     # the triangle: XCH -> A -> B -> XCH collects the disagreement between xb and xa*ab
     fa = v14r.simulate_chain([xa], [hx(None), hx(T_A)], g)[0]
     fb = v14r.simulate_chain([ab], [hx(T_A), hx(T_B)], fa)[0]
-    out = lane("flow triangle XCH -> A -> B -> XCH", {"action": "flow-balance", "offer": fabricate_offer({None: g}, {None: 1}, salt=0x73).to_bech32(),
-                                                      "current_height": H, "dev_fee": fee, "startAsset": hx(None),
-                                                      "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": g},
-                                                               {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": fa},
-                                                               {"pool": xb and snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": fb}]}, [xa, ab, xb])
+    out = lane("flow triangle XCH -> A -> B -> XCH", exact({"action": "flow-balance", "current_height": H, "dev_fee": fee, "startAsset": hx(None),
+                                                            "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": g},
+                                                                     {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": fa},
+                                                                     {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": fb}]},
+                                                           {None: g}, None, 0x73), [xa, ab, xb])
     if out:
         back = int(out["total_out"])
         print(f"          the triangle returned {back} for {g}: {'a gain, the disagreement collected' if back > g else 'a loss to fees'} -- and every pool kept its value per LP")
     offered = 300_000_000
-    lane("wrap XCH -> A -> vault LP -> XCH", {"action": "multihop-swap", "offer": fabricate_offer({None: offered}, {None: 1}, salt=0x74).to_bech32(),
-                                              "pools": [snap(xa), snap(vault), snap(xlp)], "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)],
-                                              "current_height": H, "dev_fee": fee}, [xa, vault, xlp])
-    lane("revisit XCH -> A -> LP -> XCH -> A", {"action": "multihop-swap", "offer": fabricate_offer({None: 400_000_000}, {T_A: 1}, salt=0x75).to_bech32(),
-                                                "pools": [snap(xa), snap(vault), snap(xlp), snap(xa2)],
-                                                "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None), hx(T_A)], "current_height": H, "dev_fee": fee},
-         [xa, vault, xlp, xa2])
+    lane("wrap XCH -> A -> vault LP -> XCH", exact({"action": "multihop-swap", "pools": [snap(xa), snap(vault), snap(xlp)],
+                                                    "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee},
+                                                   {None: offered}, None, 0x74), [xa, vault, xlp])
+    lane("revisit XCH -> A -> LP -> XCH -> A", exact({"action": "multihop-swap", "pools": [snap(xa), snap(vault), snap(xlp), snap(xa2)],
+                                                      "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None), hx(T_A)], "current_height": H, "dev_fee": fee},
+                                                     {None: 400_000_000}, T_A, 0x75), [xa, vault, xlp, xa2])
     dep_x, dep_a, sell_a = 2_000_000_000, 80_000, 30_000
     b_bought = v14r.simulate_chain([ab], [hx(T_A), hx(T_B)], sell_a)[0]
     mint = forge_math.invariant_lp_mint(triple.state[0], [dep_x, dep_a - sell_a, b_bought], triple.state[1], triple.fee_bps, triple.weights, version=10)
-    lane("routed deposit with a sale through another pool", {"action": "routed-deposit", "offer": fabricate_offer({None: dep_x + mint, T_A: dep_a}, {triple.lp_asset_id: 1}, salt=0x76).to_bech32(),
-                                                             "current_height": H, "pool": snap(triple), "dev_fee": fee,
-                                                             "sales": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": sell_a}]}, [triple, ab])
-    lane("zap through the target", {"action": "routed-deposit", "offer": fabricate_offer({None: 3_000_000_000}, {xa.lp_asset_id: 1}, salt=0x77).to_bech32(),
-                                    "current_height": H, "pool": snap(xa), "dev_fee": fee,
-                                    "sales": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": 1_000_000_000}]}, [xa])
+    lane("routed deposit with a sale through another pool", exact({"action": "routed-deposit", "current_height": H, "pool": snap(triple), "dev_fee": fee,
+                                                                   "sales": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": sell_a}]},
+                                                                  {None: dep_x + mint, T_A: dep_a}, triple.lp_asset_id, 0x76), [triple, ab])
+    lane("zap through the target", exact({"action": "routed-deposit", "current_height": H, "pool": snap(xa), "dev_fee": fee,
+                                          "sales": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": 1_000_000_000}]},
+                                         {None: 3_000_000_000}, xa.lp_asset_id, 0x77), [xa])
 
     print("random cross-pool sequences on the mirrors:")
     rng = random.Random(0xA11CE)

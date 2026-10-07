@@ -20,6 +20,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent))
 
 from chia.wallet.trading.offer import Offer
+from untrusted_clvm import offer_from_bech32
 
 from chia.util.bech32m import decode_puzzle_hash
 from chia_rs.sized_bytes import bytes32
@@ -72,7 +73,7 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
 
     result = build_transition(
         pool,
-        Offer.from_bech32(str(payload["offer"])),
+        offer_from_bech32(payload["offer"]),
         MODES[action],
         dev_fee_puzzle_hash=dev_fee_puzzle_hash,
         dev_fee_bps=dev_fee_bps,

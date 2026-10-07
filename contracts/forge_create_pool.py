@@ -25,6 +25,7 @@ from chia.types.condition_opcodes import ConditionOpcode
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, LineageProof, SpendableCAT, construct_cat_puzzle, get_innerpuzzle_from_puzzle, unsigned_spend_bundle_for_spendable_cats
 from chia.wallet.puzzles.singleton_top_layer_v1_1 import SINGLETON_LAUNCHER, SINGLETON_LAUNCHER_HASH, SINGLETON_TOP_LAYER_V1_1_HASH, puzzle_for_singleton
 from chia.wallet.trading.offer import OFFER_MOD, OFFER_MOD_HASH, Offer
+from untrusted_clvm import offer_from_bech32
 from chia_rs import Coin as RsCoin, G2Element, SpendBundle
 
 from forge_offer import find_offer_settlements
@@ -295,7 +296,7 @@ def deploy(payload: dict) -> dict:
     if not 0 <= fee_bps <= fee_ceiling:
         raise ValueError(
             f"V{version} liquidity fee must be between 0 and {fee_ceiling} bps, got {fee_bps}")
-    offer = Offer.from_bech32(payload["offer"])
+    offer = offer_from_bech32(payload["offer"])
     parsed = find_offer_settlements(offer, asset_ids)
     found = {asset_id: (settlement.coin, settlement.creator) for asset_id, settlement in parsed.items()}
     if ZERO32 in asset_ids and None in found:

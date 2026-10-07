@@ -35,19 +35,26 @@ from chia_rs.sized_ints import uint64  # noqa: E402
 import forge_v14_driver as drv  # noqa: E402
 import forge_v14_offer as v14  # noqa: E402
 
-RECORD = ROOT / ".awizard" / "v14-testnet.json"
+import forge_network  # noqa: E402
+
+# The record of the network this runs against (FORGE_NETWORK): v14-testnet.json or v14-mainnet.json.
+RECORD = forge_network.record_path("v14")
 ZERO_HEX = "00" * 32
 # Forge is word-minimal: the emoji IS the market. The forge glyph (hammer and
 # pick) marks an LP. A one-asset pool is just a pool: no glyph or word of its own,
 # and its deployer may rename it to anything, a new token name included.
 # src/lib/tokenRegistry.json is the single source for a token's glyph, ticker and
 # name (the frontend and the Sage label sync read the same file).
-_REGISTRY = json.loads((ROOT / "src" / "lib" / "tokenRegistry.json").read_text(encoding="utf-8"))["tokens"]
+# One registry per network (src/lib/tokenRegistry.json is testnet11's).
+_REGISTRY_FILE = "tokenRegistry.mainnet.json" if forge_network.network_id() == "mainnet" else "tokenRegistry.json"
+_REGISTRY = json.loads((ROOT / "src" / "lib" / _REGISTRY_FILE).read_text(encoding="utf-8"))["tokens"]
 EMOJI = {t["assetId"].lower(): t["emoji"] for t in _REGISTRY if t.get("emoji") and t["assetId"] != "txch"}
 TICKERS = {t["assetId"].lower(): t["symbol"] for t in _REGISTRY if t.get("emoji") and t["assetId"] != "txch"}
 # The base asset is named, never a glyph: a reader has to know what the pool is priced in.
-EMOJI[ZERO_HEX] = "TXCH"
-TICKERS[ZERO_HEX] = "TXCH"
+# TXCH on testnet, XCH on mainnet: a default name is written to chain as a launcher memo,
+# so a mainnet pool named "TXCH ..." would carry the wrong ticker forever.
+EMOJI[ZERO_HEX] = forge_network.native_ticker()
+TICKERS[ZERO_HEX] = forge_network.native_ticker()
 FORGE = "\u2692\uFE0F"      # hammer and pick: an LP of a Forge pool
 SYMBOLS = dict(TICKERS)
 
@@ -108,7 +115,7 @@ def asset_symbol(asset_hex: str, state: dict) -> str:
     """'seedling TXCH' style, as the V10 index labelled assets; an LP is the forge glyph
     plus its pool's emoji name, then 'LP'."""
     if asset_hex == ZERO_HEX:
-        return "TXCH"
+        return forge_network.native_ticker()
     if asset_hex in EMOJI:
         return f"{EMOJI[asset_hex]} {TICKERS[asset_hex]}"
     for other in state.get("pools", []):
@@ -159,8 +166,26 @@ def chain_names(state: dict) -> dict[str, dict]:
     return out
 
 
+def pool_registry_id(state: dict, record: dict) -> str:
+    """The registry that admitted this pool.
+
+    A network can roll its registry over to change the dev (protocol) fee address for
+    FUTURE pairs (owner, 2026-10-05): the old registry is kept under `retired_registries`
+    and its pools keep their recipient forever, curried in. A pool record names its
+    registry since then; an older record is found in the slot list of the registry that
+    holds it, and only failing that is it the active one's.
+    """
+    named = record.get("registry_launcher_id")
+    if named:
+        return str(named)
+    registries = [state["registry"], *state.get("retired_registries", [])]
+    for registry in registries:
+        if any(slot.get("launcher_id") == record["launcher_id"] for slot in (registry.get("slots") or {}).values()):
+            return registry["launcher_id"]
+    return state["registry"]["launcher_id"]
+
+
 def entries(state: dict, resolve: bool = False) -> tuple[dict, list]:
-    registry_id = state["registry"]["launcher_id"]
     on_chain = chain_names(state) if resolve else {}
     now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     plans, skipped = {}, []
@@ -223,7 +248,7 @@ def entries(state: dict, resolve: bool = False) -> tuple[dict, list]:
                     "nameSource": chain.get("source") or "record",
                     "deployerPuzzleHash": chain.get("deployer_ph"),
                     "launchLane": "forge-v11-registry",
-                    "registryLauncherId": registry_id,
+                    "registryLauncherId": pool_registry_id(state, record),
                     "registryKey": record.get("key"),
                     "launcherCoinId": launcher,
                     "launcherParentCoinInfo": pool.launcher_parent.hex(),

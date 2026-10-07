@@ -537,11 +537,25 @@ def cmd_read(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> di
     return read_profile(node, network, str(payload.get("pubkey") or ""))
 
 
+def sized(payload: dict[str, Any], build: Callable[[int], dict[str, Any]]) -> dict[str, Any]:
+    """`fee` as given, or with `fee_rate` (mojos per cost) a fee sized from the
+    wallet spend itself: built at one mojo, measured, rebuilt at the fee that
+    clears the rate. A profile or manifest publish is one small wallet spend --
+    it used to pay the fee sized for a pool swap (0.0015275 XCH at Standard)."""
+    import vault_tool as vault  # vault_tool imports this module; import late
+
+    rate = vault.parse_fee_rate(payload)
+    if rate is None:
+        return build(parse_amount(payload.get("fee", 0), "fee"))
+    measure = lambda built: vault.bundle_cost([vault.spend_from_json(s) for s in built["coin_spends"]])  # noqa: E731
+    built, _fee, cost = vault.settle_fee(build, measure, rate)
+    return {**built, "cost": cost, "fee_rate": rate}
+
+
 def cmd_build(payload: dict[str, Any], _node_factory: Callable[[str], Node]) -> dict[str, Any]:
     network = str(payload.get("network") or "testnet11")
-    fee = parse_amount(payload.get("fee", 0), "fee")
     nonce_raw = strip0x(payload.get("nonce"))
-    return build_publish(
+    return sized(payload, lambda fee: build_publish(
         str(payload.get("pubkey") or ""),
         network,
         payload.get("coins"),
@@ -549,7 +563,7 @@ def cmd_build(payload: dict[str, Any], _node_factory: Callable[[str], Node]) -> 
         fee,
         bytes.fromhex(nonce_raw) if nonce_raw else None,
         payload.get("manifests") if payload.get("manifests") is not None else payload.get("manifest"),
-    )
+    ))
 
 
 MAX_KEY_LOOKUP_SPENDS = 20
@@ -588,15 +602,25 @@ def key_for_address(
     records.sort(key=lambda r: int(r.get("spent_block_index") or 0), reverse=True)
     base = {"success": True, "network": network, "puzzle_hash": puzzle_hash.hex(), "address": encode_puzzle_hash(puzzle_hash, config["hrp"])}
     inspected = 0
+    unread = 0
     for record in records[:MAX_KEY_LOOKUP_SPENDS]:
         coin = record_coin(record)
         height = int(record.get("spent_block_index") or 0)
         if height <= 0:
             continue
         inspected += 1
-        try:
-            spend = node.rpc("get_puzzle_and_solution", {"coin_id": coin.name().hex(), "height": height})
-        except MultisigError:
+        spend = None
+        # A refused read is the node's answer, not the coin's: an address with
+        # 1,848 spends read as "never spent" on mainnet (2026-10-05) when its
+        # reads failed. Ask twice, and count what could not be read.
+        for _attempt in range(2):
+            try:
+                spend = node.rpc("get_puzzle_and_solution", {"coin_id": coin.name().hex(), "height": height})
+                break
+            except MultisigError:
+                spend = None
+        if spend is None:
+            unread += 1
             continue
         payload = spend.get("coin_solution") or spend.get("coin_spend")
         if not isinstance(payload, dict) or not payload.get("puzzle_reveal"):
@@ -612,7 +636,10 @@ def key_for_address(
         if puzzle_hash_for_synthetic_public_key(key) != puzzle_hash:
             continue
         return {**base, "found": True, "public_key": pubkey_hex(key), "source": "chain", "spent_height": height, "coin_id": coin.name().hex()}
-    return {**base, "found": False, "inspected": inspected, "spent_coins": len(records)}
+    # `spent_coins` says whether the address has spent at all; `unread` how many of
+    # the spends looked at could not be read. Callers tell "never spent" from
+    # "the node did not answer" by these two, never by `found` alone.
+    return {**base, "found": False, "inspected": inspected, "spent_coins": len(records), "unread": unread}
 
 
 def cmd_key_for_address(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> dict[str, Any]:
@@ -642,9 +669,8 @@ def cmd_manifest_read(payload: dict[str, Any], node_factory: Callable[[str], Nod
 
 def cmd_manifest_build(payload: dict[str, Any], _node_factory: Callable[[str], Node]) -> dict[str, Any]:
     network = str(payload.get("network") or "testnet11")
-    fee = parse_amount(payload.get("fee", 0), "fee")
     nonce_raw = strip0x(payload.get("nonce"))
-    return build_manifest(network, payload.get("coins"), payload.get("safe"), fee, bytes.fromhex(nonce_raw) if nonce_raw else None)
+    return sized(payload, lambda fee: build_manifest(network, payload.get("coins"), payload.get("safe"), fee, bytes.fromhex(nonce_raw) if nonce_raw else None))
 
 
 COMMANDS = {

@@ -51,6 +51,7 @@ from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
 from forge_merkle import LEAF_ORDER, MerkleTree
+from untrusted_clvm import run_capped
 
 CONTRACTS = pathlib.Path(__file__).resolve().parent
 # Normally the project's own build. `FORGE_V14_COMPILED` points it somewhere
@@ -565,7 +566,7 @@ def run_leaf(pool: V14Pool, name: str, solution: list, program: Program | None =
     Returns (new_state, tagged [(index, condition)], base conditions, ephemeral')."""
     leaf = program if program is not None else pool.leaves[name]
     state = state if state is not None else pool.state
-    out = leaf.run(Program.to(((ephemeral, state), with_birth(pool, solution))))
+    out = run_capped(leaf, Program.to(((ephemeral, state), with_birth(pool, solution))), MAX_COST)
     new_state = out.first().rest()
     tagged_conds, base = [], []
     for c in out.rest().as_iter():
@@ -968,7 +969,7 @@ def registry_spend(reg: Registry, name: str, solution: list, extra_spends=(), le
     """Run the registry leaf locally, then the singleton spend plus whatever else the
     bundle needs (slots, launcher, fee). Returns (bundle, new_state_program)."""
     program = reg.leaves[name]
-    out = program.run(Program.to(((None, reg.state), solution)))
+    out = run_capped(program, Program.to(((None, reg.state), solution)), MAX_COST)
     new_state = out.first().rest()
     leaf = leaf if leaf is not None else program
     proof = proof if proof is not None else reg.leaf_proof(name)

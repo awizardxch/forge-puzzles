@@ -19,7 +19,7 @@ import sys
 
 from chia.consensus.condition_tools import conditions_dict_for_solution
 from chia.types.condition_opcodes import ConditionOpcode
-from chia.wallet.trading.offer import Offer
+from untrusted_clvm import offer_from_bech32
 from chia_rs import Coin
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
@@ -34,7 +34,9 @@ def _asset_id_hex(asset_id) -> str:
 
 
 def summarize(offer_str: str) -> dict:
-    offer = Offer.from_bech32(offer_str.strip())
+    # A caller's string: bounded, and every reveal and solution in the decoded bundle
+    # checked for back-references before anything runs it (audit U3).
+    offer = offer_from_bech32(offer_str)
 
     offered = [
         {"assetId": _asset_id_hex(asset_id), "amount": str(sum(coin.amount for coin in coins))}

@@ -133,9 +133,17 @@ def two_generation(kit, born, claimed_birth, versioned_birth: bool):
 def main() -> int:
     import _v11_testkit as v11
     import _v14_testkit as v14
-    if not (v11.v11_available() and v14.v14_available()):
-        print("  [skip] a build is absent; the V11 control needs contracts/v11, which the public "
-              "repository does not carry, and V14 needs scripts/build-v14.py")
+    # Two unrelated reasons to stop, named apart (runbook rule 9): the V11 control is a
+    # private build the public repository does not carry, which is a fact about the checkout;
+    # a missing V14 build is the shipping set not being built, which is a fact about the
+    # tree. The old one-line skip blamed both whenever either was absent.
+    missing = []
+    if not v11.v11_available():
+        missing.append("the V11 control (contracts/v11, private; not in the public repository)")
+    if not v14.v14_available():
+        missing.append("the V14 build (run scripts/build-v14.py)")
+    if missing:
+        print(f"  [skip] cannot run: missing {' and '.join(missing)}")
         return 2
 
     born = H - 39   # V14: a coin is born AFTER the height its state last claimed (H - 40)

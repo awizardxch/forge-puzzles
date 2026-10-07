@@ -35,7 +35,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from forge_stdin import _pool, _pool_json
 
 ZERO32_HEX = "00" * 32
-DEFAULT_NODE = "https://testnet11.api.coinset.org"
+import forge_network as _forge_network  # noqa: E402
+
+# The node of the network this runs against (FORGE_NETWORK / FORGE_NODE_URL).
+DEFAULT_NODE = _forge_network.node_url()
 MAX_WALK_DEPTH = 32
 
 

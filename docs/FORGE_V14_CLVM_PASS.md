@@ -248,9 +248,9 @@ CREATE_COIN_ANNOUNCEMENT "forge-reserve-v14" + tree_hash([created_puzzle_hash, a
 The whole coin becomes the reserve; nothing else is created. For a CAT reserve the
 launcher is the inner of a CAT coin: the layer wraps `created_puzzle_hash` (the reserve's
 `p2_delegated_by_singleton` inner) into the reserve's full hash and passes the
-announcement through. The ASCII prefix matters: the CAT layer refuses an inner coin
-announcement beginning `0xcb`, its ring marker, and a bare tree hash would hit that one
-time in 256.
+announcement through. The ASCII prefix is a namespace: the CAT layer refuses an inner coin
+announcement only when it is exactly 33 bytes *and* begins `0xcb`, its ring marker, so a
+bare 32-byte tree hash would never have been refused (2026-10-07 review, F5).
 
 **Why a coin announcement from a derived id, and not something simpler** (spec §1.2,
 all simulated against consensus before this was built). A puzzle announcement binds the

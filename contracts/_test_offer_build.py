@@ -132,6 +132,13 @@ with_fee = run({
 fee_created = [c for c in conditions_of(with_fee["coin_spends"][0]) if int(c.first().as_int()) == 51]
 fee_change = [c for c in fee_created if bytes(c.rest().first().as_atom()) == bytes(CHANGE_PH)]
 check("the change is short by the fee", bool(fee_change) and int(fee_change[0].rest().rest().first().as_int()) == 749_000)
+# Stated as well as paid: Sage's approval sums RESERVE_FEE (52) and showed "FEE 0"
+# for an implicit fee (2026-10-03).
+reserved = [c for c in conditions_of(with_fee["coin_spends"][0]) if int(c.first().as_int()) == 52]
+check("the fee is stated as one RESERVE_FEE of exactly that amount",
+      len(reserved) == 1 and int(reserved[0].rest().first().as_int()) == 1_000, str(len(reserved)))
+no_fee_reserved = [c for c in conditions_of(spends[0]) if int(c.first().as_int()) == 52]
+check("  and no RESERVE_FEE when there is no fee", len(no_fee_reserved) == 0)
 
 print("\nmore coins than one leg needs:")
 many = run({
@@ -227,6 +234,217 @@ mismatch_cat = run({
     "requested": [{"asset_id": None, "amount": 1}],
 })
 check("a CAT coin whose inner does not produce its hash is refused before it runs", mismatch_cat.get("success") is False, str(mismatch_cat)[:160])
+
+# 2026-10-01: Sage's getAssetCoins reports a CAT coin's FULL puzzle (the CAT layer
+# already around the p2), and the Sage app passed it on as the inner one, so every
+# CAT-paid swap from the app was refused by the check above. The full puzzle is
+# taken only when it is this coin's own puzzle over this asset.
+print("\na CAT coin reported with its full puzzle, as Sage reports it:")
+full = cat_coin(1_000, 0x31)
+full["inner_puzzle"] = bytes(construct_cat_puzzle(CAT_MOD, CAT_ASSET, IDENTITY)).hex()
+full_built = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [full]}],
+    "requested": [{"asset_id": None, "amount": 50_000}],
+})
+check("it builds", full_built.get("success") is True, str(full_built.get("error"))[:160])
+full_spends = full_built.get("coin_spends") or []
+check("  wrapped in the CAT layer once, not twice: the reveal is the coin's own puzzle",
+      bool(full_spends) and Program.fromhex(full_spends[0]["puzzle_reveal"].removeprefix("0x")).get_tree_hash().hex()
+      == full["coin"]["puzzle_hash"].removeprefix("0x"))
+same_coin_inner = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [cat_coin(1_000, 0x31)]}],
+    "requested": [{"asset_id": None, "amount": 50_000}],
+})
+check("  and the spend is identical to the one built from the inner puzzle",
+      bool(full_spends) and full_spends == same_coin_inner.get("coin_spends"))
+
+OTHER_ASSET = bytes32(b"\x0a" * 32)
+other_full = cat_coin(1_000, 0x32)
+other_puzzle = construct_cat_puzzle(CAT_MOD, OTHER_ASSET, IDENTITY)
+other_full["inner_puzzle"] = bytes(other_puzzle).hex()
+other_full["coin"]["puzzle_hash"] = "0x" + other_puzzle.get_tree_hash().hex()   # a real coin, of ANOTHER CAT
+wrong_asset = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [other_full]}],
+    "requested": [{"asset_id": None, "amount": 1}],
+})
+check("a full puzzle of another CAT is refused, not spent as this one",
+      wrong_asset.get("success") is False and "cannot be spent with this reveal" in str(wrong_asset.get("error")),
+      str(wrong_asset.get("error"))[:160])
+
+not_this_coin = cat_coin(1_000, 0x33)
+not_this_coin["inner_puzzle"] = bytes(construct_cat_puzzle(CAT_MOD, CAT_ASSET, Program.to((1, [[51, CHANGE_PH, 1]])))).hex()
+stranger = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [not_this_coin]}],
+    "requested": [{"asset_id": None, "amount": 1}],
+})
+check("a full CAT puzzle that is not this coin's is refused", stranger.get("success") is False, str(stranger.get("error"))[:160])
+
+# 2026-10-02: the fee rode only on the XCH leg, so an offer that gives up no XCH (a
+# CAT-paid swap) went out with fee 0 whatever the page showed -- a T6-paid 7-pool
+# split sat in the mempool for minutes. It now pays from `fee_coins`.
+print("\na CAT-paid offer pays its network fee from fee coins:")
+FEE = 10_693
+fee_coin = xch_coin(1_000_000, 0x41)
+cat_fee = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "fee": FEE,
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [cat_coin(1_000, 0x42)]}],
+    "fee_coins": [fee_coin],
+    "requested": [{"asset_id": None, "amount": 50_000}],
+})
+check("it builds", cat_fee.get("success") is True, str(cat_fee.get("error"))[:160])
+fee_spends = [s for s in (cat_fee.get("coin_spends") or []) if s["coin"]["puzzle_hash"].removeprefix("0x") == fee_coin["coin"]["puzzle_hash"].removeprefix("0x")]
+check("  the fee coin is spent", len(fee_spends) == 1, f"{len(fee_spends)}")
+if fee_spends:
+    created = [c for c in conditions_of(fee_spends[0]) if c.first().as_int() == 51]
+    paid_out = sum(int(c.rest().rest().first().as_int()) for c in created)
+    check("  it pays exactly the fee: everything else comes back as change", 1_000_000 - paid_out == FEE,
+          f"in 1000000, out {paid_out}")
+    stated = [c for c in conditions_of(fee_spends[0]) if c.first().as_int() == 52]
+    check("  and states it as a RESERVE_FEE, so the wallet shows it",
+          len(stated) == 1 and int(stated[0].rest().first().as_int()) == FEE)
+    check("  and nothing of it goes to the settlement",
+          all(bytes(c.rest().first().as_atom()) != bytes(OFFER_MOD_HASH) for c in created))
+    check("  it asserts the offer's announcements, so it cannot be spent apart from the offer",
+          any(c.first().as_int() == 63 for c in conditions_of(fee_spends[0])))
+fee_offer = run({
+    "action": "finalize",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "coin_spends": cat_fee.get("coin_spends") or [],
+    "requested": [{"asset_id": None, "amount": 50_000}],
+    "signature": "0x" + bytes(G2Element()).hex(),
+})
+check("  it finalizes", fee_offer.get("success") is True, str(fee_offer.get("error"))[:160])
+if fee_offer.get("success"):
+    parsed_fee = Offer.from_bech32(fee_offer["offer"])
+    # The fee coin's own spend (conditions_of reads standard XCH spends only).
+    asserted_fee = {bytes(c.rest().first().as_atom()) for spend in fee_spends
+                    for c in conditions_of(spend) if c.first().as_int() == 63}
+    expected_fee = {ann.msg_calc for ann in Offer.calculate_announcements(parsed_fee.requested_payments, parsed_fee.driver_dict)}
+    check("  build and finalize agree on the nonce: the fee coin asserts every announcement the offer needs",
+          bool(expected_fee) and expected_fee <= asserted_fee)
+
+no_fee_coins = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "fee": FEE,
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [cat_coin(1_000, 0x43)]}],
+    "requested": [{"asset_id": None, "amount": 50_000}],
+})
+check("a fee with no XCH to pay it is refused, not dropped",
+      no_fee_coins.get("success") is False and "fee_coins" in str(no_fee_coins.get("error")), str(no_fee_coins.get("error"))[:160])
+
+zero_fee = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "fee": 0,
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 400, "coins": [cat_coin(1_000, 0x44)]}],
+    "fee_coins": [xch_coin(1_000_000, 0x45)],
+    "requested": [{"asset_id": None, "amount": 50_000}],
+})
+check("with no fee, a fee coin sent anyway is not spent", zero_fee.get("success") is True and len(zero_fee.get("coin_spends") or []) == 1,
+      f"{len(zero_fee.get('coin_spends') or [])} spends")
+
+xch_paid = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "fee": FEE,
+    "offered": [{"asset_id": None, "amount": 250_000, "coins": [xch_coin(1_000_000, 0x46)]}],
+    "fee_coins": [xch_coin(1_000_000, 0x47)],
+    "requested": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 7_500}],
+})
+check("an offer that gives up XCH pays the fee from that XCH, and spends no fee coin",
+      xch_paid.get("success") is True and len(xch_paid.get("coin_spends") or []) == 1,
+      f"{len(xch_paid.get('coin_spends') or [])} spends")
+
+print("\na payment rides the trader's own spend (the router fee on a Dexie-only swap, 2026-10-05):")
+FEE_PH = bytes32.fromhex("fe" * 32)
+
+
+def finalized_offer(built: dict, requested: list) -> Offer:
+    done = run({
+        "action": "finalize",
+        "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+        "coin_spends": built["coin_spends"],
+        "requested": requested,
+        "signature": "0x" + bytes(G2Element()).hex(),
+    })
+    return Offer.from_bech32(done["offer"])
+
+
+xch_requested = [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 7_500}]
+paid_xch = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "fee": 1_000,
+    "offered": [{"asset_id": None, "amount": 970_000, "coins": [xch_coin(1_100_000, 0x51)],
+                 "payments": [{"puzzle_hash": "0x" + FEE_PH.hex(), "amount": 30_000}]}],
+    "requested": xch_requested,
+})
+check("an XCH leg with a payment builds", paid_xch.get("success") is True, str(paid_xch.get("error"))[:160])
+if paid_xch.get("success"):
+    made = [c for c in conditions_of(paid_xch["coin_spends"][0]) if int(c.first().as_int()) == 51]
+    to_fee = [c for c in made if bytes(c.rest().first().as_atom()) == bytes(FEE_PH)]
+    check("  the same spend pays the fee address exactly the payment", len(to_fee) == 1
+          and int(to_fee[0].rest().rest().first().as_int()) == 30_000)
+    check("  hinted to the fee address, so its wallet sees it", len(to_fee) == 1
+          and [bytes(m.as_atom()) for m in to_fee[0].rest().rest().rest().first().as_iter()] == [bytes(FEE_PH)])
+    to_change = [c for c in made if bytes(c.rest().first().as_atom()) == bytes(CHANGE_PH)]
+    check("  change is what the coins leave after offer, payment and network fee",
+          len(to_change) == 1 and int(to_change[0].rest().rest().first().as_int()) == 1_100_000 - 970_000 - 30_000 - 1_000)
+    offer = finalized_offer(paid_xch, xch_requested)
+    offered = {(a.hex() if a else "xch"): n for a, n in offer.get_offered_amounts().items()}
+    check("  the offer still reads as the trade: it gives up the net amount, not the fee", offered == {"xch": 970_000}, str(offered))
+    asserted = {bytes(c.rest().first().as_atom()) for c in conditions_of(paid_xch["coin_spends"][0]) if c.first().as_int() == 63}
+    expected = {ann.msg_calc for ann in Offer.calculate_announcements(offer.requested_payments, offer.driver_dict)}
+    check("  and the spend that pays the fee asserts the settlement: no swap, no fee", bool(expected) and expected <= asserted)
+
+cat_requested = [{"asset_id": None, "amount": 50_000}]
+paid_cat = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": "0x" + CAT_ASSET.hex(), "amount": 388, "coins": [cat_coin(1_000, 0x52)],
+                 "payments": [{"puzzle_hash": "0x" + FEE_PH.hex(), "amount": 12}]}],
+    "requested": cat_requested,
+})
+check("a CAT leg with a payment builds", paid_cat.get("success") is True, str(paid_cat.get("error"))[:160])
+if paid_cat.get("success"):
+    offer = finalized_offer(paid_cat, cat_requested)
+    fee_cat_ph = CAT_MOD.curry(CAT_MOD.get_tree_hash(), CAT_ASSET, FEE_PH).get_tree_hash_precalc(FEE_PH)
+    additions = offer._bundle.additions()
+    fee_coins = [c for c in additions if c.puzzle_hash == fee_cat_ph]
+    check("  the fee is paid in the CAT, to the fee address under the CAT layer",
+          len(fee_coins) == 1 and int(fee_coins[0].amount) == 12, f"{[(c.puzzle_hash.hex()[:8], c.amount) for c in additions]}")
+    check("  value is conserved: offered + payment + change = the coin",
+          sum(int(c.amount) for c in additions) == 1_000, f"{sum(int(c.amount) for c in additions)}")
+    offered = {(a.hex() if a else "xch"): n for a, n in offer.get_offered_amounts().items()}
+    check("  the offer gives up the net CAT amount", offered == {CAT_ASSET.hex(): 388}, str(offered))
+
+over = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": None, "amount": 970_000, "coins": [xch_coin(990_000, 0x53)],
+                 "payments": [{"puzzle_hash": "0x" + FEE_PH.hex(), "amount": 30_000}]}],
+    "requested": xch_requested,
+})
+check("coins that cover the offer but not the payment are refused", over.get("success") is False, str(over)[:120])
+zero = run({
+    "action": "build",
+    "change_puzzle_hash": "0x" + CHANGE_PH.hex(),
+    "offered": [{"asset_id": None, "amount": 970_000, "coins": [xch_coin(1_100_000, 0x54)],
+                 "payments": [{"puzzle_hash": "0x" + FEE_PH.hex(), "amount": 0}]}],
+    "requested": xch_requested,
+})
+check("a zero payment is refused", zero.get("success") is False, str(zero)[:120])
 
 print()
 if FAILED:

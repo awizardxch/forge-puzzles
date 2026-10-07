@@ -95,13 +95,16 @@ from multisig_tool import (
     sponsor_key_of,
     strip0x,
 )
+from untrusted_clvm import parse_untrusted_hex
 
 def spend_from_json(value: Any) -> CoinSpend:
-    """The inverse of ``spend_to_json``, for riders restored from a stored plan."""
+    """The inverse of ``spend_to_json``, for riders restored from a stored plan -- and for the
+    `fee_spends` an unauthenticated POST /api/multisig-execute body carries, so the programs
+    are parsed as untrusted CLVM (audit U3)."""
     return make_spend(
         coin_from_json(value.get("coin")),
-        Program.from_bytes(bytes.fromhex(strip0x(value.get("puzzle_reveal")))),
-        Program.from_bytes(bytes.fromhex(strip0x(value.get("solution")))),
+        parse_untrusted_hex(value.get("puzzle_reveal")),
+        parse_untrusted_hex(value.get("solution")),
     )
 
 
@@ -365,6 +368,24 @@ def policy_from_launcher(solution: Program) -> Policy:
     raise MultisigError("the launcher carries no readable vault policy")
 
 
+def policy_change(current: Policy, updated: Policy | None) -> str | None:
+    """What a policy memo in a singleton spend does to the lock, if anything.
+
+    New keys or threshold: a re-key, and the next coin carries the new inner
+    puzzle. The same keys and threshold under a new name or new labels: a
+    rename, with the same inner puzzle. Either way the memo sits in the spend the
+    owners signed, so a rename is as authorised as a re-key; and a rename cannot
+    touch who signs, because the inner puzzle hash it must match is unchanged.
+    """
+    if updated is None:
+        return None
+    if updated.inner_puzzle_hash() != current.inner_puzzle_hash():
+        return "rekey"
+    if updated.encode() != current.encode():
+        return "rename"
+    return None
+
+
 def policy_from_singleton_spend(puzzle: Program, solution: Program) -> Policy | None:
     """A re-key writes the new policy into the recreated singleton's memos."""
     _cost, output = puzzle.run_with_cost(MAX_CLVM_COST, solution)
@@ -456,9 +477,10 @@ def read_vault(node: Node, launcher_id: bytes32) -> VaultState:
         puzzle, solution = coin_spend_of(node, coin.name(), height)
         inner_hash = policy.inner_puzzle_hash()
         updated = policy_from_singleton_spend(puzzle, solution)
-        if updated is not None and updated.inner_puzzle_hash() != inner_hash:
+        event = policy_change(policy, updated)
+        if event is not None:
             policy = updated
-            history.append({"height": height, "policy": policy.to_json(), "event": "rekey"})
+            history.append({"height": height, "policy": policy.to_json(), "event": event})
         else:
             history.append({"height": height, "event": "spend"})
         lineage = SingletonLineageProof(coin.parent_coin_info, inner_hash, coin.amount)
@@ -910,7 +932,11 @@ def build_vault_plan(
     deposit = deposit_puzzle(launcher_id)
     deposit_ph = deposit.get_tree_hash()
     lock_fee = 0 if sponsor else fee
-    if successor is not None and successor.inner_puzzle_hash() == policy.inner_puzzle_hash():
+    # Same keys and threshold with a new name or new labels is a rename: the
+    # singleton is recreated with the same inner puzzle and the new policy in its
+    # memo, which the owners sign like any re-key. Only a policy identical in
+    # every field changes nothing.
+    if successor is not None and successor.encode() == policy.encode():
         raise MultisigError("the new policy is identical to the current one; nothing to change")
 
     # ── funds selection ──
@@ -1164,7 +1190,15 @@ def cmd_launch(payload: dict[str, Any], _factory: Callable[[str], Node]) -> dict
     raw_policy = payload.get("policy") or payload
     if isinstance(raw_policy, dict) and not raw_policy.get("format"):
         raw_policy = {**raw_policy, "format": FORMAT_MIPS}
-    return build_launch(network, Policy.from_json(raw_policy), payload.get("coins"), parse_amount(payload.get("fee", 0), "fee"), payload.get("profile"))
+    policy = Policy.from_json(raw_policy)
+    build = lambda fee: build_launch(network, policy, payload.get("coins"), fee, payload.get("profile"))  # noqa: E731
+    rate = parse_fee_rate(payload)
+    if rate is None:
+        return build(parse_amount(payload.get("fee", 0), "fee"))
+    # The creator's wallet spend plus the launcher, as the wallet will sign it.
+    measure = lambda built: bundle_cost([spend_from_json(s) for s in built["coin_spends"]])  # noqa: E731
+    built, fee, cost = settle_fee(build, measure, rate)
+    return {**built, "cost": cost, "fee_rate": rate}
 
 
 def cmd_read(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[str, Any]:
@@ -1624,29 +1658,45 @@ def cmd_propose(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
     elif not outputs and successor is None and not action_conditions and action_builder is None and not singleton_spends:
         raise MultisigError("a proposal needs outputs, conditions, a DID, a DID to publish, or a new policy")
 
-    sponsor: tuple[Coin, Program] | None = None
     sponsor_raw = payload.get("sponsor")
-    if isinstance(sponsor_raw, dict) and isinstance(sponsor_raw.get("coins"), list):
-        candidates: list[tuple[Coin, Program]] = []
-        for entry in sponsor_raw["coins"]:
-            if not isinstance(entry, dict):
-                continue
-            reveal = strip0x(entry.get("puzzle") or entry.get("puzzle_reveal") or "")
-            if not reveal:
-                continue
-            coin = coin_from_json(entry.get("coin"))
-            if int(coin.amount) >= fee:
-                candidates.append((coin, Program.from_bytes(bytes.fromhex(reveal))))
-        if not candidates:
-            raise MultisigError(f"the proposer's wallet has no XCH coin covering the {fee} mojo fee")
-        sponsor = max(candidates, key=lambda pair: int(pair[0].amount))
-    elif successor is not None and fee > 0 and not outputs:
-        # A pure re-key spends no funds coin, so only a sponsor can pay a fee.
-        raise MultisigError("a re-key with a fee needs the proposer's wallet to sponsor it")
+    has_sponsor = isinstance(sponsor_raw, dict) and isinstance(sponsor_raw.get("coins"), list)
+
+    def pick_sponsor(fee: int) -> tuple[Coin, Program] | None:
+        if has_sponsor:
+            candidates: list[tuple[Coin, Program]] = []
+            for entry in sponsor_raw["coins"]:
+                if not isinstance(entry, dict):
+                    continue
+                reveal = strip0x(entry.get("puzzle") or entry.get("puzzle_reveal") or "")
+                if not reveal:
+                    continue
+                coin = coin_from_json(entry.get("coin"))
+                if int(coin.amount) >= fee:
+                    candidates.append((coin, Program.from_bytes(bytes.fromhex(reveal))))
+            if not candidates:
+                raise MultisigError(f"the proposer's wallet has no XCH coin covering the {fee} mojo fee")
+            return max(candidates, key=lambda pair: int(pair[0].amount))
+        if successor is not None and fee > 0 and not outputs:
+            # A pure re-key spends no funds coin, so only a sponsor can pay a fee.
+            raise MultisigError("a re-key with a fee needs the proposer's wallet to sponsor it")
+        return None
 
     nonce_raw = strip0x(payload.get("nonce"))
     nonce = bytes.fromhex(nonce_raw) if nonce_raw else None
+
+    def build(fee: int) -> VaultPlan:
+        return build_vault_plan(node, network, state, outputs, fee, pick_sponsor(fee), successor,
+                                nonce, action_conditions,
+                                action_value, action_builder, singleton_spends)
+
+    # `fee_rate` (mojos per cost) sizes the fee from the spend itself: build it,
+    # measure what the mempool will charge, and set the fee to that cost times
+    # the rate plus a margin. A lock spend costs 40-150M depending on its owners
+    # and assets; a flat fee sized for a pool swap (235M+) paid about seven times
+    # what a 1-of-1 send needed (mainnet, 2026-10-05).
     offer_raw = payload.get("offer")
+    fee_rate = None if isinstance(offer_raw, dict) else parse_fee_rate(payload)
+    measured: int | None = None
     if isinstance(offer_raw, dict):
         # An offer is built by its own composer, which needs to know which coins
         # were selected before it can write anything. Everything else about the
@@ -1660,17 +1710,89 @@ def cmd_propose(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
             vault_offer.parse_requested(offer_raw.get("requested")),
             nonce,
         )
+    elif fee_rate is not None and successor is not None and not outputs and not has_sponsor:
+        # A pure re-key with nobody to pay: nothing can carry a fee.
+        plan = build(0)
+        fee = 0
+    elif fee_rate is not None:
+        # One mojo first, so the fee's own coin is part of the shape measured.
+        plan, fee, measured = settle_fee(build, lambda built: plan_cost(built, state.height), fee_rate)
     else:
-        plan = build_vault_plan(node, network, state, outputs, fee, sponsor, successor,
-                                nonce, action_conditions,
-                                action_value, action_builder, singleton_spends)
+        plan = build(fee)
+    if measured is None and not isinstance(offer_raw, dict):
+        try:
+            measured = plan_cost(plan, state.height)
+        except Exception:                                      # noqa: BLE001
+            measured = None                                    # informational only
     return {
         "success": True,
         "plan": plan.to_json(),
         "messages": [plan.message.hex()],
         "coin_ids": [c.hex() for c in plan.all_coin_ids()],
         "state": state.to_json(network),
+        "cost": measured,
+        "fee": fee,
+        "fee_rate": fee_rate,
     }
+
+
+# Margin over the measured cost when a fee is sized from it. The cost is exact
+# for the bundle measured; the margin covers the bytes the fee itself adds and
+# keeps a spend clear of the 5 mojos/cost floor the mempool refuses below.
+FEE_MARGIN_NUM, FEE_MARGIN_DEN = 11, 10
+
+
+def sized_fee(cost: int, rate: int) -> int:
+    return -(-cost * rate * FEE_MARGIN_NUM // FEE_MARGIN_DEN)
+
+
+# Cost rules are the current ones from here on; a height before the 2024 hard
+# fork would price the same bundle under the old rules.
+COST_RULES_HEIGHT = 10_000_000
+
+
+def bundle_cost(spends: list[CoinSpend], height: int | None = None) -> int:
+    """What the mempool charges for these spends as one bundle.
+
+    An empty signature has the same 96 bytes as a real one, and signatures are
+    not checked here, so the cost is the one the node will count.
+    """
+    from chia.consensus.default_constants import DEFAULT_CONSTANTS
+    from chia_rs import SpendBundle, get_conditions_from_spendbundle
+
+    bundle = SpendBundle(spends, G2Element())
+    conditions = get_conditions_from_spendbundle(bundle, DEFAULT_CONSTANTS.MAX_BLOCK_COST_CLVM, DEFAULT_CONSTANTS, max(int(height or 0), COST_RULES_HEIGHT))
+    return int(conditions.cost)
+
+
+def plan_cost(plan: "VaultPlan", height: int | None = None) -> int:
+    """The cost of a plan's bundle, with the threshold's keys revealed as a signed
+    spend reveals them. Against the first mainnet lock send: 42.3M here, 41.9M
+    on chain."""
+    return bundle_cost(plan.materialize(list(plan.policy.keys)[: plan.policy.m]), height)
+
+
+def settle_fee(build: Callable[[int], Any], measure: Callable[[Any], int], rate: int) -> tuple[Any, int, int]:
+    """Build at one mojo, measure, size the fee from the cost, rebuild until the
+    fee clears the rate on the bundle actually built. Returns (built, fee, cost)."""
+    fee = 1
+    for _ in range(4):
+        built = build(fee)
+        cost = measure(built)
+        if fee >= cost * rate:
+            return built, fee, cost
+        fee = sized_fee(cost, rate)
+    raise MultisigError("the fee did not settle on a size; enter one by hand")
+
+
+def parse_fee_rate(payload: dict[str, Any]) -> int | None:
+    raw = payload.get("fee_rate")
+    if raw in (None, ""):
+        return None
+    rate = parse_amount(raw, "fee_rate")
+    if not 1 <= rate <= 1_000:
+        raise MultisigError("fee_rate must be between 1 and 1000 mojos per cost")
+    return rate
 
 
 def spends_needing_signature(spends: list[CoinSpend], keys: list[G1Element]) -> list[CoinSpend]:
@@ -1847,7 +1969,16 @@ def build_execution_fee(plan: VaultPlan, coins_raw: Any, fee: int) -> dict[str, 
 
 def cmd_fee_spend(payload: dict[str, Any], _factory: Callable[[str], Node]) -> dict[str, Any]:
     plan = VaultPlan.from_json(payload.get("plan"))
-    return build_execution_fee(plan, payload.get("coins"), parse_amount(payload.get("fee", 0), "fee"))
+    rate = parse_fee_rate(payload)
+    if rate is None:
+        return build_execution_fee(plan, payload.get("coins"), parse_amount(payload.get("fee", 0), "fee"))
+    # The fee pays for the whole push: the lock's own spends plus this one, which
+    # cannot be measured alone because it asserts the lock's announcement.
+    lock_spends = plan.materialize(list(plan.policy.keys)[: plan.policy.m])
+    build = lambda fee: build_execution_fee(plan, payload.get("coins"), fee)  # noqa: E731
+    measure = lambda built: bundle_cost(lock_spends + [spend_from_json(s) for s in built["coin_spends"]])  # noqa: E731
+    built, fee, cost = settle_fee(build, measure, rate)
+    return {**built, "cost": cost, "fee_rate": rate}
 
 
 def cmd_assemble(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[str, Any]:

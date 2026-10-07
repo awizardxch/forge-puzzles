@@ -38,7 +38,9 @@ from multisig_tool import MultisigError, Node, network_config, record_coin, stri
 
 # A wallet hands out addresses in order and rarely runs far ahead of what it has
 # used, so this is generous. It is one node query however many are given.
-MAX_KEYS = 400
+# The site sends its first 500 keys (WalletContext COIN_KEY_WINDOW); a cap below that
+# hid funds at a wallet's 488th address (the mainnet registry wallet, 2026-10-06).
+MAX_KEYS = 600
 # Enough coins for any spend Forge builds, newest and largest first.
 MAX_COINS = 200
 
@@ -90,6 +92,83 @@ def coins_for_keys(node: Node, pubkeys: list[str]) -> list[dict[str, Any]]:
     return [entry for _, entry in coins[:MAX_COINS]]
 
 
+# Lineage costs two node reads per coin (the parent's record, then its spend), so
+# only the largest few of each asset are proved; a creation spends one per asset.
+MAX_CATS_PER_ASSET = 5
+
+
+def cat_coins_for_keys(node: Node, pubkeys: list[str], asset_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Unspent CAT coins of each asset at the wallet's addresses, with what a spend needs.
+
+    A CAT address is the CAT layer curried with the asset id around the same
+    standard inner puzzle the XCH address uses, so it is derived the same way.
+    Each coin also needs a lineage proof -- its parent's parent, inner puzzle hash
+    and amount -- which the parent's own spend on chain supplies. A coin whose
+    parent is not a CAT of the same asset (one fresh from its TAIL) cannot be
+    proved this way and is skipped; the wallet's other coins still count.
+    """
+    from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle, match_cat_puzzle
+    from chia.wallet.uncurried_puzzle import uncurry_puzzle
+
+    inners = []
+    for raw in pubkeys[:MAX_KEYS]:
+        text = strip0x(str(raw or ""))
+        if len(text) != 96:
+            continue
+        try:
+            inners.append(puzzle_for_synthetic_public_key(G1Element.from_bytes(bytes.fromhex(text))))
+        except Exception:  # noqa: BLE001
+            continue
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for raw_asset in asset_ids:
+        asset_hex = strip0x(str(raw_asset or "")).lower()
+        if len(asset_hex) != 64 or set(asset_hex) == {"0"}:
+            continue
+        asset = bytes32.fromhex(asset_hex)
+        by_hash = {}
+        for inner in inners:
+            by_hash[construct_cat_puzzle(CAT_MOD, asset, inner).get_tree_hash()] = inner
+        if not by_hash:
+            out[asset_hex] = []
+            continue
+        records = [r for r in node.coin_records_by_puzzle_hashes(list(by_hash)) if not r.get("spent")]
+        records.sort(key=lambda r: int(record_coin(r).amount), reverse=True)
+        found: list[dict[str, Any]] = []
+        for record in records[:MAX_CATS_PER_ASSET]:
+            coin = record_coin(record)
+            parent = node.coin_record(bytes32(coin.parent_coin_info))
+            if not parent or not parent.get("spent"):
+                continue
+            parent_coin = record_coin(parent)
+            try:
+                parent_puzzle, _ = node.puzzle_and_solution(bytes32(coin.parent_coin_info), int(parent.get("spent_block_index") or 0))
+            except Exception:  # noqa: BLE001 -- a parent the node cannot show cannot prove lineage
+                continue
+            matched = match_cat_puzzle(uncurry_puzzle(parent_puzzle))
+            if matched is None:
+                continue
+            _, parent_tail, parent_inner = matched
+            if bytes(parent_tail.as_atom()) != bytes(asset):
+                continue
+            found.append({
+                "asset_id": asset_hex,
+                "coin": {
+                    "parent_coin_info": coin.parent_coin_info.hex(),
+                    "puzzle_hash": coin.puzzle_hash.hex(),
+                    "amount": int(coin.amount),
+                },
+                "inner_puzzle": bytes(by_hash[bytes32(coin.puzzle_hash)]).hex(),
+                "lineage_proof": {
+                    "parent_name": parent_coin.parent_coin_info.hex(),
+                    "inner_puzzle_hash": parent_inner.get_tree_hash().hex(),
+                    "amount": int(parent_coin.amount),
+                },
+            })
+        out[asset_hex] = found
+    return out
+
+
 def main() -> int:
     for stream in (sys.stdin, sys.stdout):
         try:
@@ -108,12 +187,16 @@ def main() -> int:
         if not isinstance(pubkeys, list) or not pubkeys:
             raise MultisigError("pubkeys must be a non-empty list")
         coins = coins_for_keys(node, [str(key) for key in pubkeys])
+        asset_ids = payload.get("asset_ids") if isinstance(payload.get("asset_ids"), list) else []
+        cats = cat_coins_for_keys(node, [str(key) for key in pubkeys], [str(a) for a in asset_ids]) if asset_ids else {}
         print(json.dumps({
             "success": True,
             "network": network,
             "addresses": len(pubkeys[:MAX_KEYS]),
             "coins": coins,
             "balance": sum(entry["coin"]["amount"] for entry in coins),
+            # Only when asked for: {asset_id: [{asset_id, coin, inner_puzzle, lineage_proof}]}
+            **({"cats": cats} if asset_ids else {}),
         }))
         return 0
     except MultisigError as exc:

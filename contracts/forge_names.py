@@ -25,9 +25,11 @@ import json
 import urllib.request
 from typing import Any
 
-from chia.types.blockchain_format.program import Program
+import forge_network as _forge_network  # noqa: E402
+from untrusted_clvm import parse_untrusted_hex, run_capped  # noqa: E402
 
-DEFAULT_NODE = "https://testnet11.api.coinset.org"
+# The node of the network this runs against (FORGE_NETWORK / FORGE_NODE_URL).
+DEFAULT_NODE = _forge_network.node_url()
 CREATE_COIN = 51
 LAUNCHER_HASH_HEX = "eff07522495060c066f66f32acc2a77e3a3e737aca8baea4d1a64ea4cdc13da9"
 
@@ -46,9 +48,10 @@ def _rpc(node: str, route: str, body: dict) -> dict:
 def _memos_of(node: str, coin_id_hex: str, spent_height: int, target_ph_hex: str, target_amount: int) -> list[bytes]:
     """The memos on the CREATE_COIN in `coin_id`'s spend that made (target_ph, target_amount)."""
     cs = _rpc(node, "get_puzzle_and_solution", {"coin_id": "0x" + coin_id_hex, "height": int(spent_height)})["coin_solution"]
-    puzzle = Program.from_bytes(bytes.fromhex(_strip(cs["puzzle_reveal"])))
-    solution = Program.from_bytes(bytes.fromhex(_strip(cs["solution"])))
-    for cond in puzzle.run(solution).as_iter():
+    # The node answered with somebody's spend: no back-references, and a cost cap (audit U3).
+    puzzle = parse_untrusted_hex(cs["puzzle_reveal"])
+    solution = parse_untrusted_hex(cs["solution"])
+    for cond in run_capped(puzzle, solution).as_iter():
         items = list(cond.as_iter())
         if items[0].atom is None or items[0].as_int() != CREATE_COIN or len(items) < 4:
             continue

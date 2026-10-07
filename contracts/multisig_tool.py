@@ -40,6 +40,7 @@ import itertools
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -99,6 +100,10 @@ ASSERT_MY_COIN_ID = ConditionOpcode.ASSERT_MY_COIN_ID
 
 class MultisigError(Exception):
     """A caller mistake or a chain state that makes the request impossible."""
+
+
+class _Transient(Exception):
+    """A node read that failed in a way worth asking again (5xx, 429, a reset)."""
 
 
 # ─── Encoding helpers ────────────────────────────────────────────────────────
@@ -186,7 +191,25 @@ class Node:
         self.node_url = node_url.rstrip("/")
         self.timeout = timeout
 
+    # A read the node's edge drops (a 5xx, a reset connection) is asked again: the
+    # lock page showed "HTTP 503: upstream connect error" for a balance coinset
+    # answered a moment later (2026-10-05). A push is never repeated here -- a
+    # push that timed out may have landed, and the callers handle that case.
+    READ_RETRIES = 2
+    RETRY_PAUSE_S = 0.6
+
     def rpc(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
+        attempts = 1 if route == "push_tx" else 1 + self.READ_RETRIES
+        for attempt in range(attempts):
+            try:
+                return self._rpc_once(route, payload)
+            except _Transient as exc:
+                if attempt + 1 >= attempts:
+                    raise MultisigError(str(exc)) from exc
+                time.sleep(self.RETRY_PAUSE_S * (attempt + 1))
+        raise MultisigError(f"node {route} did not answer")  # unreachable
+
+    def _rpc_once(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self.node_url}/{route}",
             data=json.dumps(payload).encode(),
@@ -202,9 +225,14 @@ class Node:
                 body = json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")
-            raise MultisigError(f"node {route} HTTP {exc.code}: {detail[:400]}") from exc
+            message = f"node {route} HTTP {exc.code}: {detail[:400]}"
+            if exc.code >= 500 or exc.code == 429:
+                raise _Transient(message) from exc
+            raise MultisigError(message) from exc
         except urllib.error.URLError as exc:
-            raise MultisigError(f"node {route} unreachable: {exc.reason}") from exc
+            raise _Transient(f"node {route} unreachable: {exc.reason}") from exc
+        except (TimeoutError, ConnectionError) as exc:
+            raise _Transient(f"node {route} unreachable: {exc}") from exc
         if not isinstance(body, dict):
             raise MultisigError(f"node {route} returned a non-object body")
         return body

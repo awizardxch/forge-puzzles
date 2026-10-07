@@ -87,9 +87,10 @@ at the inner hash the registry computed (the CAT layer wraps it), for exactly
 `reserves[i]`, hinted with this pool's launcher id. The registry pins
 `RESERVE_LAUNCHER_HASH` in its curried constants.
 
-The ASCII prefix on the message is not decoration: the CAT layer refuses an inner coin
-announcement whose first byte is `0xcb` (its ring marker), and a bare tree hash would hit
-that one time in 256.
+The ASCII prefix on the message is a namespace, not a guard. The CAT layer refuses an inner
+coin announcement only when it is exactly 33 bytes *and* begins `0xcb` (its ring marker);
+a bare 32-byte tree hash is never refused, so the prefix buys legibility and a distinct
+namespace, nothing more (2026-10-07 review, F5).
 
 **What it reduces to.** Registering a market requires funding its reserves. A squatter
 may still register `[1, 1]`, and that is the case the dilution arithmetic already

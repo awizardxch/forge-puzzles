@@ -54,34 +54,42 @@ def check(label, ok, detail=""):
 
 # ---- a wallet's offer, without a wallet -------------------------------------------------------------
 
-def fabricate_offer(offered: dict, requested: dict, salt: int) -> Offer:
-    """`offered`: asset -> amount the trader puts in; `requested`: asset -> amount
-    they must receive. Trader coins are `(1)` puzzles: an XCH coin creates the XCH
-    settlement, a CAT coin (with a fabricated CAT parent) creates the CAT
-    settlement; each asserts the requested payments' announcements, so the
-    offer only settles when the trader is paid."""
+def fabricate_offer(offered: dict, requested: dict, salt: int, payments: dict | None = None, bind: bool = True) -> Offer:
+    """`offered`: asset -> amount the trader puts in (the settlement coin); `requested`:
+    asset -> amount they must receive at TRADER_PH, or a list of (puzzle hash, amount)
+    for a group that also pays someone else (the router's output-side fee); `payments`:
+    asset -> [(puzzle hash, amount)] the trader's own spend of that asset creates beside
+    the settlement (the router's input-side fee). Trader coins are `(1)` puzzles: an XCH
+    coin creates the XCH settlement, a CAT coin (with a fabricated CAT parent) creates
+    the CAT settlement; each asserts the requested payments' announcements, so the offer
+    only settles when the trader is paid."""
     coins, spends, cats = [], [], []
+    payments = payments or {}
     for i, (asset, amount) in enumerate(offered.items()):
+        held = amount + sum(a for _, a in payments.get(asset, []))
         if asset is None:
-            coin = Coin(bytes32(bytes([salt, i]) * 16), IDENTITY.get_tree_hash(), uint64(amount))
+            coin = Coin(bytes32(bytes([salt, i]) * 16), IDENTITY.get_tree_hash(), uint64(held))
         else:
             outer = construct_cat_puzzle(CAT_MOD, asset, IDENTITY).get_tree_hash()
             grand = bytes32(bytes([salt, 0x10 + i]) * 16)
-            coin = Coin(drv.coin_id(grand, outer, amount), outer, uint64(amount))
+            coin = Coin(drv.coin_id(grand, outer, held), outer, uint64(held))
         coins.append((asset, coin))
     notarized = Offer.notarize_payments(
-        {asset: [CreateCoin(TRADER_PH, uint64(amount), [TRADER_PH])] for asset, amount in requested.items()},
+        {asset: [CreateCoin(ph, uint64(a), [ph]) for ph, a in (spec if isinstance(spec, list) else [(TRADER_PH, spec)])]
+         for asset, spec in requested.items()},
         [c for _, c in coins])
     announcements = []
-    for asset, payments in notarized.items():
+    for asset, group in notarized.items():
         settle = OFFER_MOD_HASH if asset is None else construct_cat_puzzle(CAT_MOD, asset, OFFER_MOD).get_tree_hash()
-        for p in payments:
-            msg = Program.to((p.nonce, [p.as_condition_args()])).get_tree_hash()
-            announcements.append([63, bytes32(drv.hashlib.sha256(bytes(settle) + bytes(msg)).digest())])
+        # one group per asset: every payment shares the nonce, and the announcement is over the whole group
+        msg = Program.to((group[0].nonce, [p.as_condition_args() for p in group])).get_tree_hash()
+        announcements.append([63, bytes32(drv.hashlib.sha256(bytes(settle) + bytes(msg)).digest())])
     for asset, coin in coins:
         # Inside a CAT the inner puzzle pays the INNER settlement hash; the CAT
         # layer wraps it into the CAT-settlement outer hash the announcements use.
-        conditions = [[51, OFFER_MOD_HASH, int(coin.amount)], *announcements]
+        # `bind=False` leaves the announcements out: a gift, not an offer, which the lane refuses.
+        conditions = [[51, OFFER_MOD_HASH, int(offered[asset])],
+                      *[[51, ph, a, [ph]] for ph, a in payments.get(asset, [])], *(announcements if bind else [])]
         if asset is None:
             spends.append(make_spend(coin, IDENTITY, Program.to(conditions)))
         else:
@@ -128,77 +136,72 @@ def snapshot_roundtrip(pool):
     return snap, back
 
 
-def swap_case(label, pool, i_in, i_out, gross, ask_bps=9_900, expect_ok=True):
-    print(f"swap on {label}: asset {i_in} -> {i_out}, gross {gross}")
+def wrapped(asset, ph: bytes32) -> bytes32:
+    """`ph` as it appears in a CREATE_COIN of `asset`: bare for XCH, CAT-wrapped for a CAT."""
+    return ph if asset is None else construct_cat_puzzle(CAT_MOD, asset, Program.to(ph)).get_tree_hash_precalc(ph)
+
+
+def settlement_outputs(bundle: SpendBundle, asset, amount: int) -> set:
+    """Every (puzzle hash, amount) the settlement coin of `asset` holding `amount` creates."""
+    outs = set()
+    for cs in bundle.coin_spends:
+        if cs.coin.puzzle_hash != v14.settle_ph(asset) or int(cs.coin.amount) != amount:
+            continue
+        for c in Program.from_bytes(bytes(cs.puzzle_reveal)).run(Program.from_bytes(bytes(cs.solution))).as_iter():
+            if c.first().atom is not None and c.first().as_int() == 51:
+                outs.add((bytes32(c.rest().first().as_atom()), c.rest().rest().first().as_int()))
+    return outs
+
+
+def swap_case(label, pool, i_in, i_out, put_in, bps=0, ask_delta=0, fee_short=0, bind=True, expect_ok=True, salt=0x31):
+    """A swap settles EXACTLY (F3, 2026-10-07 review): the offer asks for exactly what the
+    pool pays at this state, and the router's rate is inside the trader's signature --
+    paid by the trader's own spend on the input, or as a requested payment to the router
+    on the output when the trader receives XCH. Nothing the pool pays out is left to a
+    group nobody signed. `put_in` is what the trader gives up, fee included."""
+    print(f"swap on {label}: asset {i_in} -> {i_out}, {put_in} in at {bps} bps")
     snap, _ = snapshot_roundtrip(pool)
     a_in, a_out = pool.asset_ids[i_in], pool.asset_ids[i_out]
+    side = v14.router_fee_side(a_in, a_out)
+    in_fee = put_in * bps // 10_000 if side == "input" else 0
+    net = put_in - in_fee
     r, w = pool.state[0], pool.weights
-    honest = v14.forge_math.swap_output(r[i_in], r[i_out], gross, pool.fee_bps, w[i_in], w[i_out])
-    payout = honest - honest * pool.protocol_fee_bps // 10_000
-    want = payout * ask_bps // 10_000
-    offer = fabricate_offer({a_in: gross}, {a_out: want}, salt=0x31)
+    honest = v14.forge_math.swap_output(r[i_in], r[i_out], net, pool.fee_bps, w[i_in], w[i_out])
+    payout = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
+    out_fee = payout * bps // 10_000 if side == "output" else 0
+    group = [(TRADER_PH, payout - out_fee + ask_delta)] + ([(ROUTER_PH, out_fee - fee_short)] if out_fee > 0 else [])
+    payments = {a_in: [(ROUTER_PH, in_fee - fee_short)]} if in_fee > 0 else None
+    offer = fabricate_offer({a_in: net}, {a_out: group}, salt=salt, payments=payments, bind=bind)
     payload = {"action": "swap", "offer": offer.to_bech32(), "pool": snap, "current_height": H,
-               "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": 0}}
+               "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": bps}}
     try:
         out = run(payload)
     except Exception as exc:
-        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:90]}")
+        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:100]}")
         return None
     if not check("  builder accepted the offer", expect_ok):
         return None
     bundle = SpendBundle.from_json_dict(out["bundle"])
-    # The router asks for 0 bps here, so it is entitled to NOTHING and the whole
-    # payout belongs to the trader: their notarised floor in the asserted group, and
-    # the overage above it refunded in a second group. It used to be kept by the
-    # router, which made a trader's own slippage tolerance into router revenue.
-    check("  trader is paid at least the request", paid_to(bundle, TRADER_PH, a_out) >= want)
-    check("  at 0 bps the router keeps nothing and the overage is refunded",
-          paid_to(bundle, ROUTER_PH, a_out) == 0 and paid_to(bundle, TRADER_PH, a_out) == payout,
-          f"trader {paid_to(bundle, TRADER_PH, a_out)} of {payout}")
+    fee_asset = a_in if side == "input" else a_out
+    check("  the trader is paid exactly their share of the payout",
+          paid_to(bundle, TRADER_PH, a_out) == payout - out_fee, f"{paid_to(bundle, TRADER_PH, a_out)} of {payout}")
+    check(f"  the router is paid exactly its rate, on the {side} leg, and nothing on the other",
+          paid_to(bundle, ROUTER_PH, fee_asset) == in_fee + out_fee
+          and paid_to(bundle, ROUTER_PH, a_out if side == "input" else a_in) == 0, f"{in_fee + out_fee}")
+    check("  the payout coin creates only the trader's signed group",
+          settlement_outputs(bundle, a_out, payout)
+          == {(wrapped(a_out, TRADER_PH), payout - out_fee)} | ({(wrapped(a_out, ROUTER_PH), out_fee)} if out_fee else set()))
     check("  successor snapshot is V11 and rebuilds to the successor pool",
           out["pool"]["protocol_version"] == drv.PROTOCOL_VERSION and v14.snapshot_to_pool(out["pool"]).coin.name().hex() == out["forge"]["successor_coin_id"])
-    check("  successor state moved the reserves", [int(x) for x in out["pool"]["state"]["reserves"]][i_in] == r[i_in] + gross)
-    check("  details name the protocol fee and surplus", out["forge"]["protocol_fee"] == honest - payout and out["forge"]["surplus"] == payout - want)
+    check("  successor state moved the reserves by the net", [int(x) for x in out["pool"]["state"]["reserves"]][i_in] == r[i_in] + net)
+    check("  details name the protocol fee, the router fee and no surplus or refund",
+          out["forge"]["protocol_fee"] == honest - payout and out["forge"]["surplus"] == 0 and out["forge"]["refund"] == 0
+          and out["forge"]["router_fee"] == in_fee + out_fee and out["forge"]["router_fee_side"] == side
+          and out["forge"]["offered"] == put_in)
     return out
 
 
-def refund_at_real_rate(label, pool, i_in, i_out, gross, salt):
-    """The quote's safety margin costs the trader nothing, at the RATE WE CHARGE.
-
-    The case above runs the router at 0 bps, which cannot tell "the cap is applied
-    correctly" from "there is no cap". At 300 bps and paying XCH the fee comes off
-    the ENTRY, so the output side owes the router nothing and the whole payout --
-    the notarised floor plus the margin above it -- belongs to the trader.
-
-    This is worth pinning because the margin LOOKS like a fee on screen and the
-    obvious "saving" is to remove it. It is free: measured on chain 2026-09-13, a
-    settled split paid the trader two coins, 375,943 for the request and 1,132 for
-    the margin, totalling exactly the quote. Removing it would only trade a free
-    cushion for a hard refusal.
-    """
-    fee = {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}
-    a_in, a_out = pool.asset_ids[i_in], pool.asset_ids[i_out]
-    net = gross - gross * 300 // 10_000
-    r, w = pool.state[0], pool.weights
-    honest = v14.forge_math.swap_output(r[i_in], r[i_out], net, pool.fee_bps, w[i_in], w[i_out])
-    payout = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
-    want = payout * 97 // 100          # a deliberately wide margin under the payout
-    offer = fabricate_offer({a_in: gross}, {a_out: want}, salt=salt)
-    out = run({"action": "swap", "offer": offer.to_bech32(), "pool": v14.pool_to_snapshot(pool),
-               "current_height": H, "dev_fee": fee})
-    bundle = SpendBundle.from_json_dict(out["bundle"])
-    trader = paid_to(bundle, TRADER_PH, a_out)
-    check(f"  {label}: the margin is refunded, not kept", trader == payout,
-          f"trader {trader} of {payout}, asked {want}")
-    check(f"  {label}: the router takes nothing from the output",
-          paid_to(bundle, ROUTER_PH, a_out) == 0)
-    check(f"  {label}: the router took its rate from the ENTRY",
-          out["forge"]["router_fee_side"] == "input" and out["forge"]["router_fee"] == gross * 300 // 10_000,
-          f"{out['forge']['router_fee']} of {gross}")
-    return out
-
-
-def add_case(label, pool, pct, extra_xch=0, expect_ok=True):
+def add_case(label, pool, pct, extra_xch=0, ask_delta=0, expect_ok=True):
     print(f"add on {label}: {pct}% of each reserve")
     snap, _ = snapshot_roundtrip(pool)
     deposits = [max(1, x * pct // 100) for x in pool.state[0]]
@@ -208,43 +211,39 @@ def add_case(label, pool, pct, extra_xch=0, expect_ok=True):
         offered[a] = d + (honest if a is None else 0)
     if None not in pool.asset_ids:
         offered[None] = honest + extra_xch
-    want = honest * 99 // 100
-    offer = fabricate_offer(offered, {pool.lp_asset_id: want}, salt=0x32)
+    # exact: the deposit asks for what the pool mints, and brings exactly the backing
+    offer = fabricate_offer(offered, {pool.lp_asset_id: honest + ask_delta}, salt=0x32)
     payload = {"action": "add", "offer": offer.to_bech32(), "pool": snap, "current_height": H,
                "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": 0}}
     try:
         out = run(payload)
     except Exception as exc:
-        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:90]}")
+        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:100]}")
         return None
     if not check("  builder accepted the offer", expect_ok):
         return None
     bundle = SpendBundle.from_json_dict(out["bundle"])
     minted = out["forge"]["lp_minted"]
     check("  mint equals the honest quote", minted == honest, f"{minted}")
-    # A deposit is not a trade, so the router has no claim on any part of it. The
-    # depositor asked for a round number and the pool minted a little more; that little
-    # more is theirs. It used to go to the router, which meant every deposit quietly
-    # paid a fee nobody quoted.
-    check("  trader receives at least the requested LP", paid_to(bundle, TRADER_PH, pool.lp_asset_id) >= want)
-    check("  the whole mint reaches the depositor, overage included",
-          paid_to(bundle, TRADER_PH, pool.lp_asset_id) == minted,
+    # A deposit is not a trade, so the router has no claim on any part of it.
+    check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, pool.lp_asset_id) == minted,
           f"{paid_to(bundle, TRADER_PH, pool.lp_asset_id)} of {minted}")
     check("  the router keeps nothing on a deposit", paid_to(bundle, ROUTER_PH, pool.lp_asset_id) == 0)
-    if None not in pool.asset_ids:
-        check("  excess XCH above the backing returns to the DEPOSITOR",
-              paid_to(bundle, TRADER_PH) >= extra_xch and paid_to(bundle, ROUTER_PH) == 0, f"{extra_xch}")
+    check("  no XCH leaves the bundle to anyone: it is all backing", paid_to(bundle, TRADER_PH) == 0 and paid_to(bundle, ROUTER_PH) == 0)
     check("  total_lp grew by the mint", int(out["pool"]["state"]["total_lp"]) == pool.state[1] + minted)
     check("  successor snapshot rebuilds", v14.snapshot_to_pool(out["pool"]).coin.name().hex() == out["forge"]["successor_coin_id"])
     return out
 
 
-def remove_case(label, pool, burn, ask_bps=9_900, expect_ok=True):
+def remove_case(label, pool, burn, ask_delta=0, expect_ok=True):
     print(f"remove on {label}: burn {burn}")
     snap, _ = snapshot_roundtrip(pool)
     vf = v14.forge_math.vault_fee_bps(len(pool.state[0]), 10, pool.fee_bps)
     payouts = v14.forge_math.withdrawal_amounts(pool.state[0], burn, pool.state[1], vf)
-    wants = {a: p * ask_bps // 10_000 for a, p in zip(pool.asset_ids, payouts) if p * ask_bps // 10_000 > 0}
+    wants = {a: p for a, p in zip(pool.asset_ids, payouts) if p > 0}
+    if ask_delta:
+        first = next(iter(wants))
+        wants[first] += ask_delta
     # the trader's LP coin: a CAT of the pool's LP asset, fabricated with a CAT parent
     offer = fabricate_offer({pool.lp_asset_id: burn}, wants, salt=0x33)
     payload = {"action": "remove", "offer": offer.to_bech32(), "pool": snap, "current_height": H,
@@ -252,18 +251,15 @@ def remove_case(label, pool, burn, ask_bps=9_900, expect_ok=True):
     try:
         out = run(payload)
     except Exception as exc:
-        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:90]}")
+        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:100]}")
         return None
     if not check("  builder accepted the offer", expect_ok):
         return None
     bundle = SpendBundle.from_json_dict(out["bundle"])
     for a, p in zip(pool.asset_ids, payouts):
-        w = wants.get(a, 0)
         # As with a deposit: a withdrawal is not a trade. The withdrawer gets every mojo
-        # the pool released, including whatever sits above the number they asked for.
-        check(f"  withdrawer paid at least the request for asset {'XCH' if a is None else a.hex()[:6]}",
-              paid_to(bundle, TRADER_PH, a) >= w)
-        check("  ...and receives the whole payout, the router nothing",
+        # the pool released, in the group they signed; the router nothing.
+        check(f"  withdrawer receives the whole payout of {'XCH' if a is None else a.hex()[:6]}, the router nothing",
               paid_to(bundle, TRADER_PH, a) == p and paid_to(bundle, ROUTER_PH, a) == 0, f"{p}")
     check("  total_lp fell by the burn", int(out["pool"]["state"]["total_lp"]) == pool.state[1] - burn)
     check("  the melt coin is the offered LP settlement's child",
@@ -300,23 +296,33 @@ def main() -> int:
     swap_case("pair (CAT in)", pair, 1, 0, 2_000)
     swap_case("cats", cats, 0, 1, 10_000)
     swap_case("triple (weighted)", triple, 1, 2, 5_000)
-    swap_case("pair, greedy trader", pair, 0, 1, 50_000_000, ask_bps=10_100, expect_ok=False)
-    swap_case("pair, trader asks exactly the payout", pair, 0, 1, 50_000_000, ask_bps=10_000)
+    swap_case("pair, one mojo more than the payout", pair, 0, 1, 50_000_000, ask_delta=1, expect_ok=False)
+    swap_case("pair, one mojo less than the payout (a stale quote)", pair, 0, 1, 50_000_000, ask_delta=-1, expect_ok=False)
+    swap_case("pair, an offer that binds no group (a gift)", pair, 0, 1, 50_000_000, bind=False, expect_ok=False)
 
-    print("the safety margin at the rate we actually charge (300 bps, XCH in):")
-    refund_at_real_rate("pair", pair, 0, 1, 50_000_000, salt=0x7A)
-    refund_at_real_rate("triple", triple, 0, 1, 50_000_000, salt=0x7B)
+    print("the router's rate, inside the trader's signature (300 bps):")
+    swap_case("pair, XCH in: the trader's own spend pays the fee", pair, 0, 1, 50_000_000, bps=300, salt=0x7A)
+    swap_case("pair, XCH out: the fee is a requested payment to the router", pair, 1, 0, 2_000, bps=300, salt=0x7B)
+    swap_case("cats, CAT for CAT: the trader's own spend pays the fee", cats, 0, 1, 10_000, bps=300, salt=0x7C)
+    swap_case("triple, XCH in", triple, 0, 1, 50_000_000, bps=300, salt=0x7D)
+    # (one mojo short is one mojo less put in, and the rate on that floors the same: the
+    # rate holds; a fee short by more than rounding does not)
+    swap_case("pair, XCH in, the fee short", pair, 0, 1, 50_000_000, bps=300, fee_short=10_000, expect_ok=False, salt=0x7E)
+    swap_case("pair, XCH out, the fee short", pair, 1, 0, 2_000, bps=300, fee_short=10_000, expect_ok=False, salt=0x7F)
 
     add_case("pair", pair, 5)
-    add_case("cats (XCH rides only as backing)", cats, 5, extra_xch=1234)
+    add_case("cats (XCH rides only as backing)", cats, 5)
     add_case("triple", triple, 3)
     add_case("vault", vault, 10)
+    add_case("cats, XCH above the backing", cats, 5, extra_xch=1234, expect_ok=False)
+    add_case("pair, one LP less than the mint", pair, 5, ask_delta=-1, expect_ok=False)
 
     remove_case("pair", pair, 20_000)
     remove_case("cats", cats, 5_000)
     remove_case("triple", triple, 7_000)
     remove_case("vault", vault, 10_000)
-    remove_case("pair, greedy trader", pair, 20_000, ask_bps=10_050, expect_ok=False)
+    remove_case("pair, one mojo more than the payout", pair, 20_000, ask_delta=1, expect_ok=False)
+    remove_case("pair, one mojo less than the payout", pair, 20_000, ask_delta=-1, expect_ok=False)
 
     print("lane guards:")
     snap = v14.pool_to_snapshot(pair)

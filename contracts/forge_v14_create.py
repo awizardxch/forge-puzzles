@@ -11,7 +11,9 @@ holds no key:
       eve, the XCH reserve if the pool holds XCH, the fee settlement, and change;
       it also ASSERTS the announcement of the genesis LP payment to the creator,
       so a bundle that mints the genesis LP anywhere else fails the creator's
-      own spend;
+      own spend -- and one announcement of each router spend that binds the pool
+      (the launcher, every reserve launcher, the fee settlement, the registry's
+      `register`), so none of them can be dropped from the bundle it signed for;
     * one CAT coin per CAT asset, spent to that asset's reserve puzzle hash
       (with change back to the creator);
 
@@ -33,6 +35,7 @@ creator spends as the wallet actually signed them) and produces the bundle.
 """
 from __future__ import annotations
 
+import hashlib
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -58,7 +61,36 @@ from forge_v14_offer import OfferRejected, pool_to_snapshot  # noqa: E402
 
 OFFER_PH = bytes32(OFFER_MOD_HASH)
 CREATE_COIN = 51
-ASSERT_PUZZLE_ANNOUNCEMENT = 63
+CREATE_COIN_ANNOUNCEMENT, ASSERT_COIN_ANNOUNCEMENT = 60, 61
+CREATE_PUZZLE_ANNOUNCEMENT, ASSERT_PUZZLE_ANNOUNCEMENT = 62, 63
+
+
+def announcement_binds(spend: CoinSpend) -> list:
+    """The asserts a signed spend adds to require `spend` in its bundle: one per announcement
+    the spend makes, read off the spend as it will run on chain, so nothing here can drift
+    from what the puzzle announces. The CAT layer's own ring announcement -- a 33-byte COIN
+    announcement, 0xcb then the ring hash, emitted by the CAT mod itself -- is the ring's
+    business and is left out. Only that one: a 32-byte hash announced by a non-CAT spend
+    (the registry singleton's) begins 0xcb one time in 256, and dropping it left the
+    creator with nothing to require of that spend."""
+    puzzle, solution = Program.from_bytes(bytes(spend.puzzle_reveal)), Program.from_bytes(bytes(spend.solution))
+    _, conditions = puzzle.run_with_cost(drv.MAX_COST, solution)
+    is_cat = puzzle.uncurry()[0] == CAT_MOD
+    binds = []
+    for condition in conditions.as_iter():
+        if condition.first().atom is None:
+            continue
+        opcode = condition.first().as_int()
+        if opcode not in (CREATE_COIN_ANNOUNCEMENT, CREATE_PUZZLE_ANNOUNCEMENT):
+            continue
+        message = bytes(condition.rest().first().as_atom())
+        if is_cat and opcode == CREATE_COIN_ANNOUNCEMENT and len(message) == 33 and message[:1] == b"\xcb":
+            continue
+        anchor = spend.coin.name() if opcode == CREATE_COIN_ANNOUNCEMENT else spend.coin.puzzle_hash
+        binds.append([opcode + 1, bytes32(hashlib.sha256(bytes(anchor) + message).digest())])
+    if not binds:
+        raise OfferRejected(f"spend {spend.coin.name().hex()[:8]} announces nothing: the creator cannot require it")
+    return binds
 
 
 @dataclass(frozen=True)
@@ -193,30 +225,8 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
     eve_ph = construct_cat_puzzle(CAT_MOD, pool.lp_asset_id, drv.LP_MINT_INNER).get_tree_hash()
     memos = [m.encode("utf-8") for m in (config.name, config.symbol) if m]
     change = int(xch.coin.amount) - need
-    conditions = [
-        [CREATE_COIN, SINGLETON_LAUNCHER_HASH, 1, memos] if memos else [CREATE_COIN, SINGLETON_LAUNCHER_HASH, 1],
-        [CREATE_COIN, eve_ph, 1],
-    ]
-    if xch_index is not None:
-        conditions.append([CREATE_COIN, drv.RESERVE_LAUNCHER_HASH, xch_reserve])   # V14: the launcher, not the reserve
-    conditions.append([CREATE_COIN, OFFER_PH, fee])
-    if change > 0:
-        conditions.append([CREATE_COIN, xch.puzzle.get_tree_hash(), change, [xch.puzzle.get_tree_hash()]])
-    # The creator's bind: the genesis LP must be paid to recipient_ph, or this spend fails.
-    # V14: the creator receives everything above the locked floor; the floor is burned by the same
-    # settlement, and `register` asserts that burn.
-    conditions.append([ASSERT_PUZZLE_ANNOUNCEMENT, lp_payment_announcement(pool.lp_asset_id, launcher_id, recipient_ph,
-                                                                          config.total_lp - drv.LOCKED_BURN)])
-    creator_spends = [make_spend(xch.coin, xch.puzzle, drv.p2_delegated_solution(conditions))]
-    for asset, cat in cats.items():
-        i = config.asset_ids.index(asset)
-        conds = [[CREATE_COIN, drv.RESERVE_LAUNCHER_HASH, config.reserves[i]]]   # V14: CAT-wrapped by the layer
-        if int(cat.coin.amount) > config.reserves[i]:
-            conds.append([CREATE_COIN, cat.inner.get_tree_hash(), int(cat.coin.amount) - config.reserves[i], [cat.inner.get_tree_hash()]])
-        creator_spends.extend(unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
-            cat.coin, asset, cat.inner, drv.p2_delegated_solution(conds), lineage_proof=cat.lineage)]).coin_spends)
 
-    # router side
+    # router side -- built first: the creator's spend asserts what these announce
     launcher = Coin(xch.coin.name(), SINGLETON_LAUNCHER_HASH, uint64(1))
     eve = Coin(xch.coin.name(), eve_ph, uint64(1))
     pool.extra["eve_coin_id"] = eve.name()   # V14: register_solution reads it
@@ -232,9 +242,43 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
                       uint64(int(rec["parent"]["amount"])))
         _, spend = drv.slot_spend(registry, value, parent, bytes32.fromhex(rec["parent_inner_hash"]))
         slot_spends.append(spend)
+    reserve_launchers = drv.reserve_launcher_spends(pool)
     reg_bundle, reg_state = drv.registry_spend(registry, "forge_registry_register", drv.register_solution(pool, left, right),
                                                extra_spends=[])
-    router_spends = [*drv.reserve_launcher_spends(pool), launcher_spend, *eve_spends, *lp_pay, fee_spend, *slot_spends, *reg_bundle.coin_spends]
+    router_spends = [*reserve_launchers, launcher_spend, *eve_spends, *lp_pay, fee_spend, *slot_spends, *reg_bundle.coin_spends]
+
+    # creator side
+    conditions = [
+        [CREATE_COIN, SINGLETON_LAUNCHER_HASH, 1, memos] if memos else [CREATE_COIN, SINGLETON_LAUNCHER_HASH, 1],
+        [CREATE_COIN, eve_ph, 1],
+    ]
+    if xch_index is not None:
+        conditions.append([CREATE_COIN, drv.RESERVE_LAUNCHER_HASH, xch_reserve])   # V14: the launcher, not the reserve
+    conditions.append([CREATE_COIN, OFFER_PH, fee])
+    if change > 0:
+        conditions.append([CREATE_COIN, xch.puzzle.get_tree_hash(), change, [xch.puzzle.get_tree_hash()]])
+    # The creator's bind: the genesis LP must be paid to recipient_ph, or this spend fails.
+    # V14: the creator receives everything above the locked floor; the floor is burned by the same
+    # settlement, and `register` asserts that burn.
+    conditions.append([ASSERT_PUZZLE_ANNOUNCEMENT, lp_payment_announcement(pool.lp_asset_id, launcher_id, recipient_ph,
+                                                                          config.total_lp - drv.LOCKED_BURN)])
+    # The bundle's bind (F1, 2026-10-07 review, confirmed on the simulator): the router's spends
+    # hold no key, so until here whoever put the bundle in a block could drop the registry's
+    # `register` and slot spends -- the only spends that checked the reserve launchers and the
+    # fee -- point those at itself, and reuse the creator's signed spends byte for byte. The
+    # creator's spend therefore asserts an announcement of every router spend that binds the
+    # pool: the singleton launcher's, each reserve launcher's, the fee settlement's and the
+    # registry's own `forge-registered-v14`. A bundle missing any of them fails this spend.
+    for spend in (launcher_spend, *reserve_launchers, fee_spend, *reg_bundle.coin_spends):
+        conditions.extend(announcement_binds(spend))
+    creator_spends = [make_spend(xch.coin, xch.puzzle, drv.p2_delegated_solution(conditions))]
+    for asset, cat in cats.items():
+        i = config.asset_ids.index(asset)
+        conds = [[CREATE_COIN, drv.RESERVE_LAUNCHER_HASH, config.reserves[i]]]   # V14: CAT-wrapped by the layer
+        if int(cat.coin.amount) > config.reserves[i]:
+            conds.append([CREATE_COIN, cat.inner.get_tree_hash(), int(cat.coin.amount) - config.reserves[i], [cat.inner.get_tree_hash()]])
+        creator_spends.extend(unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
+            cat.coin, asset, cat.inner, drv.p2_delegated_solution(conds), lineage_proof=cat.lineage)]).coin_spends)
     registry_after = registry.advance([x.as_int() for x in reg_state.as_iter()])     # RegistryState is [initialized, pool_count]
     return CreationPlan(pool, registry_after, key, left, right, recipient_ph, creator_spends, router_spends, network_fee, {
         "launcher_id": launcher_id.hex(), "lp_asset_id": pool.lp_asset_id.hex(), "key": key.hex(),
@@ -282,6 +326,8 @@ def record_patch(plan_: CreationPlan, registry_record: dict[str, Any]) -> dict[s
             "label": plan_.details.get("symbol") or plan_.details["launcher_id"][:12],
             "emoji": plan_.details.get("name", ""), "symbol": plan_.details.get("symbol", ""),
             "key": key, "lp_recipient_ph": plan_.recipient_ph.hex(),
+            # Which registry admitted it: a network may roll its registry over (forge_v14_index.pool_registry_id).
+            "registry_launcher_id": registry_record.get("launcher_id"),
             "launcher_parent": pool.launcher_parent.hex(), "launcher_id": pool.launcher_id.hex(), "lp_asset_id": pool.lp_asset_id.hex(),
             "asset_ids": [None if a is None else a.hex() for a in pool.asset_ids], "weights": pool.weights,
             "fee_bps": pool.fee_bps, "protocol_fee_bps": pool.protocol_fee_bps, "protocol_ph": pool.protocol_ph.hex(),

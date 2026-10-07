@@ -31,7 +31,10 @@ import forge_v14_driver as drv  # noqa: E402
 from forge_v14_driver import replace  # noqa: E402
 from forge_v14_offer import pool_to_snapshot, snapshot_to_pool  # noqa: E402
 
-DEFAULT_NODE = "https://testnet11.api.coinset.org"
+import forge_network as _forge_network  # noqa: E402
+
+# The node of the network this runs against (FORGE_NETWORK / FORGE_NODE_URL).
+DEFAULT_NODE = _forge_network.node_url()
 MAX_WALK_DEPTH = 64
 
 

@@ -29,7 +29,10 @@ from chia_rs import Coin, G1Element  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 from chia_rs.sized_ints import uint64  # noqa: E402
 
-from forge_v14_offer import OfferRejected, _trader_ph  # noqa: E402
+from chia.types.blockchain_format.program import Program  # noqa: E402
+from chia.types.coin_spend import make_spend  # noqa: E402
+
+from forge_v14_offer import MAX_REVEAL_COST, OfferRejected, _reveal_conditions, bound_groups  # noqa: E402
 
 BUILDER = Path(__file__).resolve().parent / "forge_offer_build.py"
 IDENTITY = puzzle_for_pk(G1Element())
@@ -77,30 +80,47 @@ def relayed_with_prepended_group(offer: Offer) -> Offer:
     return Offer(requested, offer._bundle, offer.driver_dict)
 
 
+# Since 2026-10-07 (F3) a pool pays ONLY the groups the maker's signed spends assert, and
+# exactly what they add up to: there is no refund to aim, and a group a relayer adds is
+# refused outright rather than paid.
+def refused(label: str, fn) -> None:
+    try:
+        fn()
+        check(label, False, "no refusal")
+    except OfferRejected as exc:
+        check(label, "not asserted by the maker's signed spends" in str(exc), str(exc))
+
+
 print("an honest offer:")
 offer = maker_offer()
-check("the maker's spend asserts its payment group", _trader_ph(offer, CAT_ASSET) == TRADER_PH, str(_trader_ph(offer, CAT_ASSET)))
-first = offer.get_requested_payments()[CAT_ASSET][0]
-check("(and the first requested payment is the maker's, so the old rule agreed here)", bytes32(first.puzzle_hash) == TRADER_PH)
+groups = bound_groups(offer, CAT_ASSET)
+check("the maker's spend asserts its payment group, and that group is what the pool pays",
+      len(groups) == 1 and bytes32(groups[0].rest().first().first().as_atom()) == TRADER_PH)
 
 print("\nthe same offer after a relayer prepends a 1-mojo group:")
 relayed = relayed_with_prepended_group(offer)
 first = relayed.get_requested_payments()[CAT_ASSET][0]
 check("the first requested payment is now the relayer's (the old refund destination)", bytes32(first.puzzle_hash) == ATTACKER_PH)
-check("the refund still goes to the maker's group", _trader_ph(relayed, CAT_ASSET) == TRADER_PH, str(_trader_ph(relayed, CAT_ASSET)))
+refused("the relayer's group is not paid: the offer is refused", lambda: bound_groups(relayed, CAT_ASSET))
 
-print("\nan offer whose groups the maker never asserted:")
+print("\nan offer whose groups the maker never asserted (a gift, not an offer):")
 only_theirs = dict(offer.requested_payments)
 only_theirs[CAT_ASSET] = [NotarizedPayment(ATTACKER_PH, uint64(7_500), [ATTACKER_PH], bytes32.fromhex("77" * 32))]
 unbound = Offer(only_theirs, offer._bundle, offer.driver_dict)
-try:
-    _trader_ph(unbound, CAT_ASSET)
-    check("is refused rather than paid to a stranger", False, "no refusal")
-except OfferRejected as exc:
-    check("is refused rather than paid to a stranger", "bound by the maker's signed spends" in str(exc), str(exc))
+refused("is refused rather than paid to a stranger", lambda: bound_groups(unbound, CAT_ASSET))
 
 print("\nno payment of the asset at all:")
-check("answers None (the LP-add path keeps its fallback)", _trader_ph(offer, None) is None)
+check("answers no groups", bound_groups(offer, None) == [])
+
+# F2 (2026-10-07 review): the maker's reveals used to run with no cost limit, so a looping
+# puzzle in an offer string would hold the responder in _asserted_announcements for good.
+print("\nthe maker's reveal runs under a cost cap (F2):")
+quoted = Program.to((1, [[63, b"\x01" * 32]]))   # (q (63 0x01..)): announces one assertion, costs a little
+reveal = make_spend(Coin(bytes32(b"\x11" * 32), quoted.get_tree_hash(), uint64(1)), quoted, Program.to([]))
+check("the cap is the block cost limit forge_offer applies", MAX_REVEAL_COST == 11_000_000_000)
+conditions = _reveal_conditions(reveal)
+check("a reveal within the cap is read", conditions is not None and conditions.first().first().as_int() == 63)
+check("the same reveal past the cap is None, not a hang", _reveal_conditions(reveal, max_cost=1) is None)
 
 print()
 if FAILED:

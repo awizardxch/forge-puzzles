@@ -16,6 +16,7 @@ from chia.types.blockchain_format.coin import Coin
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, LineageProof, construct_cat_puzzle
 from chia.util.bech32m import decode_puzzle_hash
 from chia.wallet.trading.offer import Offer
+from untrusted_clvm import offer_from_bech32
 from chia_rs import G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
@@ -76,7 +77,11 @@ def _lane_version(payload: dict) -> int:
         versions.add(int(declared))
     if len(versions) > 1:
         raise ValueError(f"a bundle cannot mix Forge revisions: {sorted(versions)}")
-    return versions.pop() if versions else 13          # V12 is the shipping revision
+    # Nothing declared and no snapshot to read it from (a creation): the newest lane
+    # this build carries. This said 13 long after V14 shipped, so a creation through
+    # api/forge-create was built by the retired V13 lane where its sources exist and
+    # refused outright where they are pruned (forge-ui) -- found 2026-10-01.
+    return versions.pop() if versions else max(_LANES)
 
 
 def _lane(payload: dict):
@@ -325,6 +330,11 @@ def _dev_fee(payload: dict[str, Any]) -> tuple[bytes32 | None, int]:
     if not raw:
         return None, 0
     text = str(raw).strip()
+    if text.startswith(("xch1", "txch1")):
+        # The router's fee is paid to this address on THIS network; a txch1 recipient
+        # on a mainnet responder (or the reverse) is a misconfiguration, refused.
+        import forge_network as _net
+        _net.check_address_network(text, "router fee recipient")
     recipient = (decode_puzzle_hash(text) if text.startswith(("xch1", "txch1"))
                  else _bytes32(text))
     return recipient, int(dev_fee.get("bps") or 0)
@@ -407,38 +417,28 @@ def _lane_pool(snapshot: dict[str, Any]):
     return lane[0].snapshot_to_pool(snapshot)
 
 
-def _trader_ph_for(offer: Offer) -> bytes32 | None:
-    """A puzzle hash the trader named in their own offer, to send their change back to."""
-    for payments in offer.get_requested_payments().values():
-        if payments:
-            return bytes32(payments[0].puzzle_hash)
-    return None
-
-
 def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height: int, surplus_ph: bytes32 | None,
                       fee_bps: int = 0) -> dict[str, Any]:
     """The multi-pool lanes, all through the lane's own route composer. The payload
     contracts are the V10 lanes' (see the branches of `build` below); the successor
     snapshots come back one per distinct pool, in first-use order.
 
-    The router's fee is taken ONCE, on the entry, before the route spends a coin. That
-    leaves these lanes with no fee arithmetic of their own: LP, protocol and DAO are all
-    inside the puzzle and are already paid out of each hop's own output by the leaf. It
-    also means the overage at the end of a route belongs to the trader -- it is the gap
-    between what the pools actually released and what they asked for, nothing more -- so
-    `surplus_ph` here is the TRADER, not the router. It used to be the router, unbounded,
-    which handed over every mojo of a widened slippage tolerance.
+    The router's fee is paid ONCE, on the entry, by the trader's own spend, before the
+    route spends a coin. That leaves these lanes with no fee arithmetic of their own: LP,
+    protocol and DAO are all inside the puzzle and are already paid out of each hop's own
+    output by the leaf. A route pays out exactly what the offer asks for, in the groups
+    the trader signed; there is no overage and no one to send it to (F3, 2026-10-07).
     """
     off, rt, cre, drv = _lane(payload)
     fee_ph = surplus_ph if fee_bps > 0 else None
-    trader = _trader_ph_for(offer)
-    if trader is not None:
-        surplus_ph = trader
+    # `preview`: size the route from the offer's coins and report what it releases and the
+    # fee it needs, without settling -- the exact figures an offer must carry.
+    preview = bool(payload.get("preview"))
     if action == "multihop-swap":
         pools = [_lane_pool(entry) for entry in payload["pools"]]
         surplus = surplus_ph if surplus_ph is not None else pools[0].protocol_ph
         result = rt.multihop_swap(pools, [_bytes32(str(a)) for a in payload["path"]], offer, height, surplus,
-                                  fee_bps, fee_ph)
+                                  fee_bps, fee_ph, preview=preview)
         extra = {"amounts": [str(a) for a in result.details["amounts"]],
                  "dev_fee_collected": str(result.details.get("router_fee", 0))}
         if "wrap" in result.details:
@@ -447,17 +447,21 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
         branches = [([_lane_pool(entry) for entry in b["pools"]], [_bytes32(str(a)) for a in b["path"]], int(b["amountIn"]))
                     for b in payload["branches"]]
         surplus = surplus_ph if surplus_ph is not None else branches[0][0][0].protocol_ph
-        result = rt.split_swap(branches, offer, height, surplus, fee_bps, fee_ph)
+        # Dexie open offers taken inside the same bundle (fixed-size, so each is taken whole).
+        externals = [offer_from_bech32(o) for o in payload.get("dexieOffers") or []]
+        result = rt.split_swap(branches, offer, height, surplus, fee_bps, fee_ph, externals=externals, preview=preview)
         extra = {"branch_amounts": [[str(a) for a in amounts] for amounts in result.details["branch_amounts"]],
                  "total_out": str(result.details["total_out"]),
-                 "dev_fee_collected": str(result.details.get("router_fee", 0))}
+                 "dev_fee_collected": str(result.details.get("router_fee", 0)),
+                 **({"taken_offers": [{k: str(v) for k, v in t.items()} for t in result.details["taken_offers"]]}
+                    if result.details.get("taken_offers") else {})}
     elif action == "flow-balance":
         specs = [(_lane_pool(leg["pool"]), _bytes32(str(leg["assetIn"])), _bytes32(str(leg["assetOut"])), int(leg["amountIn"]))
                  for leg in payload["legs"]]
         start_raw = str(payload.get("startAsset") or "").strip()
         start = _bytes32(start_raw) if start_raw and start_raw.lower() not in ("txch", "xch", "0" * 64) else ZERO_32
         surplus = surplus_ph if surplus_ph is not None else specs[0][0].protocol_ph
-        result = rt.flow_balance(specs, offer, height, surplus, start, fee_bps, fee_ph)
+        result = rt.flow_balance(specs, offer, height, surplus, start, fee_bps, fee_ph, preview=preview)
         extra = {"leg_amounts": [[str(a), str(b)] for a, b in result.details["leg_amounts"]],
                  "total_out": str(result.details["total_out"])}
     elif action == "routed-deposit":
@@ -465,7 +469,7 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
         sales = [([_lane_pool(entry) for entry in sale["pools"]], [_bytes32(str(a)) for a in sale["path"]], int(sale["amountIn"]))
                  for sale in payload.get("sales", [])]
         result = rt.routed_deposit(target, sales, offer, height,
-                               surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph)
+                               surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview)
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
         extra = {"target": off.pool_to_snapshot(target_after),
                  "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
@@ -475,10 +479,17 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
     elif action == "vault-route":
         swap_pool, vault = _lane_pool(payload["swapPool"]), _lane_pool(payload["vault"])
         result = rt.vault_route(swap_pool, _bytes32(str(payload["assetIn"])), vault, offer, height,
-                                  surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph)
+                                  surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph, preview=preview)
         extra = {"swap_out": str(result.details["swap_out"]), "redeemed": str(result.details["redeemed"])}
     else:
         raise ValueError(f"unknown route lane {action!r}")
+    if preview:
+        return {
+            "success": True, "action": action, "preview": True,
+            "pools": [off.pool_to_snapshot(pool) for pool in result.pools],
+            "forge": {k: v for k, v in result.details.items() if k not in ("deposits",)},
+            **extra,
+        }
     return {
         "success": True,
         "action": action,
@@ -494,6 +505,53 @@ def _route_hex(asset) -> str:
     return _bytes32(str(asset)).hex()
 
 
+def _probe_asset(raw: Any) -> bytes32 | None:
+    text = str(raw or "").strip().lower().removeprefix("0x")
+    return None if text in ("", "txch", "xch", "0" * 64) else _bytes32(text)
+
+
+def _probe_offer(probe: dict[str, Any]) -> Offer:
+    """A stand-in offer for a preview: keyless `(1)` coins with fabricated parents creating
+    the settlements of `offered` (asset -> amount) and asking one unit of each `requested`
+    asset. It is never validated or pushed; the composer only reads the settlement amounts
+    and the requested assets to size the route."""
+    from chia.types.blockchain_format.program import Program
+    from chia.types.coin_spend import make_spend
+    from chia.wallet.cat_wallet.cat_utils import SpendableCAT, unsigned_spend_bundle_for_spendable_cats
+    from chia.wallet.conditions import CreateCoin
+    from chia.wallet.puzzle_drivers import PuzzleInfo
+    from chia.wallet.trading.offer import OFFER_MOD_HASH
+    from chia_rs import SpendBundle
+
+    identity = Program.to(1)
+    identity_hash = identity.get_tree_hash()
+    trader_ph = bytes32(b"\x11" * 32)
+    coins, spends = [], []
+    for i, (asset_raw, amount_raw) in enumerate(dict(probe.get("offered") or {}).items()):
+        asset, amount = _probe_asset(asset_raw), int(amount_raw)
+        if amount <= 0:
+            raise ValueError("a probe offers positive amounts only")
+        grand = bytes32(bytes([0x50 + i]) * 32)
+        conditions = Program.to([[51, OFFER_MOD_HASH, amount]])
+        if asset is None:
+            coin = Coin(grand, identity_hash, uint64(amount))
+            spends.append(make_spend(coin, identity, conditions))
+        else:
+            # the CAT layer checks the coin's parent against its lineage proof, so the
+            # fabricated parent is a CAT of the same inner at the grandparent
+            outer = construct_cat_puzzle(CAT_MOD, asset, identity).get_tree_hash()
+            coin = Coin(Coin(grand, outer, uint64(amount)).name(), outer, uint64(amount))
+            spends.extend(unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
+                coin, asset, identity, conditions,
+                lineage_proof=LineageProof(grand, identity_hash, uint64(amount)))]).coin_spends)
+        coins.append(coin)
+    requested = {_probe_asset(raw): [CreateCoin(trader_ph, uint64(1), [trader_ph])] for raw in probe.get("requested") or []}
+    if not coins or not requested:
+        raise ValueError("a probe needs offered amounts and at least one requested asset")
+    driver = {a: PuzzleInfo({"type": "CAT", "tail": "0x" + a.hex()}) for a in requested if a is not None}
+    return Offer(Offer.notarize_payments(requested, coins), SpendBundle(spends, G2Element()), driver)
+
+
 CREATE_LANES = ("prepare-create", "create", "commit-create")
 
 
@@ -502,8 +560,18 @@ def _lane_registry(record: dict[str, Any], drv):
     from dataclasses import replace as _replace
     from chia.wallet.lineage_proof import LineageProof
     from chia_rs.sized_ints import uint64 as _u64
+    # Every curried constant, the protocol (dev fee) recipient included: left out, it fell
+    # back to the treasury, which rebuilt the RIGHT registry only while the two were the
+    # same wallet. Launched with separate addresses (2026-10-05), it would rebuild a
+    # registry that does not exist and every site creation would fail.
+    # The scale and window stay the driver's constants, which every V14 record carries:
+    # the record reaches here through JavaScript (api/forge-create.js), and JSON there
+    # turns price_scale = 2**64 into 18446744073709552000.
+    extra = {}
+    if record.get("protocol_ph"):
+        extra["protocol_ph"] = _bytes32(record["protocol_ph"])
     reg = drv.make_registry(creation_fee=int(record["creation_fee"]), treasury_ph=_bytes32(record["treasury_ph"]),
-                                launcher_parent=_bytes32(record["launcher_parent"]), state=list(record["state"]))
+                            launcher_parent=_bytes32(record["launcher_parent"]), state=list(record["state"]), **extra)
     coin = _coin(record["coin"])
     lin = record["lineage"]
     lineage = LineageProof(_bytes32(lin["parent_name"]), None if lin.get("inner_puzzle_hash") is None else _bytes32(lin["inner_puzzle_hash"]),
@@ -511,8 +579,12 @@ def _lane_registry(record: dict[str, Any], drv):
     return _replace(reg, coin=coin, lineage=lineage)
 
 
-def _creator_coins(payload: dict[str, Any]):
-    """The creator's coins with their own puzzle reveals: {xch: {coin, puzzle_reveal}, cats: [{asset_id, coin, inner_puzzle, lineage_proof}]}."""
+def _creator_coins(payload: dict[str, Any], cre):
+    """The creator's coins with their own puzzle reveals: {xch: {coin, puzzle_reveal}, cats: [{asset_id, coin, inner_puzzle, lineage_proof}]}.
+
+    `cre` is the lane's creation module. This read a module-level `cre` that does not
+    exist, so every prepare-create through this dispatcher raised NameError (found
+    2026-10-01, the first time a creation ran through api/forge-create end to end)."""
     from chia.types.blockchain_format.program import Program as _P
     from chia.wallet.lineage_proof import LineageProof
     from chia_rs.sized_ints import uint64 as _u64
@@ -541,8 +613,8 @@ def _creation_config(payload: dict[str, Any], cre) -> "cre.CreationConfig":
     state = {"pools": []}
     try:
         import json as _json
-        _records = Path(__file__).resolve().parent.parent / ".awizard"
-        _default = _records / "v14-testnet.json" if (_records / "v14-testnet.json").is_file() else _records / "v13-testnet.json"
+        import forge_network as _net
+        _default = _net.record_path("v14")
         state = _json.loads(Path(payload.get("record_path") or _default).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- names of nested LP assets fall back to their ids
         pass
@@ -564,7 +636,7 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     if action == "commit-create":
         return cre.commit_record(payload["record_path"], payload["record_patch"])
     registry = _lane_registry(payload["registry"], drv)
-    xch, cats = _creator_coins(payload)
+    xch, cats = _creator_coins(payload, cre)
     plan = cre.plan(registry, payload["registry"]["slots"], _creation_config(payload, cre), xch, cats,
                      _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0))
     out = {"success": True, "action": action, **cre.plan_json(plan)}
@@ -593,7 +665,13 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).lower()
     if action in CREATE_LANES and isinstance(payload.get("registry"), dict) or action == "commit-create":
         return _build_lane_create(action, payload)
-    offer = Offer.from_bech32(str(payload["offer"]))
+    if payload.get("preview") and not payload.get("offer") and isinstance(payload.get("probe"), dict):
+        # A preview sized from amounts alone: a probe offer stands in for the trader's, so
+        # a page can ask what a route releases -- and what it must therefore ask for
+        # exactly -- before the wallet has built anything (F3, 2026-10-07).
+        offer = _probe_offer(payload["probe"])
+    else:
+        offer = offer_from_bech32(payload["offer"])
     # The action-layer revisions (14 = V13, 15 = V14) take the versioned lane; _lane() picks which.
     if any(int(snapshot.get("protocol_version") or 0) in _LANES for snapshot in _pool_snapshots(payload)):
         return _build_lane(action, payload, offer)
