@@ -37,47 +37,58 @@ CONTRACTS = ROOT / "contracts"
 # (importing file, imported module) -> why this crossing is allowed to exist.
 # A crossing not listed here fails the run. Adding a line is cheap; the point is that
 # it has to be a sentence someone wrote, not something that accumulated.
-SIM = ("the design simulations that decided V14. They run the candidate against the "
+SIM = ("the design simulations that decided V14 (carried into V15 unchanged). They run the candidate against the "
        "V13 build, because a fix is only shown to fix something by failing first; "
        "the rejected routes ship for the same reason")
 
+LIVE_SECONDARY = ("V14 is not retired: the owner kept it live beside V15 (2026-10-07). Its pools "
+                  "stay on chain undrained, its lane ships in every slice and is imported "
+                  "unconditionally; a creation takes the newest lane")
+
 ARGUED: dict[tuple[str, str], str] = {
+    ("forge_stdin.py", "forge_v14_offer"): LIVE_SECONDARY,
+    ("forge_stdin.py", "forge_v14_route"): LIVE_SECONDARY,
+    ("forge_stdin.py", "forge_v14_create"): LIVE_SECONDARY,
+    ("forge_stdin.py", "forge_v14_driver"): LIVE_SECONDARY,
+    ("forge_v15_route.py", "forge_v14_driver"): LIVE_SECONDARY + "; the composer spends a V14 pool on a route with its own driver",
+    ("_test_v15_route_lane.py", "_v14_testkit"): LIVE_SECONDARY + "; the mixed-revision route case builds a V14 pool",
+    ("_test_v15_route_lane.py", "forge_v14_offer"): LIVE_SECONDARY + "; its snapshot is the V14 lane's",
     ("forge_stdin.py", "forge_v13_offer"):
         "the retired lane is optional and guarded by try/ImportError; it serves pools "
         "whose record is still read back, and its absence is reported by _lane",
     ("forge_stdin.py", "forge_v13_route"): "same optional lane",
     ("forge_stdin.py", "forge_v13_create"): "same optional lane",
     ("forge_stdin.py", "forge_v13_driver"): "same optional lane",
-    ("_test_v14_chip0062_audit.py", "_v11_testkit"):
+    ("_test_v15_chip0062_audit.py", "_v11_testkit"):
         "the CHIP-0062 audit read contracts/v11, so every finding is built against V11 "
         "first: a finding that cannot be demonstrated where the auditors found it is as "
         "much a failure as one V14 still allows",
-    ("_test_v14_consensus_timelocks.py", "_v11_testkit"):
-        "the before/after control: it proves V11 asserted no birth height where V14 "
+    ("_test_v15_consensus_timelocks.py", "_v11_testkit"):
+        "the before/after control: it proves V11 asserted no birth height where V15 "
         "does, which cannot be shown without building a V11 pool",
-    ("_test_v14_before_after.py", "_v13_testkit"):
-        "the before/after control: every V14 change is run against the V13 build too",
-    ("_sim_v14_action_binding.py", "_v13_testkit"):
+    ("_test_v15_before_after.py", "_v13_testkit"):
+        "the before/after control: every V14 change, carried into V15, is run against the V13 build too",
+    ("_sim_v15_action_binding.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_binding_all_actions.py", "_v13_testkit"):
+    ("_sim_v15_binding_all_actions.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_binding_all_actions.py", "forge_v13_driver"):
+    ("_sim_v15_binding_all_actions.py", "forge_v13_driver"):
         SIM,
-    ("_sim_v14_layered_cats.py", "_v13_testkit"):
+    ("_sim_v15_layered_cats.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_r1_candidates.py", "_v13_testkit"):
+    ("_sim_v15_r1_candidates.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_r1_candidates.py", "forge_v13_driver"):
+    ("_sim_v15_r1_candidates.py", "forge_v13_driver"):
         SIM,
-    ("_sim_v14_r1_routes.py", "_test_v13_registry"):
+    ("_sim_v15_r1_routes.py", "_test_v13_registry"):
         SIM,
-    ("_sim_v14_r1_routes.py", "_v13_testkit"):
+    ("_sim_v15_r1_routes.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_review_corrections.py", "_v13_testkit"):
+    ("_sim_v15_review_corrections.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_settlement_amount.py", "_v13_testkit"):
+    ("_sim_v15_settlement_amount.py", "_v13_testkit"):
         SIM,
-    ("_sim_v14_settlement_amount.py", "forge_v13_driver"):
+    ("_sim_v15_settlement_amount.py", "forge_v13_driver"):
         SIM,
 }
 

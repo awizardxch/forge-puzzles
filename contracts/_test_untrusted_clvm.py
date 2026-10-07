@@ -161,7 +161,7 @@ GUARDED = {
     "forge_stdin_nasset.py": re.compile(r"Offer\.from_bech32\("),
     "forge_create_pool.py": re.compile(r"Offer\.from_bech32\("),
     # Its own compiled modules may use the raw parser; nothing in it may `.run(` uncapped.
-    "forge_v14_driver.py": re.compile(r"(?<!subprocess)\.run\("),
+    "forge_v15_driver.py": re.compile(r"(?<!subprocess)\.run\("),
 }
 for name, pattern in GUARDED.items():
     hits = [f"{i}: {line.strip()}" for i, line in enumerate((HERE / name).read_text(encoding="utf-8").splitlines(), 1)

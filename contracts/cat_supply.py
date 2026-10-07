@@ -38,7 +38,7 @@ from chia.wallet.uncurried_puzzle import uncurry_puzzle  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 
 import forge_network as _forge_network  # noqa: E402
-from forge_v14_price_history import Rpc, _strip, node_rpc  # noqa: E402
+from forge_v15_price_history import Rpc, _strip, node_rpc  # noqa: E402
 from wallet_holdings import cat_puzzle_hash  # noqa: E402
 
 DEFAULT_NODE = _forge_network.node_url()

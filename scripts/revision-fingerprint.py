@@ -65,7 +65,7 @@ def fingerprint(base: Path) -> tuple[str, list[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--revision", default="contracts/v14",
+    ap.add_argument("--revision", default="contracts/v15",
                     help="directory to fingerprint, relative to the repo root")
     ap.add_argument("--files", action="store_true", help="print every file's line too")
     ap.add_argument("--expect", help="fail if the digest is not this")

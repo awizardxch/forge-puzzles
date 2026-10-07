@@ -25,7 +25,7 @@ The record is handled as TEXT until Python parses it: it carries integers past 2
 silently rounds -- 114 of them in testnet11's record.
 
 stdin:  {"action": "check" | "upload", "network": "mainnet", "node_url": "...",
-         "record_text": "...", "held_path": "/data/v14-mainnet.json"}
+         "record_text": "...", "held_path": "/data/v15-mainnet.json"}
         check: verifies record_text, or the held file when record_text is absent.
         upload: verifies record_text, merges it into held_path, writes held_path.
 stdout: {"success": true, "summary": {...}, ...} or {"success": false, "code": ..., "error": ...}
@@ -44,7 +44,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import forge_v14_driver as drv  # noqa: E402
+import forge_v15_driver as drv  # noqa: E402
 from chia.util.bech32m import encode_puzzle_hash  # noqa: E402
 from forge_stdin import _lane_registry  # noqa: E402
 
@@ -116,6 +116,7 @@ def verify(record: dict[str, Any], network: str, node_url: str | None, prefix: s
         "treasury": encode_puzzle_hash(bare.treasury_ph, prefix),
         "protocol": encode_puzzle_hash(bare.protocol_ph, prefix),
         "creation_fee": int(registry["creation_fee"]),
+        "current_fee": bare.current_fee,          # V15: the fee in state, what register charges now
         "pools": len(record.get("pools") or []),
         "retired_registries": [r.get("launcher_id") for r in record.get("retired_registries") or []],
         "checked_on_chain": bool(node_url),

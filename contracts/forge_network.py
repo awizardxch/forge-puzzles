@@ -41,7 +41,7 @@ def address_prefix() -> str:
     return facts()["hrp"]
 
 
-def record_path(revision_tag: str = "v14") -> Path:
+def record_path(revision_tag: str = "v15") -> Path:
     """`.awizard/v14-testnet.json` on testnet (unchanged), `v14-mainnet.json` on mainnet.
     A state directory (AWIZARD_STATE_DIR / the platform volume) wins when it holds one."""
     name = f"{revision_tag}-{facts()['record_suffix']}.json"

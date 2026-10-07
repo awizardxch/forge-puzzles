@@ -32,7 +32,7 @@ from chia_rs.sized_ints import uint64  # noqa: E402
 from chia.types.blockchain_format.program import Program  # noqa: E402
 from chia.types.coin_spend import make_spend  # noqa: E402
 
-from forge_v14_offer import MAX_REVEAL_COST, OfferRejected, _reveal_conditions, bound_groups  # noqa: E402
+from forge_v15_offer import MAX_REVEAL_COST, OfferRejected, _reveal_conditions, bound_groups  # noqa: E402
 
 BUILDER = Path(__file__).resolve().parent / "forge_offer_build.py"
 IDENTITY = puzzle_for_pk(G1Element())

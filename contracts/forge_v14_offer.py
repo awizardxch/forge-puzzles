@@ -126,6 +126,10 @@ def pool_to_snapshot(pool: drv.V14Pool) -> dict[str, Any]:
         # What V10 called the pool module: the puzzle every V11 pool's inner is an
         # instance of. The frontend only asks that these two are strings.
         "pool_module_hash": _hex(drv.ACTION_LAYER.get_tree_hash()),
+        # The action layer is shared by V14 and V15, so the index tells revisions apart by the
+        # LP TAIL mod hash, which every revision changes (its PROTOCOL_VERSION is curried
+        # into every LP coin). api/_deploymentIndex.js believes the (action, tail) pair.
+        "revision_hash": _hex(drv.LP_TAIL_MOD.get_tree_hash()),
         "reserve_inner_puzzle_hash": _hex(pool.reserves[0].inner_hash),
         "reserve_inner_puzzle_hashes": [_hex(r.inner_hash) for r in pool.reserves],
         "launcher_id": _hex(pool.launcher_id),

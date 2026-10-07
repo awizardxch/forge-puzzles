@@ -1,0 +1,463 @@
+{
+ "target": [
+  {
+   "shape": "A1 2-asset even",
+   "assets": 2,
+   "weights": [
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20
+   ],
+   "left_ideal": [
+    10000000,
+    20
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "A3 all-CAT",
+   "assets": 2,
+   "weights": [
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    50,
+    50
+   ],
+   "left_ideal": [
+    50,
+    50
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "B1 vault (n=1)",
+   "assets": 1,
+   "weights": [
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 0.99550224,
+   "left": [
+    150499
+   ],
+   "left_ideal": [
+    500
+   ],
+   "vault_fee_bps": 30,
+   "exact_residual": true,
+   "residual_is_fee_bearing": true,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "C1 weighted 4:1",
+   "assets": 2,
+   "weights": [
+    4,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20
+   ],
+   "left_ideal": [
+    10000000,
+    20
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "D1 3-asset",
+   "assets": 3,
+   "weights": [
+    1,
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20,
+    30
+   ],
+   "left_ideal": [
+    10000000,
+    20,
+    30
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "D2 5-asset",
+   "assets": 5,
+   "weights": [
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20,
+    30,
+    40,
+    5
+   ],
+   "left_ideal": [
+    10000000,
+    20,
+    30,
+    40,
+    5
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "D3 weighted 4:1:1",
+   "assets": 3,
+   "weights": [
+    4,
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20,
+    30
+   ],
+   "left_ideal": [
+    10000000,
+    20,
+    30
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "E1 zero fee",
+   "assets": 2,
+   "weights": [
+    1,
+    1
+   ],
+   "fee_bps": 0,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20
+   ],
+   "left_ideal": [
+    10000000,
+    20
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "E2 max fee",
+   "assets": 2,
+   "weights": [
+    1,
+    1
+   ],
+   "fee_bps": 1000,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20
+   ],
+   "left_ideal": [
+    10000000,
+    20
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "H2 weighted 8:1",
+   "assets": 2,
+   "weights": [
+    8,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    10000000,
+    20
+   ],
+   "left_ideal": [
+    10000000,
+    20
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "lopsided reserves",
+   "assets": 2,
+   "weights": [
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    1000000000,
+    1
+   ],
+   "left_ideal": [
+    1000000000,
+    0
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  },
+  {
+   "shape": "tiny pool",
+   "assets": 2,
+   "weights": [
+    1,
+    1
+   ],
+   "fee_bps": 30,
+   "exit_full": true,
+   "recovered": 1.0,
+   "left": [
+    1,
+    1
+   ],
+   "left_ideal": [
+    0,
+    0
+   ],
+   "vault_fee_bps": 0,
+   "exact_residual": true,
+   "residual_is_fee_bearing": false,
+   "reenterable": true,
+   "vpl_holds": true,
+   "round_trip_safe": true
+  }
+ ],
+ "adversarial": [
+  {
+   "probe": "swap_round_trip",
+   "worst_gain": -3
+  },
+  {
+   "probe": "invariant_bits",
+   "max_bits": 499
+  },
+  {
+   "probe": "granularity",
+   "shape": "A1 2-asset even",
+   "min_deposit": 10000000,
+   "min_swap": 501506
+  },
+  {
+   "probe": "granularity",
+   "shape": "A3 all-CAT",
+   "min_deposit": 50,
+   "min_swap": 3
+  },
+  {
+   "probe": "granularity",
+   "shape": "B1 vault (n=1)",
+   "min_deposit": 501,
+   "min_swap": null
+  },
+  {
+   "probe": "granularity",
+   "shape": "C1 weighted 4:1",
+   "min_deposit": 10000000,
+   "min_swap": 125378
+  },
+  {
+   "probe": "granularity",
+   "shape": "D1 3-asset",
+   "min_deposit": 10000000,
+   "min_swap": 501506
+  },
+  {
+   "probe": "granularity",
+   "shape": "D2 5-asset",
+   "min_deposit": 10000000,
+   "min_swap": 501506
+  },
+  {
+   "probe": "granularity",
+   "shape": "D3 weighted 4:1:1",
+   "min_deposit": 10000000,
+   "min_swap": 125378
+  },
+  {
+   "probe": "granularity",
+   "shape": "E1 zero fee",
+   "min_deposit": 10000000,
+   "min_swap": 500001
+  },
+  {
+   "probe": "granularity",
+   "shape": "E2 max fee",
+   "min_deposit": 10000000,
+   "min_swap": 555557
+  },
+  {
+   "probe": "granularity",
+   "shape": "H2 weighted 8:1",
+   "min_deposit": 10000000,
+   "min_swap": 62690
+  },
+  {
+   "probe": "granularity",
+   "shape": "lopsided reserves",
+   "min_deposit": 1,
+   "min_swap": 25075225677032
+  },
+  {
+   "probe": "granularity",
+   "shape": "tiny pool",
+   "min_deposit": 1,
+   "min_swap": 2
+  },
+  {
+   "probe": "random_sequences",
+   "n": 400,
+   "drops": 0
+  },
+  {
+   "probe": "fragmentation",
+   "stake": 0.01,
+   "fee_recovered": 0.0
+  },
+  {
+   "probe": "fragmentation",
+   "stake": 0.1,
+   "fee_recovered": 0.048
+  },
+  {
+   "probe": "fragmentation",
+   "stake": 0.5,
+   "fee_recovered": 0.30321333333333333
+  },
+  {
+   "probe": "fragmentation",
+   "stake": 0.9,
+   "fee_recovered": 0.7385777777777778
+  },
+  {
+   "probe": "fragmentation",
+   "stake": 0.99999,
+   "fee_recovered": 0.9887999253328356
+  },
+  {
+   "probe": "stranded",
+   "burn": 1,
+   "median": 1.0235938379650955e-05,
+   "worst": 4.913280597454921e-05
+  },
+  {
+   "probe": "stranded",
+   "burn": 100,
+   "median": 0.0010235938379650955,
+   "worst": 0.0049132805974549205
+  },
+  {
+   "probe": "stranded",
+   "burn": 1000,
+   "median": 0.010235938379650955,
+   "worst": 0.04913280597454921
+  }
+ ],
+ "findings": [
+  {
+   "severity": "MEDIUM",
+   "title": "the pair is effectively untradeable on lopsided reserves",
+   "detail": "the smallest swap producing even one mojo of output is 25,075,225,677,032, 25.1% of the reserve. A pool whose thin side has floored to single digits quotes a price but cannot be traded -- which is the state our own drained pools were left in, and the reason the burn cannot promise a standing market."
+  },
+  {
+   "severity": "INFO",
+   "title": "a single vault exit overcharges a large holder; splitting reaches the right price",
+   "detail": "Splitting a vault exit into 100 removals recovers up to 99% of the fee, because the fee stays in the reserve and the holder re-claims their own share of it while exiting. This is ORDINARY AMM ECONOMICS: any LP who trades against their own pool pays the fee and receives their share back, so the net cost is fee x (1 - share). The rate is identical for everyone and proportional to trade size; what differs is how much of the pool you own. The wrinkle is that a SINGLE removal does not apply that rebate, so a 90% holder charged the full rate is overcharged 9x and splitting is the only way to reach the correct price. Vault-only: vault_fee_bps is 0 for n >= 2."
+  },
+  {
+   "severity": "INFO",
+   "title": "the two-sided vault charge is correct and stays",
+   "detail": "A vault crossing is two trades -- in and out -- and costs 60.0 bps against a swap pool's ~60 bps for A->B->A, measured in _sim_v15_vault_consistency.py. Charging entry-only would price a vault crossing at half the equivalent swap. Fragmenting a DEPOSIT mints slightly less, so the asymmetry is redemption-only."
+  }
+ ]
+}

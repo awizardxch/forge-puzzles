@@ -1,0 +1,68 @@
+{
+ "leaves": {
+  "forge_action_swap": "3fae54d0427d589eaf0c1d435933d584cf50f4f5ffb63e8ebbef3d0c2b96329f",
+  "forge_action_add": "2aea75cdd9617fedf018a5613cb3212d81a79d72ee93537f4d7b017e64898b8e",
+  "forge_action_remove": "115f73032b291c5989a47d0b648d5bed0674f50baf8e0cc4a5d4fdb1e1204248",
+  "forge_action_observe": "49abebf9d3f11d374e6cd8ee306adb496febea1a3ac6fb5a40dc87a780cf77ff",
+  "forge_action_collect": "a07ccf201ff84778c5c235aed49979535d48ae4f28a67ab67a79b0a07a79c91a",
+  "forge_action_dao_fee": "55784b2239f2eb04631c580e1c9a1b12f5a2895ba34f2d3156740fcda196cd86"
+ },
+ "root": "797a4791ad850d9ed1200531d9a83b900fc655ed0238d0f395101295e2040256",
+ "proofs": {
+  "forge_action_swap": {
+   "path": 0,
+   "hashes": [
+    "28b2ef72b9f3910abc20c344c697df506051a7b2c81ccc52a39627cb0b3de19e",
+    "5514a30adddfba60064303270e7e939d67fb87a583c7fe170db992ca06c9fc11",
+    "44d6598dd7b1777dac68171ada3a95403db07086cbbb21b075d5ed0902b2a0a0"
+   ]
+  },
+  "forge_action_add": {
+   "path": 1,
+   "hashes": [
+    "d78586c5d0d27bac798b3fa0235c93c068924b6dcf52fb5bed46376c53634a1b",
+    "5514a30adddfba60064303270e7e939d67fb87a583c7fe170db992ca06c9fc11",
+    "44d6598dd7b1777dac68171ada3a95403db07086cbbb21b075d5ed0902b2a0a0"
+   ]
+  },
+  "forge_action_remove": {
+   "path": 1,
+   "hashes": [
+    "4f6c480878fa9db97179c1575caffe4b8a69ce3e29e5396d4a3fbe438d34ac84",
+    "44d6598dd7b1777dac68171ada3a95403db07086cbbb21b075d5ed0902b2a0a0"
+   ]
+  },
+  "forge_action_observe": {
+   "path": 4,
+   "hashes": [
+    "669ea5820f2b885ee210bb6388d255963227061da6f870ef99e3fd7b9eae68c5",
+    "419d29d01896386b8ef5f49a206eb06062b66510bc49bb89882bca55afd95d12",
+    "6affa48f1fb31da4cfc19d1b22654f3849532c7446cf75024e7770e47e1089ad"
+   ]
+  },
+  "forge_action_collect": {
+   "path": 5,
+   "hashes": [
+    "65efd29e36d9394faac71139cd3ec932ef2ec598c7e43340b9a905171b2fb16f",
+    "419d29d01896386b8ef5f49a206eb06062b66510bc49bb89882bca55afd95d12",
+    "6affa48f1fb31da4cfc19d1b22654f3849532c7446cf75024e7770e47e1089ad"
+   ]
+  },
+  "forge_action_dao_fee": {
+   "path": 3,
+   "hashes": [
+    "dac31042cfb881b93cb9bc5e978c6cb9b746f096ea834d8483e957f6835c09b7",
+    "6affa48f1fb31da4cfc19d1b22654f3849532c7446cf75024e7770e47e1089ad"
+   ]
+  }
+ },
+ "shape": "chia-wallet-sdk MerkleTree: split at (n+1)//2, leaf sha256(1||h), node sha256(2||l||r)",
+ "registry": {
+  "leaves": {
+   "forge_registry_init": "75a091c2e2dbe3bca7ca266ddda39627006b9e75240e46dc45ab422f41da9909",
+   "forge_registry_register": "208a2a0099d88b77b5ff12b29327357ff013f2fcadf80a6f0d89aa93d8d23256",
+   "forge_registry_set_fee": "08853b1daf3a11208c6cee3ab7b9cdf47e72046ef1188e2c54a95cf6e12310c0"
+  },
+  "root": "5b9d0183c40148a465c443792dd6c4e0b985d93aad9196060560a3ecd35b6b3f"
+ }
+}

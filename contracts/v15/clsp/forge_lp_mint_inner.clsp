@@ -1,0 +1,24 @@
+; Forge V11 LP mint inner. Testnet research only; unaudited.
+;
+; The CAT inner puzzle the LP genesis ("eve") coin must wrap on an add. The
+; pool derives the eve's id as sha256(parent + cat_puzzle_hash(lp_asset_id,
+; THIS_HASH) + 1) and sends its message to exactly that coin, so the only way
+; to satisfy the pool is to run this puzzle, whose only outputs are the minted
+; coin and the -113 mint.
+;
+; V11 CHANGE, and the only one: the minted coin carries a CHIP-0020 hint equal
+; to its own inner puzzle hash. V10 minted with a bare CREATE_COIN and on
+; 2026-09-04 that hid 49,879 LP from the wallet that owned it. The hint is not
+; a free field -- it is `settlement_hash` itself, so it is a function of the
+; holding rather than a statement about it, and nothing needs to assert it.
+;
+; `settlement_hash` and `amount` remain the depositor's choice: the pool
+; re-derives the canonical mint from its invariant and refuses any other
+; figure, and the TAIL checks the delta against the real CAT ring.
+
+(mod (settlement_hash amount lp_tail lp_action)
+  (list
+    (list 51 settlement_hash amount (list settlement_hash))
+    (list 51 () -113 lp_tail lp_action)
+  )
+)

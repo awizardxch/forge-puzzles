@@ -28,7 +28,7 @@ sys.path.insert(0, str(HERE))
 sys.stdout.reconfigure(encoding="utf-8")
 
 import forge_registry_record as rr  # noqa: E402
-import forge_v14_driver as drv  # noqa: E402
+import forge_v15_driver as drv  # noqa: E402
 from forge_stdin import _lane_registry  # noqa: E402
 
 TREASURY = bytes(b"\x55" * 32)
@@ -126,7 +126,7 @@ def main() -> int:
     print("kept exactly: integers past 2**53 survive the upload")
     import tempfile
     with tempfile.TemporaryDirectory() as scratch:
-        held = Path(scratch) / "v14-mainnet.json"
+        held = Path(scratch) / "v15-mainnet.json"
         text = json.dumps(good, indent=1)
         out = rr.upload(text, held, "mainnet", None, "xch")
         written = json.loads(held.read_text(encoding="utf-8"))
@@ -134,7 +134,7 @@ def main() -> int:
               str(written["registry"]["price_scale"]))
         check("  and the kept record verifies again", rr.verify(written, "mainnet", None, "xch")["tip"] == out["summary"]["tip"])
         rr.upload(text, held, "mainnet", None, "xch")
-        check("  a second upload copies the record it replaces aside", any(p.name.startswith("v14-mainnet.json.before-upload-")
+        check("  a second upload copies the record it replaces aside", any(p.name.startswith("v15-mainnet.json.before-upload-")
                                                                           for p in Path(scratch).iterdir()))
         rounded = text.replace(str(2 ** 64), "18446744073709552000")     # what a JavaScript JSON round trip makes
         try:
@@ -173,7 +173,7 @@ def main() -> int:
     if "--live" in sys.argv:
         print("testnet11's own record, against the testnet11 chain")
         os.environ["FORGE_NETWORK"] = "testnet11"
-        path = HERE.parent / ".awizard" / "v14-testnet.json"
+        path = HERE.parent / ".awizard" / "v15-testnet.json"
         record = json.loads(path.read_text(encoding="utf-8"))
         try:
             summary = rr.verify(record, "testnet11", "https://testnet11.api.coinset.org", "txch")

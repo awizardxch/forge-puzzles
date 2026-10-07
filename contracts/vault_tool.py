@@ -2008,6 +2008,17 @@ def cmd_assemble(payload: dict[str, Any], factory: Callable[[str], Node]) -> dic
             raise MultisigError("a fee spend needs its own signature")
         aggregate = AugSchemeMPL.aggregate([aggregate, G2Element.from_bytes(bytes.fromhex(fee_signature_raw))])
         spends = spends + fee_spends
+    # Keyless spends that RECEIVE a message the lock's spend sends (a Forge registry's
+    # set_fee, a pool's dao_fee; owner, 2026-10-07). They are not part of the plan and
+    # carry no signature; consensus pairs the message, so a wrong or missing receiver is
+    # refused at push, never silently dropped. Their programs are caller-supplied CLVM
+    # and are parsed as such (untrusted_clvm, U3) by spend_from_json.
+    attached = [spend_from_json(entry) for entry in payload.get("attached_spends") or []]
+    if len(attached) > 16:
+        raise MultisigError("at most 16 attached spends")
+    if attached and plan.summary.get("kind") == "offer":
+        raise MultisigError("an offer carries no attached spends")
+    spends = spends + attached
     bundle = WalletSpendBundle(spends, aggregate)
     is_offer = plan.summary.get("kind") == "offer"
     if is_offer and (fee_spends or payload.get("push")):
