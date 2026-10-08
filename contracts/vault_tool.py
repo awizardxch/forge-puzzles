@@ -1709,6 +1709,7 @@ def cmd_propose(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
             vault_offer.parse_side(offer_raw.get("offered"), "offered"),
             vault_offer.parse_requested(offer_raw.get("requested")),
             nonce,
+            vault_offer.parse_payments(offer_raw.get("offered")),
         )
     elif fee_rate is not None and successor is not None and not outputs and not has_sponsor:
         # A pure re-key with nobody to pay: nothing can carry a fee.

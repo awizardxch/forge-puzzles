@@ -90,6 +90,32 @@ def parse_side(raw: Any, label: str = "offered") -> Side:
     return side
 
 
+Payments = list[tuple[bytes32 | None, bytes32, int]]
+
+
+def parse_payments(raw: Any) -> Payments:
+    """`payments: [{puzzle_hash, amount}]` on an offered entry: coins the lock's own
+    spend creates beside the settlement, in that entry's asset -- the router's fee
+    when it is taken on the input side (exact settlement: the fee is inside the
+    owners' signature, never carved from the entry). Absent on every other offer."""
+    out: Payments = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        asset_id = _asset_of(entry, "offered")
+        for index, payment in enumerate(entry.get("payments") or []):
+            if not isinstance(payment, dict):
+                raise MultisigError(f"offered payment {index + 1} must be an object")
+            puzzle_hash = hex32(strip0x(payment.get("puzzle_hash")), "offered payment puzzle_hash")
+            amount = parse_amount(payment.get("amount"), "offered payment amount")
+            if amount <= 0:
+                raise MultisigError("an offered payment must be positive")
+            out.append((asset_id, puzzle_hash, amount))
+    if len(out) > 4:
+        raise MultisigError("an offer carries at most 4 payments")
+    return out
+
+
 def parse_requested(raw: Any) -> Wanted:
     """`[{asset_id, amount, puzzle_hash?}]`.
 
@@ -156,6 +182,7 @@ def build_offer_plan(
     offered: Side,
     requested: Wanted,
     nonce: bytes | None = None,
+    payments_out: Payments | None = None,
 ) -> VaultPlan:
     """A plan the owners sign that, once signed, IS an offer.
 
@@ -171,6 +198,13 @@ def build_offer_plan(
     # No hint on a settlement coin: nobody owns it, and a hint there names a
     # puzzle no wallet is watching.
     outputs = [Output(OFFER_MOD_HASH, amount, asset_id, "", (), hint=False) for asset_id, amount in offered]
+    # The router's fee on the input side: a coin the lock's own spend creates beside the
+    # settlement, in an asset it gives up, so the owners' signature covers it.
+    offered_assets = {asset for asset, _ in offered}
+    for asset_id, puzzle_hash, amount in payments_out or []:
+        if asset_id not in offered_assets:
+            raise MultisigError("a payment must be in an asset the offer gives up")
+        outputs.append(Output(puzzle_hash, amount, asset_id, "router fee", (), hint=True))
     payments = requested_payments(requested, deposit_ph)
     drivers = driver_dict([offered, requested])
 

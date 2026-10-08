@@ -333,7 +333,23 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     all_coins += [_coin(record) for record in fee_coins]
     asserts = _announcements(payload["requested"], change_ph, all_coins)
 
-    for leg in payload["offered"]:
+    # The router's fee ladder, proven inside the trade (forge_fee_identity.embedded_proof):
+    # one AGG_SIG_UNSAFE per holding key over a digest of THESE coins, in the first leg's
+    # first spend. The wallet signs them in the same prompt as the trade; the router reads
+    # them back and checks the offer's signature; the chain checks them on inclusion.
+    proof_keys = [str(k).strip().lower().removeprefix("0x") for k in (payload.get("fee_proof_keys") or [])]
+    proof_conditions: list[Program] = []
+    if proof_keys:
+        from forge_fee_identity import MAX_EMBEDDED_KEYS, fee_proof_digest
+        from chia_rs import G1Element
+        if len(proof_keys) > MAX_EMBEDDED_KEYS or len(set(proof_keys)) != len(proof_keys):
+            raise ValueError(f"a trade proves 1 to {MAX_EMBEDDED_KEYS} distinct keys")
+        for key in proof_keys:
+            G1Element.from_bytes(bytes.fromhex(key))   # a key that is not a G1 point is refused here
+        digest = fee_proof_digest(str(payload.get("network_id") or "testnet11"), [coin.name() for coin in all_coins])
+        proof_conditions = [Program.to([49, bytes.fromhex(key), digest]) for key in proof_keys]
+
+    for index, leg in enumerate(payload["offered"]):
         asset = _asset_id(leg.get("asset_id"))
         amount = int(leg["amount"])
         if amount <= 0:
@@ -342,10 +358,11 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         if not coins:
             raise ValueError("an offered leg needs at least one coin")
         payments = _payments(leg)
+        leg_conditions = list(asserts) + (proof_conditions if index == 0 else [])
         spends.extend(
-            _xch_spends(coins, amount, change_ph, fee, asserts, payments)
+            _xch_spends(coins, amount, change_ph, fee, leg_conditions, payments)
             if asset is None
-            else _cat_spends(asset, coins, amount, change_ph, asserts, payments)
+            else _cat_spends(asset, coins, amount, change_ph, leg_conditions, payments)
         )
     if fee_coins:
         # Change back to the trader, the fee left unrecreated, and the same

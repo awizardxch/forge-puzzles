@@ -374,6 +374,30 @@ check(
 )
 
 
+# ─── the router's fee inside the lock's offer (2026-10-07) ───────────────────
+# Exact settlement: a router fee on the input side is a coin the lock's OWN spend
+# creates beside the settlement, so the owners' signature covers it. The proposal
+# API used to drop it, and every lock trade with a nonzero rate was refused.
+
+ROUTER_PH = bytes32([0x7A] * 32)
+paid = offers.build_offer_plan(NODE, "testnet11", STATE, [(None, 1_000_000_000)], [(CAT_TAIL, 250, None)], None,
+                               offers.parse_payments([{"amount": 1_000_000_000, "payments": [{"puzzle_hash": ROUTER_PH.hex(), "amount": 4_200_000}]}]))
+paid_spends, paid_signature = signed(paid)
+paid_offer = offers.assemble_offer(paid, paid_spends, paid_signature)
+created = [c for s in paid_offer.to_spend_bundle().coin_spends if s.coin.amount > 0
+           for c in Program.from_bytes(bytes(s.puzzle_reveal)).run(Program.from_bytes(bytes(s.solution))).as_iter()
+           if c.first().atom is not None and c.first().as_int() == 51]
+to_router = [int(c.at("rrf").as_int()) for c in created if bytes(c.at("rf").as_atom()) == bytes(ROUTER_PH)]
+check("the lock's own spend pays the router beside the settlement", to_router, [4_200_000])
+check("and still gives up exactly the offered amount to the settlement", paid_offer.get_offered_amounts(), {None: 1_000_000_000})
+check(
+    "a payment in an asset the offer does not give up is refused",
+    refused(lambda: offers.build_offer_plan(NODE, "testnet11", STATE, [(None, 5)], [(CAT_TAIL, 1, None)], None,
+                                            [(CAT_TAIL, ROUTER_PH, 1)])).startswith("refused"),
+    True,
+)
+
+
 print(f"vault offer: {PASSED} checks passed" + (f", {len(FAILED)} FAILED" if FAILED else ""))
 for failure in FAILED:
     print("  x " + failure)

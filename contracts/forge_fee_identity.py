@@ -51,6 +51,97 @@ from chia_rs.sized_bytes import bytes32
 PROOF_TITLE = "The Forge - fee rate"   # ASCII only: it must survive every wallet's signing prompt
 MAX_KEYS = 600
 MAX_PAYERS = 600
+MAX_EMBEDDED_KEYS = 20
+
+# AGG_SIG_ME's additional data is the network's genesis challenge.
+GENESIS = {
+    "testnet11": bytes.fromhex("37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615"),
+    "mainnet": bytes.fromhex("ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb"),
+}
+AGG_SIG_UNSAFE = 49
+AGG_SIG_ME = 50
+AGG_SIG_OPCODES = set(range(43, 51))
+RUN_MAX_COST = 11_000_000_000
+
+
+# ── the proof embedded in a trade (owner, 2026-10-07: "build it into the transaction") ──
+#
+# The site's offer builder (forge_offer_build.py) adds one `(49 key digest)` per
+# holding key to the trader's own first spend, the digest bound to the exact coins
+# that offer spends. The wallet signs them in the SAME prompt as the trade, the
+# router reads them back out of the offer and checks the offer's aggregate
+# signature against every signature condition its spends make, and the chain
+# checks them again on inclusion. Bound to the offer's coins, a proof cannot be
+# lifted into another trade; signed with the trade, it cannot be lent.
+
+def fee_proof_digest(network_id: str, coin_ids: list[bytes]) -> bytes:
+    """What every embedded key signs: the network and the offer's own coins, sorted."""
+    return hashlib.sha256(b"forge-fee-rate|" + network_id.encode() + b"|" + b"".join(sorted(bytes(c) for c in coin_ids))).digest()
+
+
+def _conditions(spend) -> list[list]:
+    puzzle = Program.from_bytes(bytes(spend.puzzle_reveal))
+    solution = Program.from_bytes(bytes(spend.solution))
+    _cost, out = puzzle.run_with_cost(RUN_MAX_COST, solution)
+    return [list(c.as_iter()) for c in out.as_iter()]
+
+
+def agg_sig_pairs(spends, network_id: str) -> tuple[list[tuple[bytes, bytes]], list[tuple[bytes, bytes, bytes]]]:
+    """Every (key, message) the spends require signed, as consensus would form them,
+    and the (key, raw message, coin id) of each AGG_SIG_UNSAFE among them. Only the
+    two kinds wallets make (49, 50) are understood; any other refuses."""
+    genesis = GENESIS[network_id]
+    pairs: list[tuple[bytes, bytes]] = []
+    unsafe: list[tuple[bytes, bytes, bytes]] = []
+    for spend in spends:
+        coin_id = spend.coin.name()
+        for cond in _conditions(spend):
+            if not cond or len(bytes(cond[0].as_atom() or b"")) != 1:
+                continue
+            opcode = cond[0].as_int()
+            if opcode not in AGG_SIG_OPCODES:
+                continue
+            key = bytes(cond[1].as_atom())
+            msg = bytes(cond[2].as_atom())
+            if opcode == AGG_SIG_UNSAFE:
+                pairs.append((key, msg))
+                unsafe.append((key, msg, bytes(coin_id)))
+            elif opcode == AGG_SIG_ME:
+                pairs.append((key, msg + bytes(coin_id) + genesis))
+            else:
+                raise ValueError(f"the offer asks for an AGG_SIG kind ({opcode}) the router does not verify")
+    return pairs, unsafe
+
+
+def embedded_proof(offer_text: str, network_id: str) -> dict:
+    """{"present", "ok", "reason", "proven", "keys"}: the holding keys a trade proves
+    by its own signature. `present` is false when the offer carries no proof."""
+    none = {"present": False, "ok": False, "reason": None, "proven": [], "keys": []}
+    offer = Offer.from_bech32(offer_text)
+    bundle = offer.to_spend_bundle()
+    # An offer file carries a placeholder spend per requested asset (a zero-parent,
+    # zero-amount settlement coin holding the notarized payments). It is no coin of
+    # the trader's, cannot run alone, and asks for no signature: skip it.
+    spends = [s for s in bundle.coin_spends
+              if s.coin.puzzle_hash != OFFER_MOD_HASH and bytes(s.coin.parent_coin_info) != bytes(32)]
+    digest = fee_proof_digest(network_id, [s.coin.name() for s in spends])
+    try:
+        pairs, unsafe = agg_sig_pairs(spends, network_id)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable offer proves nothing
+        return {**none, "present": True, "reason": f"the offer's conditions could not be read: {exc}"}
+    keys = sorted({_hex(k) for k, msg, _ in unsafe if msg == digest})
+    if not keys:
+        return none
+    if len(keys) > MAX_EMBEDDED_KEYS:
+        return {**none, "present": True, "reason": f"an offer proves at most {MAX_EMBEDDED_KEYS} keys"}
+    try:
+        pks = [G1Element.from_bytes(k) for k, _ in pairs]
+        ok = AugSchemeMPL.aggregate_verify(pks, [m for _, m in pairs], G2Element.from_bytes(bytes(bundle.aggregated_signature)))
+    except Exception as exc:  # noqa: BLE001
+        return {**none, "present": True, "reason": f"the offer's signature could not be checked: {exc}"}
+    if not ok:
+        return {**none, "present": True, "reason": "the offer's signature does not cover every key it names"}
+    return {"present": True, "ok": True, "reason": None, "proven": sorted({key_ph(k) for k in keys}), "keys": keys}
 
 
 def _hex(b: bytes) -> str:
@@ -66,6 +157,9 @@ def payers_of(offer_text: str) -> list[str]:
     offer = Offer.from_bech32(offer_text)
     out: set[str] = set()
     for cs in offer.to_spend_bundle().coin_spends:
+        # requested-payment placeholders (zero parent) are nobody's coins
+        if bytes(cs.coin.parent_coin_info) == bytes(32):
+            continue
         puzzle = Program.from_bytes(bytes(cs.puzzle_reveal))
         mod, args = puzzle.uncurry()
         # (MOD_HASH TAIL_HASH INNER_PUZZLE): a CAT coin's address is the inner puzzle's hash
@@ -250,9 +344,36 @@ def main() -> int:
         offer = Offer(Offer.notarize_payments(requested, coins), SpendBundle(spends, G2Element()), {})
         print(json.dumps({"success": True, "offer": offer.to_bech32()}))
         return 0
+    if mode == "sign-spends":
+        # checks only: sign every AGG_SIG the spends ask for with the matching synthetic keys
+        from chia.types.coin_spend import make_spend
+        from chia.types.blockchain_format.coin import Coin
+        from chia_rs.sized_ints import uint64
+        network_id = str(payload.get("network_id") or "testnet11")
+        by_pk = {}
+        for raw in payload["secret_keys"]:
+            sk = calculate_synthetic_secret_key(PrivateKey.from_bytes(bytes.fromhex(_clean(raw))), DEFAULT_HIDDEN_PUZZLE_HASH)
+            by_pk[bytes(sk.get_g1())] = sk
+        spends = [make_spend(Coin(bytes32.fromhex(_clean(s["coin"]["parent_coin_info"])), bytes32.fromhex(_clean(s["coin"]["puzzle_hash"])),
+                                  uint64(int(s["coin"]["amount"]))), Program.fromhex(_clean(s["puzzle_reveal"])), Program.fromhex(_clean(s["solution"])))
+                  for s in payload["coin_spends"]]
+        pairs, _ = agg_sig_pairs(spends, network_id)
+        sigs = [AugSchemeMPL.sign(by_pk[k], m) for k, m in pairs if k in by_pk]
+        print(json.dumps({"success": True, "signature": _hex(bytes(AugSchemeMPL.aggregate(sigs))), "signed": len(sigs), "required": len(pairs)}))
+        return 0
+    if mode == "key-puzzle":
+        # checks only: the standard puzzle of a wallet key, as a coin's puzzle reveal
+        pk = G1Element.from_bytes(bytes.fromhex(_clean(payload["key"])))
+        print(json.dumps({"success": True, "puzzle": bytes(puzzle_for_synthetic_public_key(pk)).hex()}))
+        return 0
+    if mode == "embedded-digest":
+        print(json.dumps({"success": True, "digest": _hex(fee_proof_digest(str(payload["network_id"]), [bytes.fromhex(_clean(c)) for c in payload["coin_ids"]]))}))
+        return 0
     network_id = str(payload.get("network_id") or "testnet11")
     payers = payers_of(str(payload["offer"])) if payload.get("offer") else None
     result: dict = {"success": True, "payers": payers or []}
+    if payload.get("offer"):
+        result["embedded"] = embedded_proof(str(payload["offer"]), network_id)
     proof = payload.get("proof")
     if isinstance(proof, dict):
         result["proof"] = verify_proof(proof, network_id, payers)
