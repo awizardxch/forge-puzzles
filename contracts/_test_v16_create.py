@@ -22,7 +22,7 @@ from chia.types.blockchain_format.program import Program
 from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
 from chia.wallet.lineage_proof import LineageProof
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_synthetic_public_key
-from chia_rs import AugSchemeMPL, Coin, G2Element
+from chia_rs import AugSchemeMPL, Coin, G1Element, G2Element
 from chia_rs.sized_bytes import bytes32
 from chia_rs.sized_ints import uint64
 
@@ -229,6 +229,46 @@ def main() -> int:
     p3 = create.plan(reg2, slots2, cfg3, creator_xch(2 + 1_000_000 + 99_999 + fee, 0x3A), {T_B: creator_cat(T_B, 10_000, 0x3B)}, CREATOR_PH, fee)
     bundle3 = create.finalize(p3, G2Element())
     check("  mints 100,000 LP against 10,000 of the asset, 99,000 to the creator", paid_to(bundle3, CREATOR_PH, p3.pool.lp_asset_id) == 100_000 - drv.LOCKED_BURN)
+
+    # The creation gate's key proof (owner, 2026-10-09): any coin of a wallet may pay when a
+    # key deriving an approved address signs inside the creator's spend. Proven with real
+    # keys and the real aggregate check: the pairs are formed as consensus forms them.
+    print("the creation gate's key proof")
+    import forge_network
+    from forge_fee_identity import agg_sig_pairs
+    payer_sk = AugSchemeMPL.key_gen(bytes([1]) * 32)       # the key behind P2 (its 0x01 seed above), which pays
+    approved_sk = AugSchemeMPL.key_gen(bytes([7]) * 32)  # the key behind the approved address
+    stranger_sk = AugSchemeMPL.key_gen(bytes([9]) * 32)
+    approved_pk = approved_sk.get_g1()
+    cfg4 = create.CreationConfig([T_B], [10_000], [1], 77, 5, bytes32(b"\x55" * 32), 10_000, "B77", "B77")
+    xch4, cat4 = creator_xch(2 + 1_000_000 + 9_999 + fee, 0x3C), creator_cat(T_B, 10_000, 0x3D)
+    p4 = create.plan(reg2, slots2, cfg4, xch4, {T_B: cat4}, CREATOR_PH, fee, gate_proof_keys=(approved_pk,))
+    network = forge_network.network_id()
+    digest = create.gate_proof_digest(network, [xch4.coin.name(), cat4.coin.name()])
+    pairs, unsafe = agg_sig_pairs(p4.creator_spends, network)
+    check("  the creator's XCH spend carries AGG_SIG_UNSAFE(approved key, digest of its own coins)",
+          any(k == bytes(approved_pk) and m == digest and c == bytes(xch4.coin.name()) for k, m, c in unsafe))
+    check("  the digest is domain-separated from the fee ladder's", digest != __import__("forge_fee_identity").fee_proof_digest(network, [xch4.coin.name(), cat4.coin.name()]))
+    plain = create.plan(reg2, slots2, cfg4, xch4, {T_B: cat4}, CREATOR_PH, fee)
+    check("  without gate_proof_keys nothing is added", not agg_sig_pairs(plain.creator_spends, network)[1])
+
+    def sign_all(signer_for_approved):
+        sigs = []
+        for key, msg in pairs:
+            sk = signer_for_approved if key == bytes(approved_pk) else payer_sk
+            sigs.append(AugSchemeMPL.sign(sk, msg))
+        return AugSchemeMPL.aggregate(sigs)
+
+    keys = [G1Element.from_bytes(k) for k, _ in pairs]
+    msgs = [m for _, m in pairs]
+    check("  signed by the approved key's holder: the aggregate verifies",
+          AugSchemeMPL.aggregate_verify(keys, msgs, sign_all(approved_sk)))
+    check("  naming the approved (public) key without its secret: the aggregate fails, so the chain refuses the creation",
+          not AugSchemeMPL.aggregate_verify(keys, msgs, sign_all(stranger_sk)))
+    p5 = create.plan(reg2, slots2, cfg4, creator_xch(2 + 1_000_000 + 9_999 + fee, 0x3E), {T_B: cat4}, CREATOR_PH, fee,
+                     gate_proof_keys=(approved_pk,))
+    other_digest = [m for k, m, _ in agg_sig_pairs(p5.creator_spends, network)[1]]
+    check("  the signature cannot be lifted onto another creation: other coins, other digest", other_digest and other_digest[0] != digest)
 
     print()
     passed = sum(results)

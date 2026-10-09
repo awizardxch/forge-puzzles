@@ -666,8 +666,14 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         return cre.commit_record(payload["record_path"], payload["record_patch"])
     registry = _lane_registry(payload["registry"], drv)
     xch, cats = _creator_coins(payload, cre)
+    # The creation gate's key proof: approved keys that sign inside the creator's spend
+    # (forge_v16_create.plan). Passed only when present, so a kept lane without it still plans.
+    proof_keys = [bytes.fromhex(str(k).lower().removeprefix("0x")) for k in (payload["creator"].get("gate_proof_keys") or [])]
+    if any(len(k) != 48 for k in proof_keys) or len(proof_keys) > 4:
+        raise ValueError("gate_proof_keys are 1 to 4 G1 public keys of 48 bytes")
     plan = cre.plan(registry, payload["registry"]["slots"], _creation_config(payload, cre), xch, cats,
-                     _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0))
+                     _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0),
+                     **({"gate_proof_keys": tuple(proof_keys)} if proof_keys else {}))
     out = {"success": True, "action": action, **cre.plan_json(plan)}
     if action == "create":
         def _hex0x(v: Any) -> str:

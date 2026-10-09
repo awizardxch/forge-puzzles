@@ -61,6 +61,7 @@ from forge_v16_offer import OfferRejected, pool_to_snapshot  # noqa: E402
 
 OFFER_PH = bytes32(OFFER_MOD_HASH)
 CREATE_COIN = 51
+AGG_SIG_UNSAFE = 49     # the creation gate's key proof
 CREATE_COIN_ANNOUNCEMENT, ASSERT_COIN_ANNOUNCEMENT = 60, 61
 CREATE_PUZZLE_ANNOUNCEMENT, ASSERT_PUZZLE_ANNOUNCEMENT = 62, 63
 
@@ -153,8 +154,17 @@ def lp_payment_announcement(lp_asset_id: bytes32, launcher_id: bytes32, recipien
     return bytes32(drv.hashlib.sha256(bytes(settle_ph) + bytes(Program.to((launcher_id, [[recipient_ph, amount, [recipient_ph]]])).get_tree_hash())).digest())
 
 
+def gate_proof_digest(network_id: str, coin_ids: list) -> bytes:
+    """What an approved key signs to admit a creation paid from any coin of its wallet:
+    the network and this creation's own creator coins, sorted. Domain-separated from the
+    fee ladder's digest (forge_fee_identity.fee_proof_digest)."""
+    import hashlib
+    return hashlib.sha256(b"forge-create-gate|" + network_id.encode() + b"|"
+                          + b"".join(sorted(bytes(c) for c in coin_ids))).digest()
+
+
 def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: CreatorXch, cats: dict,
-         recipient_ph: bytes32, network_fee: int) -> CreationPlan:
+         recipient_ph: bytes32, network_fee: int, gate_proof_keys: tuple = ()) -> CreationPlan:
     """Build the creation bundle around the creator's coins.
 
     `slots` is the registry's live slot list: key hex -> {key, launcher_id, left, right,
@@ -271,6 +281,16 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
     # registry's own `forge-registered-v16`. A bundle missing any of them fails this spend.
     for spend in (launcher_spend, *reserve_launchers, fee_spend, *reg_bundle.coin_spends):
         conditions.extend(announcement_binds(spend))
+    # The creation gate's key proof (owner, 2026-10-09): a wallet that controls an approved
+    # address may pay from ANY of its coins, provided that address's key signs inside this
+    # spend. AGG_SIG_UNSAFE over a digest of this creation's own creator coins: consensus
+    # refuses the whole bundle unless the key's holder signed, so naming a public key one
+    # does not hold proves nothing, and the signature cannot be lifted onto other coins.
+    if gate_proof_keys:
+        import forge_network
+        digest = gate_proof_digest(forge_network.network_id(), [xch.coin.name(), *(c.coin.name() for c in cats.values())])
+        for proof_key in gate_proof_keys:
+            conditions.append([AGG_SIG_UNSAFE, bytes(proof_key), digest])
     creator_spends = [make_spend(xch.coin, xch.puzzle, drv.p2_delegated_solution(conditions))]
     for asset, cat in cats.items():
         i = config.asset_ids.index(asset)
