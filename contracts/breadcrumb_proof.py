@@ -45,7 +45,7 @@ from chia_rs.sized_bytes import bytes32  # noqa: E402
 from untrusted_clvm import parse_untrusted_hex, run_capped  # noqa: E402
 
 import forge_network as _forge_network  # noqa: E402
-from forge_v15_price_history import state_from_reveal  # noqa: E402
+from forge_v16_price_history import state_from_reveal  # noqa: E402
 from wallet_holdings import cat_puzzle_hash  # noqa: E402
 
 XCH = "0" * 64

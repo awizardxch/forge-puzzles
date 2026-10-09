@@ -38,12 +38,17 @@ from chia.wallet.uncurried_puzzle import uncurry_puzzle  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 
 import forge_network as _forge_network  # noqa: E402
-from forge_v15_price_history import Rpc, _strip, node_rpc  # noqa: E402
+from forge_v16_price_history import Rpc, _strip, node_rpc  # noqa: E402
 from wallet_holdings import cat_puzzle_hash  # noqa: E402
 
 DEFAULT_NODE = _forge_network.node_url()
 MAX_BUDGET = 200
 BURN_PUZZLE_HASH = bytes32.fromhex("0" * 60 + "dead")
+# Both unspendable hashes in use. 0x...dead is the community's burn address; the
+# all-zero hash is where V13-V15 pools paid their genesis LOCKED_BURN (forge_v15_driver
+# ZERO_32) and where the site's "Burn LP Coin" sent the seed before 2026-10-09; V16 pays
+# both to 0x...dead. Neither has a known preimage, so both count as burned.
+BURN_PUZZLE_HASHES = (BURN_PUZZLE_HASH, bytes32(b"\x00" * 32))
 
 
 class SupplyError(Exception):
@@ -92,10 +97,13 @@ def _coin_id(record: dict) -> str:
 
 
 def burned(rpc: Rpc, asset_id: str) -> int:
-    puzzle_hash = cat_puzzle_hash(bytes32.fromhex(asset_id), BURN_PUZZLE_HASH)
-    answer = _ok(rpc("get_coin_records_by_puzzle_hash",
-                     {"puzzle_hash": "0x" + bytes(puzzle_hash).hex(), "include_spent_coins": False}), "burn address")
-    return sum(int(record["coin"]["amount"]) for record in answer.get("coin_records") or [])
+    total = 0
+    for burn in BURN_PUZZLE_HASHES:
+        puzzle_hash = cat_puzzle_hash(bytes32.fromhex(asset_id), burn)
+        answer = _ok(rpc("get_coin_records_by_puzzle_hash",
+                         {"puzzle_hash": "0x" + bytes(puzzle_hash).hex(), "include_spent_coins": False}), "burn address")
+        total += sum(int(record["coin"]["amount"]) for record in answer.get("coin_records") or [])
+    return total
 
 
 def supply(payload: dict[str, Any], rpc: Rpc | None = None) -> dict[str, Any]:

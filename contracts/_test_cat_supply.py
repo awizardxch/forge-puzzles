@@ -63,7 +63,11 @@ class Chain:
             return {"success": True, "coin_records": [r for r in self.records.values()
                                                       if cs._strip(r["coin"]["parent_coin_info"]) == parent]}
         if route == "get_coin_records_by_puzzle_hash":
-            return {"success": True, "coin_records": self.burn_coins}
+            # Burned coins sit at the first burn hash asked about (0x...dead); `zero_burn_coins`
+            # at the second (the all-zero hash), so a sum that reads only one is caught.
+            self.burn_asks = getattr(self, "burn_asks", 0) + 1
+            return {"success": True, "coin_records": self.burn_coins if self.burn_asks % 2 == 1
+                    else getattr(self, "zero_burn_coins", [])}
         raise AssertionError(route)
 
 
@@ -99,6 +103,11 @@ check("burned is read from the burn address", out.get("burned") == "25", out.get
 check("burned_only reads the burn address alone",
       cs.supply({"asset_id": asset, "burned_only": True}, rpc=chain) == {"success": True, "status": "burned", "burned": "25"})
 
+chain, asset, tip = build(lambda issuance: GENESIS_BY_ID_MOD.curry(issuance), burn=25)
+chain.zero_burn_coins = [{"coin": {"amount": 7}}]
+check("LP or tokens at the all-zero hash (Forge's genesis and Burn LP target) count as burned too",
+      cs.supply({"asset_id": asset, "burned_only": True}, rpc=chain)["burned"] == "32")
+
 chain, asset, tip = build(lambda issuance: GENESIS_BY_ID_MOD.curry(issuance), siblings_spent=False)
 out = cs.supply({"asset_id": asset, "start": tip, "budget": 50}, rpc=chain)
 check("an unspent sibling is reported, not counted", out.get("minted") == "60" and len(out.get("unspent_siblings", [])) == 2)
@@ -127,8 +136,9 @@ def recording(route: str, payload: dict) -> dict:
 
 
 cs.burned(recording, "ab" * 32)
-check("the burn query asks for this CAT at 0x...dead",
-      asked == [bytes(cat_puzzle_hash(bytes32.fromhex("ab" * 32), cs.BURN_PUZZLE_HASH)).hex()])
+check("the burn query asks for this CAT at 0x...dead and at the all-zero hash, nothing else",
+      asked == [bytes(cat_puzzle_hash(bytes32.fromhex("ab" * 32), burn)).hex() for burn in cs.BURN_PUZZLE_HASHES]
+      and len(set(asked)) == 2)
 
 print(f"\n{'all cat-supply checks passed' if failures == 0 else f'{failures} cat-supply check(s) failed'}")
 raise SystemExit(1 if failures else 0)

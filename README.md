@@ -7,7 +7,7 @@ Everything here can move funds. That is the whole point of the split — the
 interface lives in a separate repository, so what is in front of you *is* the
 attack surface and nothing dilutes that claim.
 
-> **Status: testnet research. Unaudited.** V15 (protocol 16) is live on testnet11 beside V14 (protocol 15), which is kept, not retired
+> **Status: testnet research. Unaudited.** V16 (protocol 17) is live on testnet11 beside V15 (protocol 16) and V14 (protocol 15), which are kept, not retired
 > with 32 pools. It replaces V13, which a fourth independent review retired on
 > 2026-09-15: the registry admitted a pool whose reserves were never funded, and
 > the slot it took could never be spent by anyone. V14 derives every reserve's
@@ -23,8 +23,9 @@ attack surface and nothing dilutes that claim.
 
 ```
 contracts/
-  v15/                 the shipping pool, a rue project
-  v14/                 the previous revision, kept live (no pool drained)
+  v16/                 the shipping pool, a rue project
+  v15/                 the previous revision, kept live (no pool drained)
+  v14/                 the revision before it, kept live (no pool drained)
     puzzles/           Forge's leaves, the finalizer, the reserve launcher, the curve
     puzzles/upstream/  CNI's CHIP-0050 puzzles, vendored verbatim
     compiled/          built hex and tree hashes
@@ -34,7 +35,7 @@ contracts/
 docs/                  protocol documents
 ```
 
-**Start at [`docs/FORGE_PUZZLE_V15.md`](docs/FORGE_PUZZLE_V15.md)** (what V15 changes and why), then [`docs/FORGE_PUZZLE_V14.md`](docs/FORGE_PUZZLE_V14.md): what the
+**Start at [`docs/FORGE_PUZZLE_V16.md`](docs/FORGE_PUZZLE_V16.md)** (V16 burns the locked minimum to Chia's burn address, `0x000...dead`) and [`docs/FORGE_PUZZLE_V15.md`](docs/FORGE_PUZZLE_V15.md) (what V15 changes and why), then [`docs/FORGE_PUZZLE_V14.md`](docs/FORGE_PUZZLE_V14.md): what the
 fourth and fifth reviews found, what V14 changes, and what was measured rather
 than argued. Then [`docs/FORGE_V14_CLVM_PASS.md`](docs/FORGE_V14_CLVM_PASS.md)
 for the leaf-by-leaf reading with the mutation verdict on every assert, and
@@ -46,7 +47,7 @@ chosen.
 
 The pool is an action-layer singleton built on **CHIP-0050**. CNI's upstream
 `action`, `finalizer`, `slot` and `p2_delegated_by_singleton` are vendored
-verbatim and required to hash to the values in `contracts/v15/pins.json`; Forge
+verbatim and required to hash to the values in `contracts/v16/pins.json`; Forge
 adds six leaves (`swap`, `add`, `remove`, `observe`, `collect`, `dao_fee`), a
 multi-reserve finalizer written from the upstream reserve finalizer, and — in
 V14 — a reserve launcher, the only puzzle a reserve may be born from. The rule
@@ -67,8 +68,8 @@ singleton authorises one at a time. See
 Needs [`rue`](https://github.com/rigidity/rue) 0.8.4 on PATH.
 
 ```bash
-python scripts/build-v15.py     # in the monorepo; rebuilds and re-checks the pins
-rue build --hex --hash --all .  # in contracts/v15, to build in place
+python scripts/build-v16.py     # in the monorepo; rebuilds and re-checks the pins
+rue build --hex --hash --all .  # in contracts/v16, to build in place
 ```
 
 `pins.json` records every upstream puzzle's tree hash **and** its source's
@@ -81,15 +82,16 @@ was bought the hard way: a DID once confirmed on chain and could never be spent,
 because a puzzle was hashed but never executed.
 
 ```bash
-python contracts/_test_v15_actions.py            # the leaves, accept and refuse
-python contracts/_test_v15_reserves_proved.py    # the reserve launcher and the derived parent (R-1)
-python contracts/_test_v15_settlement_amount.py  # the settlement binding, attacks value-balanced
-python contracts/_test_v15_before_after.py       # each change against the V13 AND V14 builds
-python contracts/_test_v15_manipulation.py       # flash-loan-analog sequences
-python contracts/_test_v15_curve_equivalence.py
-python contracts/_test_v15_genesis.py            # the eve-bound genesis mint
-python contracts/_test_v15_consensus_timelocks.py  # birth heights, judged offline
-python contracts/_test_v15_integrity.py          # every puzzle recompiled; exit 2 without rue
+python contracts/_test_v16_actions.py            # the leaves, accept and refuse
+python contracts/_test_v16_registry.py           # admission, and the locked minimum burned at 0x000...dead
+python contracts/_test_v16_reserves_proved.py    # the reserve launcher and the derived parent (R-1)
+python contracts/_test_v16_settlement_amount.py  # the settlement binding, attacks value-balanced
+python contracts/_test_v16_before_after.py       # each change against the V13 AND V14 builds
+python contracts/_test_v16_manipulation.py       # flash-loan-analog sequences
+python contracts/_test_v16_curve_equivalence.py
+python contracts/_test_v16_genesis.py            # the eve-bound genesis mint
+python contracts/_test_v16_consensus_timelocks.py  # birth heights, judged offline
+python contracts/_test_v16_integrity.py          # every puzzle recompiled; exit 2 without rue
 python contracts/_test_mips.py               # against vectors from chia-wallet-sdk
 python contracts/_test_vault_policy.py       # the lock
 ```

@@ -44,6 +44,10 @@ from forge_split_swap import SplitBranchSpec, build_split_swap
 from forge_flow_balance import FlowLegSpec, build_flow_balance
 from forge_routed_deposit import DepositSale, build_routed_deposit
 from forge_transition import build_transition
+import forge_v16_offer as off16
+import forge_v16_route as rt16
+import forge_v16_create as cre16
+import forge_v16_driver as drv16
 import forge_v15_offer as off15
 import forge_v15_route as rt15
 import forge_v15_create as cre15
@@ -54,12 +58,13 @@ import forge_v14_create as cre14
 import forge_v14_driver as drv14
 
 # One lane per protocol revision: (offer, route, create, driver). A request picks its lane by
-# its own protocol_version or its pool snapshots'; a bundle never mixes revisions. V15
-# (protocol 16) is the live lane and the one a creation takes. V14 (15) is NOT retired:
-# the owner kept it live beside V15 (2026-10-07), its pools stay on chain undrained and
-# its lane ships everywhere, so it is imported unconditionally. V13 (14) is kept only
-# while its record is read back; V11.1 (12) and V12 (13) were drained and retired.
-_LANES = {16: (off15, rt15, cre15, drv15), 15: (off14, rt14, cre14, drv14)}
+# its own protocol_version or its pool snapshots'; a bundle never mixes revisions, except a
+# route (below). V16 (protocol 17) is the live lane and the one a creation takes. V15 (16)
+# and V14 (15) are NOT retired: the owner kept each live beside its successor (2026-10-09,
+# 2026-10-07), their pools stay on chain undrained and their lanes ship everywhere, so they
+# are imported unconditionally. V13 (14) is kept only while its record is read back;
+# V11.1 (12) and V12 (13) were drained and retired.
+_LANES = {17: (off16, rt16, cre16, drv16), 16: (off15, rt15, cre15, drv15), 15: (off14, rt14, cre14, drv14)}
 # The retired lane is OPTIONAL. It is only needed while V13's record is still read back,
 # and it is absent wherever the retired sources are not shipped -- the public repository
 # prunes every retired revision, so importing it unconditionally made this dispatcher fail
@@ -76,7 +81,8 @@ else:
     _LANES[14] = (off13, rt13, cre13, drv13)
 
 
-# The route actions the newest composer builds across revisions (forge_v15_route._drv).
+# The route actions a composer builds across revisions (forge_v16_route._drv; a route that
+# never touches a V16 pool is built by forge_v15_route, which spends V14 and V15 pools).
 _CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route"})
 
 
@@ -86,8 +92,8 @@ def _lane_version(payload: dict) -> int:
     if declared is not None:
         versions.add(int(declared))
     if len(versions) > 1:
-        # V14 is live beside V15 (owner, 2026-10-07): a ROUTE may cross revisions, and the
-        # newest lane's composer builds it, spending each pool with its own driver. Anything
+        # V14 and V15 are live beside V16 (owner, 2026-10-07, 2026-10-09): a ROUTE may cross
+        # revisions, and the newest lane on it builds it, spending each pool with its own driver. Anything
         # else -- a single-pool action, a creation -- is one revision by construction.
         if payload.get("action") in _CROSS_REVISION_ACTIONS and versions <= set(_LANES):
             return max(versions)
@@ -426,8 +432,8 @@ ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", 
 
 def _snapshot_of(pool) -> dict[str, Any]:
     """A pool's snapshot, written by ITS OWN lane: on a route across revisions the successors
-    are V14 and V15 pools side by side, and each must come back labelled and shaped by the
-    lane that rebuilds it (forge_v15_route._drv)."""
+    are V14, V15 and V16 pools side by side, and each must come back labelled and shaped by the
+    lane that rebuilds it (forge_v16_route._drv)."""
     version = int(sys.modules[type(pool).__module__].PROTOCOL_VERSION)
     return _LANES[version][0].pool_to_snapshot(pool)
 
@@ -630,14 +636,14 @@ def _creation_config(payload: dict[str, Any], cre) -> "cre.CreationConfig":
     total_lp = int(cfg.get("total_lp") or (min(reserves) * int(cfg.get("lp_ratio") or 1)))
     fee_bps = int(cfg.get("fee_bps", 30))
     # a name or symbol left empty is derived the way every pool's default is
-    import forge_v15_index as _idx      # the LIVE lane: this named V13's while V14 shipped
+    import forge_v16_index as _idx      # the LIVE lane: this named V13's while V14 shipped
     canonical = cre.canonical(cre.CreationConfig(assets, reserves, weights, fee_bps, 0, ZERO_32, total_lp))
     hex_ids = [("00" * 32) if a is None else a.hex() for a in canonical.asset_ids]
     state = {"pools": []}
     try:
         import json as _json
         import forge_network as _net
-        _default = _net.record_path("v15")
+        _default = _net.record_path("v16")
         state = _json.loads(Path(payload.get("record_path") or _default).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- names of nested LP assets fall back to their ids
         pass

@@ -27,10 +27,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 from chia_rs import G2Element  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 
-import forge_v15_create as create  # noqa: E402
-import forge_v15_driver as drv  # noqa: E402
-import forge_v15_index as index  # noqa: E402
-from _test_v15_create import CREATOR_PH, T_A, creator_cat, creator_xch, paid_to  # noqa: E402
+import forge_v16_create as create  # noqa: E402
+import forge_v16_driver as drv  # noqa: E402
+import forge_v16_index as index  # noqa: E402
+from _test_v16_create import CREATOR_PH, T_A, creator_cat, creator_xch, paid_to  # noqa: E402
 from forge_offer import ZERO_32  # noqa: E402
 
 DEV_A = bytes32(b"\xaa" * 32)
@@ -72,7 +72,7 @@ def load_deploy_script():
 
 
 def main() -> int:
-    if not (drv.v15_available() and drv.registry_available()):
+    if not (drv.v16_available() and drv.registry_available()):
         print("  [skip] V14 build outputs are absent"); return 2
 
     print("the outgoing registry, dev address A")

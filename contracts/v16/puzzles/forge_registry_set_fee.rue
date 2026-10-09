@@ -1,0 +1,54 @@
+// forge_registry_set_fee.rue -- Forge V16 registry `set_fee` leaf. Testnet research only; unaudited.
+//
+// Sets the creation fee future pairs pay. V14 curried the fee into the registry, so
+// changing it meant rolling the registry over (a new registry, old pairs listed under
+// the retired one). V15 holds the fee in RegistryState (owner, 2026-10-07): `init`
+// seeds it from CONSTANTS.creation_fee, `register` charges whatever the state holds,
+// and this is the only leaf that moves it, in either direction, zero included (zero
+// makes registration free: `register` then asserts no settlement at all).
+//
+// Authorization is the DAO-fee handshake turned to the treasury: a coin whose puzzle
+// hash IS the treasury (CONSTANTS.treasury_puzzle_hash, the recipient of every creation
+// fee) sends a mode-23 message -- sender committed by puzzle hash, receiver by coin id --
+// naming the new fee. Consensus commits the receiver to THIS registry coin, so the
+// message cannot be replayed against another spend of it, and the treasury proves
+// control of its recipient by spending a coin at it; no signature scheme enters the
+// puzzle. The treasury on mainnet is a lock, which emits the message from its own
+// action.
+//
+// Nothing else moves: the slot list is untouched (no slot is spent or created), the
+// pool count is carried, and `initialized` must already be 1 so the fee cannot be set
+// on a registry that was never opened.
+//
+// solution: new_fee
+import upstream::action::StateTruth;
+import forge_action_common::*;
+import forge_registry_common::*;
+
+fn main(
+    CONSTANTS: RegistryConstants,
+    truth: StateTruth,
+    new_fee: Int,
+) -> RegistryOutput {
+    let state = unchecked_cast::<RegistryState>(truth.actual_state);
+    assert state.initialized == 1;
+    assert new_fee >= 0;
+    // Audit F7: the fee goes into the hashed state, so it is stored after arithmetic and
+    // is canonical whatever bytes the solution spelled it with. The treasury's message
+    // names the same canonical value.
+    let fee = new_fee + 0;
+
+    RegistryOutput {
+        state_truth: StateTruth {
+            ephemeral_state: truth.ephemeral_state,
+            actual_state: RegistryState { initialized: 1, pool_count: state.pool_count, creation_fee: fee },
+        },
+        conditions: [
+            ReceiveMessage {
+                mode: SENDER_PUZZLE | RECEIVER_COIN,
+                message: registry_fee_message(fee),
+                sender: [CONSTANTS.treasury_puzzle_hash],
+            },
+        ],
+    }
+}

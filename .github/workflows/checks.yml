@@ -31,4 +31,4 @@ jobs:
       - name: Sage bridge result shaping
         run: python contracts/_test_sage_bridge_result.py
       - name: Curve equivalence
-        run: python contracts/_test_v15_curve_equivalence.py
+        run: python contracts/_test_v16_curve_equivalence.py

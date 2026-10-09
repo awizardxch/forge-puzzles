@@ -2,7 +2,7 @@
 """The wallet side of a keyless pool creation, over Sage RPC.
 
 Revision-agnostic: nothing here depends on which protocol the pool will run, only on
-what the creator's wallet must hand over. The builder (forge_v15_create via
+what the creator's wallet must hand over. The builder (forge_v16_create via
 forge_stdin) never touches a key. What a creator's
 wallet must do is exactly two things, and this bridge does them through the local
 Sage the interface already talks to:
