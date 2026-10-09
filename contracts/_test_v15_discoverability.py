@@ -226,18 +226,32 @@ def main() -> int:
                   burned >= drv.LOCKED_BURN, f"{burned} at the burn address")
 
     print("registry spends reveal each pool's config:")
-    reg_gens = sorted(gens, key=lambda r: int(r["confirmed_block_index"]))
+    # A rollover (scripts/deploy-v15-testnet.py registry --rollover) keeps the outgoing
+    # registry under `retired_registries`, and the pools it admitted stay in the record:
+    # their registrations are in THAT registry's spends. Each pool is counted against the
+    # registry it names (`registry_launcher_id`; unstamped = the current one), so a
+    # rollover can neither hide a missing registration nor fail a record that has one.
+    registries = [reg["launcher_id"]] + [r["launcher_id"] for r in state.get("retired_registries", [])]
     configs = 0
-    for r in reg_gens:
-        if not r["spent"]:
-            continue
-        cs = rpc("get_puzzle_and_solution", {"coin_id": "0x" + coin_name(r), "height": int(r["spent_block_index"])})["coin_solution"]
-        sol = Program.from_bytes(bytes.fromhex(strip(cs["solution"])))
-        inner_sol = list(sol.as_iter())[2]
-        solutions = list(list(inner_sol.as_iter())[2].as_iter())
-        leaf_solution = list(solutions[0].as_iter())
-        if len(leaf_solution) >= 4:   # register: launcher_parent, config, reserves, total_lp, ...
-            configs += 1
+    for launcher in registries:
+        launcher_gens = gens if launcher == reg["launcher_id"] else [
+            r for r in by_hint(launcher) if int(r["coin"]["amount"]) == 1]
+        found = 0
+        for r in sorted(launcher_gens, key=lambda r: int(r["confirmed_block_index"])):
+            if not r["spent"]:
+                continue
+            cs = rpc("get_puzzle_and_solution", {"coin_id": "0x" + coin_name(r), "height": int(r["spent_block_index"])})["coin_solution"]
+            sol = Program.from_bytes(bytes.fromhex(strip(cs["solution"])))
+            inner_sol = list(sol.as_iter())[2]
+            solutions = list(list(inner_sol.as_iter())[2].as_iter())
+            leaf_solution = list(solutions[0].as_iter())
+            if len(leaf_solution) >= 4:   # register: launcher_parent, config, reserves, total_lp, ...
+                found += 1
+        admitted = sum(1 for pool in state["pools"]
+                       if (pool.get("registry_launcher_id") or reg["launcher_id"]) == launcher)
+        check(f"  registry {launcher[:12]}…: every pool it admitted has a readable registration",
+              found == admitted, f"{found} registrations vs {admitted} recorded pools")
+        configs += found
     check("every registration's config is readable from the registry's spends", configs == len(state["pools"]), f"{configs}")
 
     print()
