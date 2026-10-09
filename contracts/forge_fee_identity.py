@@ -50,6 +50,9 @@ from chia_rs.sized_bytes import bytes32
 
 PROOF_TITLE = "The Forge - fee rate"   # ASCII only: it must survive every wallet's signing prompt
 MAX_KEYS = 600
+# The creation gate matches a whole wallet scan (WalletConnect pages run to 5,000 keys);
+# ~0.26 ms a key, so 6,000 is under two seconds.
+MAX_GATE_KEYS = 6000
 MAX_PAYERS = 600
 MAX_EMBEDDED_KEYS = 20
 
@@ -299,7 +302,8 @@ def main() -> int:
     payload = json.loads(sys.stdin.read() or "{}")
     mode = str(payload.get("mode") or "identify")
     if mode == "keys-to-phs":
-        keys = [_clean(k) for k in (payload.get("keys") or [])][:MAX_KEYS]
+        limit = min(int(payload.get("limit") or MAX_KEYS), MAX_GATE_KEYS)
+        keys = [_clean(k) for k in (payload.get("keys") or [])][:limit]
         phs = {}
         for k in keys:
             try:
