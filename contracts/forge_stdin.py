@@ -675,6 +675,15 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
                      _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0),
                      **({"gate_proof_keys": tuple(proof_keys)} if proof_keys else {}))
     out = {"success": True, "action": action, **cre.plan_json(plan)}
+    if action == "prepare-create":
+        # The mempool cost of the whole creation, measured on the unsigned bundle (the
+        # signature does not change the conditions' cost). api/forge-create.js sizes the
+        # network fee from it: the site's tier estimate is a one-swap figure, and a
+        # creation costs 337M+ (testnet, two assets) -- Standard landed under the node's
+        # 5 mojos/cost floor on the first mainnet pair (2026-10-09).
+        from chia_rs import SpendBundle as _SB
+        conds, _adds = drv.validate(_SB([*plan.creator_spends, *plan.router_spends], G2Element()))
+        out["cost"] = int(conds.cost)
     if action == "create":
         def _hex0x(v: Any) -> str:
             text = str(v)
