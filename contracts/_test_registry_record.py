@@ -170,6 +170,47 @@ def main() -> int:
         except SystemExit as exc:
             check("  a registry recipient on the other network's address is refused", "not a" in str(exc), str(exc)[:60])
 
+    print("set-dao repairs a pool committed without its DAO recipient (mainnet's first pair, 2026-10-10)")
+    import tempfile
+    dao = drv.bytes32(b"\x6d" * 32)
+    pool = drv.make_pool([None, drv.bytes32(b"\x77" * 32)], [10**12, 9_000_000], total_lp=9_000_000, leaves="forge",
+                         fee_bps=100, protocol_ph=drv.bytes32(DEV), dao_ph=dao, dao_fee_bps=100)
+    st = pool.state
+    hexcoin = lambda c: {"parent_coin_info": c.parent_coin_info.hex(), "puzzle_hash": c.puzzle_hash.hex(), "amount": int(c.amount)}
+    hexlin = lambda l: None if l is None else {"parent_name": l.parent_name.hex(),
+                                               "inner_puzzle_hash": None if l.inner_puzzle_hash is None else l.inner_puzzle_hash.hex(),
+                                               "amount": int(l.amount)}
+    entry = {"launcher_parent": pool.launcher_parent.hex(), "launcher_id": pool.launcher_id.hex(),
+             "asset_ids": [None if a is None else a.hex() for a in pool.asset_ids], "weights": pool.weights,
+             "fee_bps": pool.fee_bps, "protocol_fee_bps": pool.protocol_fee_bps, "protocol_ph": pool.protocol_ph.hex(),
+             "state": [st[0], st[1], st[2], st[3], bytes(st[4]).hex(), int(st[5]), list(st[6]), [bytes(x).hex() for x in st[7]]],
+             "birth": int(pool.birth), "coin": hexcoin(pool.coin), "lineage": hexlin(pool.lineage),
+             "reserves": [{"coin": hexcoin(r.coin), "lineage": hexlin(r.lineage)} for r in pool.reserves]}
+    broken = record_for(DEV)
+    broken["pools"] = [entry]            # no dao_ph: the shape record_patch committed before the fix
+    with tempfile.TemporaryDirectory() as tmp:
+        held = Path(tmp) / "v16-mainnet.json"
+        held.write_text(json.dumps(broken, indent=1), encoding="utf-8")
+        before = held.read_bytes()
+        for label, launcher, ph in (("a wrong recipient", pool.launcher_id.hex(), "11" * 32),
+                                    ("an unknown launcher", "22" * 32, dao.hex()),
+                                    ("a short hash", pool.launcher_id.hex(), "ab")):
+            try:
+                rr.set_dao(held, launcher, ph)
+                check(f"  {label} is refused", False)
+            except rr.Refused as exc:
+                check(f"  {label} is refused, record untouched", held.read_bytes() == before, exc.code)
+        out = rr.set_dao(held, pool.launcher_id.hex(), dao.hex())
+        after = json.loads(held.read_text(encoding="utf-8"))
+        check("  the right recipient is written, with dao_fee_bps from state[5]",
+              after["pools"][0].get("dao_ph") == dao.hex() and after["pools"][0].get("dao_fee_bps") == 100)
+        check("  the previous record is kept beside it", (Path(tmp) / out["backup"]).read_bytes() == before)
+        check("  the registry's 2**64 survives exactly", after["registry"]["price_scale"] == drv.PRICE_SCALE)
+        import forge_v16_index as index
+        rebuilt = index.pool_from_record(after["pools"][0])
+        check("  and the pool rebuilds to its own puzzle", index.v16.snapshot_to_pool(
+            json.loads(json.dumps(index.v16.pool_to_snapshot(rebuilt)))).coin.puzzle_hash == pool.coin.puzzle_hash)
+
     if "--live" in sys.argv:
         print("testnet11's own record, against the testnet11 chain")
         os.environ["FORGE_NETWORK"] = "testnet11"

@@ -351,6 +351,11 @@ def record_patch(plan_: CreationPlan, registry_record: dict[str, Any]) -> dict[s
             "launcher_parent": pool.launcher_parent.hex(), "launcher_id": pool.launcher_id.hex(), "lp_asset_id": pool.lp_asset_id.hex(),
             "asset_ids": [None if a is None else a.hex() for a in pool.asset_ids], "weights": pool.weights,
             "fee_bps": pool.fee_bps, "protocol_fee_bps": pool.protocol_fee_bps, "protocol_ph": pool.protocol_ph.hex(),
+            # The DAO recipient is curried into the pool's config: without it the index rebuilds a
+            # different puzzle and drops the pool ("snapshot state does not hash to its pool coin's
+            # puzzle"). The first mainnet pair, which has a DAO fee, was left out of the index this way
+            # (2026-10-10); the deploy script's records always carried it.
+            "dao_ph": pool.dao_ph.hex(), "dao_fee_bps": int(st[5]),
             "state": [st[0], st[1], st[2], st[3], bytes(st[4]).hex(), int(st[5]), list(st[6]),
                       [bytes(x).hex() for x in st[7]]],   # V16: reserve parents live in state
             "birth": int(pool.birth),

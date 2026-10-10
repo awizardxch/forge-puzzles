@@ -168,6 +168,43 @@ def upload(record_text: str, held_path: Path, network: str, node_url: str | None
     return {"summary": summary, "pools": len(merged["pools"]), "backup": backup}
 
 
+def set_dao(held_path: Path, launcher_id: str, dao_ph: str) -> dict[str, Any]:
+    """Repair a record pool committed without its DAO recipient (site creations before
+    2026-10-10 left it out, and the index then rebuilt a puzzle that is not the pool's).
+    Written only if the pool then rebuilds to ITS OWN puzzle: forge_v16_index rebuilds it
+    and proves the state against the coin's puzzle hash, so a wrong recipient cannot enter
+    the record. Python holds the record's big integers exactly; JavaScript would not."""
+    import importlib
+    if not held_path.is_file():
+        raise Refused("NO_REGISTRY", "this router holds no registry record")
+    launcher = launcher_id.strip().lower().removeprefix("0x")
+    ph = dao_ph.strip().lower().removeprefix("0x")
+    if len(launcher) != 64 or len(ph) != 64:
+        raise Refused("BAD_REQUEST", "launcher_id and dao_ph are 32 bytes of hex")
+    record = json.loads(held_path.read_text(encoding="utf-8"))
+    pool = next((p for p in record.get("pools") or [] if str(p.get("launcher_id", "")).lower() == launcher), None)
+    if pool is None:
+        raise Refused("BAD_REQUEST", "no pool with that launcher id in the registry record")
+    candidate = dict(pool, dao_ph=ph)
+    if isinstance(pool.get("state"), list) and len(pool["state"]) > 5:
+        candidate["dao_fee_bps"] = int(pool["state"][5])
+    index = importlib.import_module("forge_v16_index")
+    try:
+        rebuilt = index.pool_from_record(candidate)
+        index.v16.snapshot_to_pool(json.loads(json.dumps(index.v16.pool_to_snapshot(rebuilt))))
+    except Exception as exc:  # noqa: BLE001 -- any failure to rebuild is a refusal
+        raise Refused("INCONSISTENT", f"with that DAO recipient the pool still does not rebuild: {type(exc).__name__}: {exc}")
+    if rebuilt.coin.puzzle_hash.hex() != str(pool["coin"]["puzzle_hash"]).lower().removeprefix("0x"):
+        raise Refused("INCONSISTENT", "with that DAO recipient the rebuilt puzzle is not the pool coin's")
+    pool.update(dao_ph=ph, **({"dao_fee_bps": candidate["dao_fee_bps"]} if "dao_fee_bps" in candidate else {}))
+    backup = f"{held_path.name}.before-set-dao-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    shutil.copyfile(held_path, held_path.parent / backup)
+    temp = held_path.with_name(held_path.name + ".tmp")
+    temp.write_text(json.dumps(record, indent=1), encoding="utf-8")
+    os.replace(temp, held_path)
+    return {"launcher_id": launcher, "dao_ph": ph, "backup": backup}
+
+
 def main() -> int:
     payload = json.loads(sys.stdin.read() or "{}")
     network = str(payload.get("network") or "")
@@ -175,6 +212,12 @@ def main() -> int:
     node_url = payload.get("node_url") or None
     held_path = Path(payload["held_path"]) if payload.get("held_path") else None
     try:
+        if payload.get("action") == "set-dao":
+            if not held_path:
+                raise Refused("BAD_REQUEST", "set-dao needs held_path")
+            out = set_dao(held_path, str(payload.get("launcher_id") or ""), str(payload.get("dao_ph") or ""))
+            print(json.dumps({"success": True, **out}))
+            return 0
         if payload.get("action") == "upload":
             if not held_path or not payload.get("record_text"):
                 raise Refused("BAD_REQUEST", "upload needs record_text and held_path")
