@@ -68,7 +68,11 @@ def plan(payload: dict) -> dict:
     # plan-live sat 1-3 mojos above the composer on a saturated pool, and the two
     # agree to the mojo with it (honest 48752 -> 48728 on both sides).
     router_bps = int(payload.get("router_fee_bps", 0))
-    fee_on_output = bool(payload.get("asset_out_native", False))
+    # `router_fee_mode: "surplus"`: the offer is the trader's own wallet's (Sage's
+    # createOffer), which pays the router nothing itself, so the whole input reaches the
+    # pool and the fee comes off the payout whatever its asset (forge_v16_offer
+    # surplus_payout_solution). `amount_out` is then what that offer must ask for.
+    fee_on_output = bool(payload.get("asset_out_native", False)) or payload.get("router_fee_mode") == "surplus"
     if router_bps > 0 and not fee_on_output:
         gross = gross - gross * router_bps // 10_000
         if gross <= 0:

@@ -201,6 +201,42 @@ def swap_case(label, pool, i_in, i_out, put_in, bps=0, ask_delta=0, fee_short=0,
     return out
 
 
+def wallet_case(label, pool, i_in, i_out, put_in, bps, ask_delta=0, expect_ok=True, salt=0x51):
+    """A WALLET-built offer (owner, 2026-10-10): Sage's createOffer, so it sits in the
+    trader's own wallet, as Dexie and TibetSwap take offers. It pays the router nothing
+    itself -- no payment beside the entry, no request to the router -- and asks for the
+    payout less the router's fee. The whole input reaches the pool; the settlement adds one
+    group paying the fee to the router, in the payout's asset. The trader is paid exactly
+    what they signed for; the router group is the only unsigned output."""
+    print(f"wallet-built swap on {label}: asset {i_in} -> {i_out}, {put_in} in at {bps} bps")
+    snap, _ = snapshot_roundtrip(pool)
+    a_in, a_out = pool.asset_ids[i_in], pool.asset_ids[i_out]
+    r, w = pool.state[0], pool.weights
+    honest = v16.forge_math.swap_output(r[i_in], r[i_out], put_in, pool.fee_bps, w[i_in], w[i_out])
+    payout = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
+    fee = payout * bps // 10_000
+    ask = payout - fee + ask_delta
+    offer = fabricate_offer({a_in: put_in}, {a_out: ask}, salt=salt)
+    payload = {"action": "swap", "offer": offer.to_bech32(), "pool": snap, "current_height": H,
+               "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": bps}}
+    try:
+        out = run(payload)
+    except Exception as exc:
+        check("  builder accepted the offer", not expect_ok, f"{type(exc).__name__}: {str(exc)[:110]}")
+        return None
+    if not check("  builder accepted the offer", expect_ok):
+        return None
+    bundle = SpendBundle.from_json_dict(out["bundle"])
+    take = payout - ask
+    check("  the trader is paid exactly what they signed for", paid_to(bundle, TRADER_PH, a_out) == ask, f"{paid_to(bundle, TRADER_PH, a_out)}")
+    check("  the router is paid the rest of the payout, at least its fee, in the payout's asset",
+          paid_to(bundle, ROUTER_PH, a_out) == take and take >= fee and paid_to(bundle, ROUTER_PH, a_in) == 0, f"{take} (fee {fee})")
+    check("  the whole input reached the pool", [int(x) for x in out["pool"]["state"]["reserves"]][i_in] == r[i_in] + put_in)
+    check("  details name the wallet-built side and the router's take",
+          out["forge"]["router_fee_side"] == "output-surplus" and out["forge"]["router_fee"] == take)
+    return out
+
+
 def add_case(label, pool, pct, extra_xch=0, ask_delta=0, expect_ok=True):
     print(f"add on {label}: {pct}% of each reserve")
     snap, _ = snapshot_roundtrip(pool)
@@ -298,6 +334,11 @@ def main() -> int:
     swap_case("triple (weighted)", triple, 1, 2, 5_000)
     swap_case("pair, one mojo more than the payout", pair, 0, 1, 50_000_000, ask_delta=1, expect_ok=False)
     swap_case("pair, one mojo less than the payout (a stale quote)", pair, 0, 1, 50_000_000, ask_delta=-1, expect_ok=False)
+    wallet_case("pair (XCH in, fee in the CAT)", pair, 0, 1, 50_000_000, bps=42)
+    wallet_case("pair (CAT in, fee in XCH)", pair, 1, 0, 2_000, bps=300)
+    wallet_case("cats", cats, 0, 1, 10_000, bps=100)
+    wallet_case("pair, asking one mojo more than payout less fee", pair, 0, 1, 50_000_000, bps=42, ask_delta=1, expect_ok=False)
+    wallet_case("pair, the price moved past the band (a stale quote)", pair, 0, 1, 50_000_000, bps=42, ask_delta=-3, expect_ok=False)
     swap_case("pair, an offer that binds no group (a gift)", pair, 0, 1, 50_000_000, bind=False, expect_ok=False)
 
     print("the router's rate, inside the trader's signature (300 bps):")

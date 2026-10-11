@@ -322,6 +322,35 @@ def exact_payout_solution(offer: Offer, asset: bytes32 | None, amount: int) -> P
     return Program.to(groups)
 
 
+def router_surplus_band(fee: int) -> int:
+    """How far above the fee a wallet-built offer's surplus may sit: a tenth of the fee, at
+    least one mojo. The pool moving a hair in the trader's favour after they signed is not
+    worth a refused trade; anything more is a stale quote (no refund group exists to give
+    it back -- an unsigned refund is what F3 showed a farmer could take)."""
+    return fee // 10 + 1
+
+
+def surplus_payout_solution(offer: Offer, asset: bytes32 | None, payout: int, fee: int,
+                            router_ph: bytes32, nonce: bytes32) -> tuple[Program, int]:
+    """A WALLET-built offer's payout (owner, 2026-10-10: offers made by the trader's own
+    wallet, as Dexie and TibetSwap take them). The offer pays the router nothing itself --
+    a wallet's createOffer cannot request for anyone else -- so it asks for the payout less
+    the router's fee, and the settlement adds one group paying that difference to the
+    router. The trader's bound groups are paid exactly as signed; the router group is the
+    only unsigned output, so the most a block builder could redirect is the router's own
+    fee, never the trader's funds. Returns (solution, the router's take)."""
+    groups = bound_groups(offer, asset)
+    requested = sum(int(p.amount) for p in offer.get_requested_payments().get(asset, []))
+    surplus = payout - requested
+    if surplus < fee:
+        raise OfferRejected(f"the pool pays {payout} of {_asset_name(asset)}; less the router's {fee} that is "
+                            f"{payout - fee}, and the offer asks {requested}: quote again")
+    if surplus > fee + router_surplus_band(fee):
+        raise OfferRejected(f"the pool pays {payout} of {_asset_name(asset)}, the offer asks {requested}, leaving "
+                            f"{surplus} where the router's fee is {fee}: the price moved; quote again")
+    return Program.to([*groups, [nonce, [router_ph, surplus, [router_ph]]]]), surplus
+
+
 def maker_payment_to(offer: Offer, asset: bytes32 | None, puzzle_hash: bytes32) -> int:
     """What the maker's own signed spends pay to `puzzle_hash` in `asset` (CAT-wrapped for a
     CAT), read off the spends as they run."""
@@ -450,13 +479,20 @@ def settle_swap(pool: drv.V16Pool, offer: Offer, height: int, surplus_ph: bytes3
     # signature, where a farmer cannot redirect it (F3, 2026-10-07 review). `in_fee` and
     # `out_fee` are mutually exclusive by construction.
     side = router_fee_side(asset_in, asset_out)
+    # A wallet-built offer (Sage's createOffer, so it sits in the trader's own wallet) pays
+    # the router nothing itself: no payment beside the entry, no request to the router. Its
+    # fee comes off the payout instead, on whichever asset that is (surplus_payout_solution).
+    wallet_built = int(fee_bps) > 0 and maker_payment_to(offer, asset_in, surplus_ph) == 0 \
+        and requested_to(offer, asset_out, surplus_ph) == 0
+    if wallet_built:
+        side = "output-surplus"
     in_fee = router_fee_paid(offer, asset_in, surplus_ph, gross, int(fee_bps)) if side == "input" else 0
     r, w = pool.state[0], pool.weights
     honest = forge_math.swap_output(r[i_in], r[i_out], gross, pool.fee_bps, w[i_in], w[i_out])
     pfee = honest * pool.protocol_fee_bps // 10_000 + honest * pool.dao_fee_bps // 10_000   # protocol + DAO slices
     payout = honest - pfee
-    out_fee = payout * int(fee_bps) // 10_000 if side == "output" else 0
-    if out_fee > 0 and requested_to(offer, asset_out, surplus_ph) < out_fee:
+    out_fee = payout * int(fee_bps) // 10_000 if side in ("output", "output-surplus") else 0
+    if out_fee > 0 and side == "output" and requested_to(offer, asset_out, surplus_ph) < out_fee:
         raise OfferRejected(f"the router's fee is {fee_bps} bps of the {payout} {_asset_name(asset_out)} paid out, {out_fee}; "
                             f"the offer's requested payments pay the router {requested_to(offer, asset_out, surplus_ph)}: "
                             "rebuild the offer with the fee payment")
@@ -472,7 +508,10 @@ def settle_swap(pool: drv.V16Pool, offer: Offer, height: int, surplus_ph: bytes3
             settlement.coin, asset_in, OFFER_MOD, in_solution, lineage_proof=settlement.lineage_proof))
     reserve = pool.reserves[i_out]
     payout_coin = Coin(reserve.coin.name(), settle_ph(asset_out), uint64(payout))
-    sol = exact_payout_solution(offer, asset_out, payout)
+    if wallet_built:
+        sol, out_fee = surplus_payout_solution(offer, asset_out, payout, out_fee, surplus_ph, payout_coin.name())
+    else:
+        sol = exact_payout_solution(offer, asset_out, payout)
     if asset_out is None:
         extra_spends.append(make_spend(payout_coin, OFFER_MOD, sol))
     else:
