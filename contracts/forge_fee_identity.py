@@ -53,7 +53,9 @@ MAX_KEYS = 600
 # The creation gate matches a whole wallet scan (WalletConnect pages run to 5,000 keys);
 # ~0.26 ms a key, so 6,000 is under two seconds.
 MAX_GATE_KEYS = 6000
-MAX_PAYERS = 600
+# A wallet's whole scan (the creation gate's window): the site derives its payers from the
+# keys it shared at connect instead of reading coins over WalletConnect (2026-10-10).
+MAX_PAYERS = 6000
 MAX_EMBEDDED_KEYS = 20
 
 # AGG_SIG_ME's additional data is the network's genesis challenge.
