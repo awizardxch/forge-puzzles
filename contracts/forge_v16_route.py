@@ -87,8 +87,8 @@ for _older in (drv15, drv14):
         assert _older.LP_MELT_INNER.get_tree_hash() == drv.LP_MELT_INNER.get_tree_hash(), \
             f"the LP melt inner moved between {_older.__name__} and V16"
 from forge_offer import ZERO_32, find_offer_settlements, requested_amounts, requested_solution  # noqa: E402
-from forge_v16_offer import (MATH_VERSION, OFFER_PH, OfferRejected, bound_groups, minimum_router_fee,  # noqa: E402
-                             router_fee_paid, settle_ph)
+from forge_v16_offer import (MATH_VERSION, OFFER_PH, OfferRejected, bound_groups, maker_payment_to,  # noqa: E402
+                             minimum_router_fee, requested_to, router_fee_paid, router_surplus_band, settle_ph)
 
 Asset = bytes32 | None     # None is XCH
 
@@ -206,6 +206,12 @@ class _Composer:
         self.fee_bps = int(fee_bps)
         self.fee_ph = fee_ph
         self.router_fee = 0
+        # A WALLET-built offer (owner, 2026-10-10: offers the trader's own wallet makes,
+        # so they sit in its offer list, as Dexie and TibetSwap take them) pays the router
+        # nothing itself; its fee comes off the route's payout instead (pay_trader). Set by
+        # `compose` from the offer, or by a preview asked to size one (`fee_mode="surplus"`).
+        self.wallet_built = False
+        self.router_fee_out = 0
         self.states = [p.state for p in pools]
         self.ephemeral = [None] * len(pools)
         self.steps: list[list] = [[] for _ in pools]
@@ -367,7 +373,7 @@ class _Composer:
         # checked here against the coin, so a crafted request cannot pay a smaller fee.
         # The rate is for the router's service, so it is on the whole entry, a taken
         # offer's share included (owner, 2026-10-05).
-        if source == "offer" and self.fee_bps > 0 and self.fee_ph is not None:
+        if source == "offer" and self.fee_bps > 0 and self.fee_ph is not None and not self.wallet_built:
             if self.preview:
                 self.fee_required += minimum_router_fee(total, self.fee_bps)
             else:
@@ -565,14 +571,36 @@ class _Composer:
             if int(amount) > 0 and _key(asset) not in self.leg_producers:
                 raise OfferRejected(f"the offer requests {_hex(asset)[:8]}, which the route does not release")
         paid: dict[str, int] = {}
+        if self.wallet_built and len(self.leg_producers) != 1:
+            # The fee is a rate on the payout; with two payout assets which one carries it
+            # would be the trader's pick. Such a route keeps the site-built offer.
+            raise OfferRejected("a route paying out more than one asset cannot take a wallet-built offer; "
+                                "the site builds this one")
         for key in list(self.leg_producers):
             asset = _asset(bytes32(key))
             producers = self.take(asset, "legs")
             total = sum(int(p.coin.amount) for p in producers)
             requested = int(wanted.get(asset, 0))
+            fee = total * self.fee_bps // 10_000 if self.wallet_built else 0
             if self.preview:
                 self.released[_hex(asset)] = total
-                paid[_hex(asset)] = total
+                paid[_hex(asset)] = total - fee
+                self.router_fee_out = fee
+                continue
+            if self.wallet_built:
+                # The trader's groups are paid exactly as signed; one group nobody signed pays
+                # the router the rest, which must be its fee (plus a hair the pools moved in
+                # the trader's favour). The most a block builder could redirect is that fee.
+                surplus = total - requested
+                if surplus < fee:
+                    raise OfferRejected(f"the route releases {total} of {_hex(asset)[:8]}; less the router's {fee} that is "
+                                        f"{total - fee}, and the offer asks {requested}: quote again")
+                if surplus > fee + router_surplus_band(fee):
+                    raise OfferRejected(f"the route releases {total} of {_hex(asset)[:8]}, the offer asks {requested}, leaving "
+                                        f"{surplus} where the router's fee is {fee}: the price moved; quote again")
+                self.spend_hub(producers, [[self.fee_ph, surplus, [self.fee_ph]]], bound_groups(self.offer, asset), asset)
+                self.router_fee = surplus
+                paid[_hex(asset)] = requested
                 continue
             if requested != total:
                 raise OfferRejected(f"the route releases {total} of {_hex(asset)[:8]}, the offer asks {requested}: an offer "
@@ -673,7 +701,7 @@ def _take_external(c: "_Composer", maker: Offer, entry: set, exits: set, candida
 
 def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph: bytes32,
             fee_bps: int = 0, fee_ph: bytes32 | None = None, externals: list | None = None,
-            preview: bool = False) -> RouteResult:
+            preview: bool = False, fee_mode: str = "auto") -> RouteResult:
     all_cats = {a for p in pools for a in p.asset_ids if a is not None} | {p.lp_asset_id for p in pools}
     offered = find_offer_settlements(offer, sorted(all_cats))
     wanted = requested_amounts(offer)
@@ -707,6 +735,12 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
             raise OfferRejected(f"the offer does not provide {_hex(leg.asset_in)[:8]}, which an entry leg consumes")
 
     c = _Composer(pools, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview)
+    if int(fee_bps) > 0 and fee_ph is not None:
+        # Wallet-built: the offer pays the router nothing, beside the entry or as a request.
+        # A preview has no real offer, so it is told which kind it is sizing.
+        c.wallet_built = fee_mode == "surplus" if preview else (
+            all(maker_payment_to(offer, a, fee_ph) == 0 for a in offered)
+            and all(requested_to(offer, a, fee_ph) == 0 for a in wanted))
     for asset, s in offered.items():
         c.offer_producers[_key(asset)] = Producer(s.coin, asset, s.lineage_proof, "offer settlement")
     candidates = sorted(all_cats | {a for a in wanted if a is not None})
@@ -783,14 +817,17 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
         # states the legs left behind; nothing was validated and nothing can be pushed.
         successors = [pool.advance(c.states[i]) for i, pool in enumerate(c.pools) if c.steps[i]]
         details = {"h": int(height), "paid_out": paid, "releases": dict(c.released),
-                   "router_fee_required": c.fee_required, "router_fee_side": "input" if c.fee_required else "none",
+                   "router_fee_required": c.fee_required,
+                   "router_fee_side": "output-surplus" if c.wallet_built else "input" if c.fee_required else "none",
+                   **({"router_fee_out": c.router_fee_out} if c.wallet_built or fee_mode == "surplus" else {}),
                    "router_fee_bps": int(fee_bps), **extra,
                    "requested": {_hex(a): int(v) for a, v in wanted.items()},
                    **({"taken_offers": c.ext_details} if c.ext_details else {})}
         return RouteResult(None, successors, legs, details)
     bundle, successors, cost = c.assemble()
     details = {"h": int(height), "cost": cost, "paid_out": paid, "surplus": c.surplus,
-               "router_fee": c.router_fee, "router_fee_side": "input" if c.router_fee else "none",
+               "router_fee": c.router_fee,
+               "router_fee_side": "output-surplus" if c.wallet_built else "input" if c.router_fee else "none",
                "router_fee_bps": int(fee_bps), **extra,
                "requested": {_hex(a): int(v) for a, v in wanted.items()},
                **({"taken_offers": c.ext_details} if c.ext_details else {})}
@@ -901,7 +938,7 @@ def wrap_backing(pools: list, path: list, offered_xch: int, fee_bps: int = 0) ->
 
 
 def multihop_swap(pools: list, path: list, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,
-                  preview: bool = False) -> RouteResult:
+                  preview: bool = False, fee_mode: str = "auto") -> RouteResult:
     """pools[i] carries path[i] -> path[i+1]; the offer funds path[0] and requests path[-1]."""
     if len(pools) < 2:
         raise OfferRejected("a multi-hop route needs at least two pools")
@@ -919,13 +956,13 @@ def multihop_swap(pools: list, path: list, offer: Offer, height: int, surplus_ph
         # The settlement already holds the net: the router's fee is paid beside it by the
         # trader's own spend, so nothing is carved from the hub and the split is exact.
         legs[0].amount_in, _backing = wrap_backing(pools, path, int(offered[None].coin.amount))
-    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview)
+    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
     return RouteResult(result.bundle, result.pools, legs,
                        {**result.details, "amounts": [legs[0].gross, *[leg.out for leg in legs]]})
 
 
 def split_swap(branches: list, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,
-               externals: list | None = None, preview: bool = False) -> RouteResult:
+               externals: list | None = None, preview: bool = False, fee_mode: str = "auto") -> RouteResult:
     """branches: [(pools, path, amount_in)], pool-disjoint, sharing the entry and exit asset.
 
     `externals`: maker offers (Dexie's open offers) taken inside the same bundle, each
@@ -946,7 +983,8 @@ def split_swap(branches: list, offer: Offer, height: int, surplus_ph: bytes32, f
         mine = _chain(distinct, pools, path, amount_in)
         legs.extend(mine)
         branch_legs.append(mine)
-    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, externals=externals, preview=preview)
+    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, externals=externals, preview=preview,
+                     fee_mode=fee_mode)
     taken_out = sum(int(t["amount_out"]) for t in result.details.get("taken_offers", []))
     return RouteResult(result.bundle, result.pools, legs, {
         **result.details,
@@ -979,7 +1017,7 @@ def flow_balance(specs: list, offer: Offer, height: int, surplus_ph: bytes32, st
 
 
 def vault_route(swap_pool, asset_in, vault, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,
-                preview: bool = False) -> RouteResult:
+                preview: bool = False, fee_mode: str = "auto") -> RouteResult:
     """Swap `asset_in` into the vault's LP on `swap_pool`, then redeem it in the vault."""
     if len(vault.asset_ids) != 1:
         raise OfferRejected("the vault has one reserve asset")
@@ -988,7 +1026,7 @@ def vault_route(swap_pool, asset_in, vault, offer: Offer, height: int, surplus_p
         raise OfferRejected("the swap pool does not hold the vault's LP")
     a_in = _asset(asset_in)
     legs = [Leg(0, "swap", a_in, lp, amount_in=1, entry=True), Leg(1, "redeem", lp, vault.asset_ids[0], amount_in=1)]
-    result = compose([swap_pool, vault], legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview)
+    result = compose([swap_pool, vault], legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
     return RouteResult(result.bundle, result.pools, legs,
                        {**result.details, "swap_out": legs[0].out, "redeemed": legs[1].out})
 

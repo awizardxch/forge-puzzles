@@ -87,6 +87,44 @@ def exact_offer(payload: dict, offered: dict, out_asset, salt: int, bps: int = 0
     return fabricate_offer(offered, {out_asset: want}, salt=salt, payments=payments), want
 
 
+def wallet_offer(payload: dict, offered: dict, out_asset, salt: int, ask_delta: int = 0):
+    """A WALLET-built offer for this route (owner, 2026-10-10): Sage's createOffer, so it
+    sits in the trader's own wallet. It pays the router nothing itself and asks for the
+    release less the router's fee, both read from the composer's preview in surplus mode
+    (the probe's `router_fee_mode`). Returns the offer, the release and the fee."""
+    probe = fabricate_offer(offered, {out_asset: 1}, salt=salt)
+    preview = run({**payload, "offer": probe.to_bech32(), "preview": True, "probe": {"router_fee_mode": "surplus"}})
+    release = int(preview["forge"]["releases"][hx(out_asset)])
+    fee = int(preview["forge"].get("router_fee_out", -1))
+    return fabricate_offer(offered, {out_asset: release - fee + ask_delta}, salt=salt), release, fee
+
+
+def wallet_case(label, payload, offered, out_asset, salt, bps, entry_asset=None):
+    print(f"wallet-built {label} at {bps} bps: the router's fee comes off the payout")
+    charged = {**payload, "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": bps}}
+    offer, release, fee = wallet_offer(charged, offered, out_asset, salt)
+    zero, _, _ = wallet_offer(payload, offered, out_asset, salt)
+    check("  the preview names the fee: the rate on the release", fee == release * bps // 10_000, f"{fee} of {release}")
+    out = attempt(f"wallet-built {label}", {**charged, "offer": offer.to_bech32()})
+    if not out:
+        return None
+    bundle = SpendBundle.from_json_dict(out["bundle"])
+    check("  the trader is paid exactly what they signed for", paid_to(bundle, TRADER_PH, out_asset) == release - fee,
+          f"{paid_to(bundle, TRADER_PH, out_asset)} vs {release - fee}")
+    check("  the router is paid its fee in the payout's asset, and nothing of the entry",
+          paid_to(bundle, ROUTER_PH, out_asset) == fee and paid_to(bundle, ROUTER_PH, entry_asset) == 0,
+          f"{paid_to(bundle, ROUTER_PH, out_asset)} vs {fee}")
+    check("  the whole entry reached the pools: the release matches the uncharged route's",
+          release == int(run({**payload, "offer": zero.to_bech32(), "preview": True})["forge"]["releases"][hx(out_asset)]))
+    check("  details name the wallet-built side and the router's take",
+          out["forge"]["router_fee_side"] == "output-surplus" and int(out["forge"]["router_fee"]) == fee, f"{out['forge'].get('router_fee_side')}")
+    greedy, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=1)
+    attempt(f"wallet-built {label}, asking one mojo more than the release less the fee", {**charged, "offer": greedy.to_bech32()}, expect_ok=False)
+    stale, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=-(fee // 10 + 2))
+    attempt(f"wallet-built {label}, the price moved past the band", {**charged, "offer": stale.to_bech32()}, expect_ok=False)
+    return out
+
+
 def main() -> int:
     if not drv.v16_available():
         print("  [skip] V11 puzzles not built"); return 2
@@ -494,6 +532,21 @@ def main() -> int:
               f"{after['reserves']}")
         check("  the protocol fee on the swap is owed", [int(f) for f in after["fees_owed"]] == [0, gross_a - a_out], f"{after['fees_owed']}")
         check("  total_lp grew by the mint", int(after["total_lp"]) == xa.state[1] + minted)
+
+    # Wallet-built offers (owner, 2026-10-10): every route's offer made by the trader's own
+    # wallet, so it shows in Sage, the router's fee taken off the final payout.
+    wallet_case("multi-hop XCH -> A -> B", hop2, {None: 100_000_000}, T_B, 0x91, 300)
+    wallet_case("multi-hop XCH -> A -> B -> C", hop3, {None: 100_000_000}, T_C, 0x92, 42)
+    wallet_case("split XCH -> A", split2, {None: 100_000_000}, T_A, 0x93, 100)
+    wallet_case("vault route XCH -> LP -> A", vroute, {None: 50_000_000}, T_A, 0x94, 300)
+    wallet_case("multi-hop B -> A -> XCH (fee in XCH)", {**hop2, "pools": [snap(ab), snap(xa)], "path": [hx(T_B), hx(T_A), hx(None)]},
+                {T_B: 20_000}, None, 0x95, 300, entry_asset=T_B)
+    # An exempt wallet (0 bps) pays nothing either way: its plain offer settles exactly.
+    plain, release0, fee0 = wallet_offer(hop2, {None: 100_000_000}, T_B, 0x96)
+    check("wallet-built at 0 bps: no fee is sized", fee0 == 0, f"{fee0}")
+    out0 = attempt("wallet-built at 0 bps", {**hop2, "offer": plain.to_bech32()})
+    if out0:
+        check("  the trader receives the whole release", paid_to(SpendBundle.from_json_dict(out0["bundle"]), TRADER_PH, T_B) == release0)
 
     print("lane guards")
     v10_like = dict(snap(xa)); v10_like["protocol_version"] = 10

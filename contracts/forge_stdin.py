@@ -463,11 +463,19 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
     # `preview`: size the route from the offer's coins and report what it releases and the
     # fee it needs, without settling -- the exact figures an offer must carry.
     preview = bool(payload.get("preview"))
+    # A preview sizing a WALLET-built offer (the probe's `router_fee_mode: "surplus"`): the
+    # router's fee comes off the payout, so the release less `router_fee_out` is what the
+    # offer asks. Only a composer that settles such offers (V16) is told; an older one
+    # sizes the site-built offer as before, and the page keeps that.
+    mode = {}
+    probe = payload.get("probe") if isinstance(payload.get("probe"), dict) else {}
+    if preview and probe.get("router_fee_mode") == "surplus" and "fee_mode" in rt.compose.__code__.co_varnames:
+        mode = {"fee_mode": "surplus"}
     if action == "multihop-swap":
         pools = [_lane_pool(entry) for entry in payload["pools"]]
         surplus = surplus_ph if surplus_ph is not None else pools[0].protocol_ph
         result = rt.multihop_swap(pools, [_bytes32(str(a)) for a in payload["path"]], offer, height, surplus,
-                                  fee_bps, fee_ph, preview=preview)
+                                  fee_bps, fee_ph, preview=preview, **mode)
         extra = {"amounts": [str(a) for a in result.details["amounts"]],
                  "dev_fee_collected": str(result.details.get("router_fee", 0))}
         if "wrap" in result.details:
@@ -478,7 +486,7 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
         surplus = surplus_ph if surplus_ph is not None else branches[0][0][0].protocol_ph
         # Dexie open offers taken inside the same bundle (fixed-size, so each is taken whole).
         externals = [offer_from_bech32(o) for o in payload.get("dexieOffers") or []]
-        result = rt.split_swap(branches, offer, height, surplus, fee_bps, fee_ph, externals=externals, preview=preview)
+        result = rt.split_swap(branches, offer, height, surplus, fee_bps, fee_ph, externals=externals, preview=preview, **mode)
         extra = {"branch_amounts": [[str(a) for a in amounts] for amounts in result.details["branch_amounts"]],
                  "total_out": str(result.details["total_out"]),
                  "dev_fee_collected": str(result.details.get("router_fee", 0)),
@@ -508,7 +516,8 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
     elif action == "vault-route":
         swap_pool, vault = _lane_pool(payload["swapPool"]), _lane_pool(payload["vault"])
         result = rt.vault_route(swap_pool, _bytes32(str(payload["assetIn"])), vault, offer, height,
-                                  surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph, preview=preview)
+                                  surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph, preview=preview,
+                                  **mode)
         extra = {"swap_out": str(result.details["swap_out"]), "redeemed": str(result.details["redeemed"])}
     else:
         raise ValueError(f"unknown route lane {action!r}")
