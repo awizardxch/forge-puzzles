@@ -17,7 +17,11 @@ bundle through Sage's sendTransaction. The counter-offer must request exactly wh
 maker offers and offer exactly what the maker requests: no arbitrage is left for
 anyone to take, so nothing in the bundle is unsigned value.
 
-stdin:  {action, maker_offer, taker_offer?, network: "mainnet" | "testnet11"}
+Several makers at once (owner, 2026-10-11: Dexie offers aggregated for the best price):
+`maker_offers` lists them; the counter-offer mirrors their sum, and all settle in one
+bundle or none does.
+
+stdin:  {action, maker_offer | maker_offers, taker_offer?, network: "mainnet" | "testnet11"}
 stdout: {success, ...} | {success: false, error}
 """
 from __future__ import annotations
@@ -32,6 +36,7 @@ from chia_rs import validate_clvm_and_signature
 from chia_rs.sized_bytes import bytes32
 
 MAX_LEGS = 4
+MAX_MAKERS = 8
 TESTNET11_GENESIS = bytes.fromhex("37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615")
 
 
@@ -59,8 +64,23 @@ def _read(text: str, what: str) -> Offer:
     return Offer.from_bech32(text)
 
 
-def plan(maker: Offer) -> dict:
-    offered, requested = _amounts(maker.get_offered_amounts()), _amounts(maker.get_requested_amounts())
+def _sum(maps) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for m in maps:
+        for k, v in m.items():
+            out[k] = out.get(k, 0) + v
+    return out
+
+
+def plan(makers) -> dict:
+    makers = makers if isinstance(makers, list) else [makers]
+    if not makers or len(makers) > MAX_MAKERS:
+        raise ValueError(f"take 1 to {MAX_MAKERS} offers at once")
+    for maker in makers:
+        if not maker.get_offered_amounts() or not maker.get_requested_amounts():
+            raise ValueError("every maker's offer must offer something and request something")
+    offered = _sum(_amounts(m.get_offered_amounts()) for m in makers)
+    requested = _sum(_amounts(m.get_requested_amounts()) for m in makers)
     if not offered or not requested:
         raise ValueError("the maker's offer must offer something and request something")
     if len(offered) > MAX_LEGS or len(requested) > MAX_LEGS:
@@ -68,15 +88,16 @@ def plan(maker: Offer) -> dict:
     return {"offered": offered, "requested": requested}
 
 
-def assemble(maker: Offer, taker: Offer, network: str):
-    made = plan(maker)
+def assemble(makers, taker: Offer, network: str):
+    makers = makers if isinstance(makers, list) else [makers]
+    made = plan(makers)
     countered = {"offered": _amounts(taker.get_offered_amounts()), "requested": _amounts(taker.get_requested_amounts())}
     # Exactly the mirror: the counter-offer pays what the maker asks and asks what the
     # maker offers, so the aggregate balances with no arbitrage left unsigned.
     if countered["offered"] != made["requested"] or countered["requested"] != made["offered"]:
         raise ValueError(f"the counter-offer must offer {made['requested']} and request {made['offered']}; "
                          f"it offers {countered['offered']} and requests {countered['requested']}")
-    bundle = Offer.aggregate([maker, taker]).to_valid_spend()
+    bundle = Offer.aggregate([*makers, taker]).to_valid_spend()
     constants = constants_for(network)
     try:
         conds, _, _ = validate_clvm_and_signature(bundle, int(constants.MAX_BLOCK_COST_CLVM), constants, 10**8)
@@ -92,13 +113,16 @@ def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         action = payload.get("action")
-        maker = _read(payload.get("maker_offer"), "maker_offer")
+        raw = payload.get("maker_offers")
+        makers = [_read(m, "maker_offers[]") for m in raw] if isinstance(raw, list) else [_read(payload.get("maker_offer"), "maker_offer")]
+        if len({m.to_bech32() for m in makers}) != len(makers):
+            raise ValueError("the same offer is listed twice")
         if action == "plan":
-            out = {"success": True, **plan(maker)}
+            out = {"success": True, **plan(makers)}
         elif action == "assemble":
             taker = _read(payload.get("taker_offer"), "taker_offer")
             network = "mainnet" if payload.get("network") == "mainnet" else "testnet11"
-            bundle, cost, fee = assemble(maker, taker, network)
+            bundle, cost, fee = assemble(makers, taker, network)
             out = {"success": True, "bundle": bundle.to_json_dict(), "transaction_id": bundle.name().hex(),
                    "cost": cost, "fee": fee}
         else:

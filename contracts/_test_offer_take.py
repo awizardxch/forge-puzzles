@@ -75,6 +75,29 @@ def main() -> int:
     check("something that is not an offer is refused", out.get("success") is False)
     check("the constants differ by network", offer_take.constants_for("mainnet") is not offer_take.constants_for("testnet11"))
 
+    print("several makers at once (Dexie offers aggregated for the best price)")
+    n_sk, n_inner, n_ph = wallet(0x43)   # a second Dexie maker
+    second = std_offer(n_sk, n_inner, n_ph, T_B, 1_000, T_A, 800_000, 0xC5)
+    both = run({"action": "plan", "maker_offers": [maker.to_bech32(), second.to_bech32()]})
+    check("the plan sums what the makers offer and request",
+          both.get("offered") == {T_B.hex(): b_offered + 1_000} and both.get("requested") == {T_A.hex(): a_requested + 800_000},
+          json.dumps({k: both.get(k) for k in ("offered", "requested")}))
+    mirror = std_offer(t_sk, t_inner, t_ph, T_A, a_requested + 800_000, T_B, b_offered + 1_000, 0xC6)
+    out = run({"action": "assemble", "maker_offers": [maker.to_bech32(), second.to_bech32()],
+               "taker_offer": mirror.to_bech32(), "network": "testnet11"})
+    check("one counter-offer takes both makers in one bundle (all three signatures)", out.get("success") is True, out.get("error", "")[:160])
+    if out.get("success"):
+        from chia_rs import SpendBundle
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  each maker is paid exactly what it asked",
+              paid_to(bundle, m_ph, T_A) == a_requested and paid_to(bundle, n_ph, T_A) == 800_000)
+        check("  the app's wallet gets both makers' B", paid_to(bundle, t_ph, T_B) == b_offered + 1_000, str(paid_to(bundle, t_ph, T_B)))
+    out = run({"action": "assemble", "maker_offers": [maker.to_bech32(), second.to_bech32()],
+               "taker_offer": taker.to_bech32(), "network": "testnet11"})
+    check("a counter-offer mirroring only one of two makers is refused", out.get("success") is False, out.get("error", "")[:100])
+    out = run({"action": "plan", "maker_offers": [maker.to_bech32(), maker.to_bech32()]})
+    check("the same offer listed twice is refused", out.get("success") is False and "twice" in out.get("error", ""))
+
     print()
     passed = sum(results)
     print(f"{passed}/{len(results)} offer-take checks passed")
