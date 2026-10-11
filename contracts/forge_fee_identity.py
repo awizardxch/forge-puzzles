@@ -204,6 +204,15 @@ def message_digest(message: str) -> bytes:
     return hashlib.sha256(message.encode("utf-8")).digest()
 
 
+def chip0002_digest(message: str) -> bytes:
+    """What a wallet's chip0002_signMessage signs: the tree hash of ("Chia Signed Message",
+    message), the message as UTF-8 (Sage: wallet_connect.rs sign_message_with_public_key,
+    parse_signature_message -- text that is not all hex is taken as its bytes). Signing this
+    way shows the message itself in the wallet's prompt, where a stand-in spend shows only
+    "Spent Coins / Transaction Output" (owner, 2026-10-10)."""
+    return bytes(Program.to((b"Chia Signed Message", message.encode("utf-8"))).get_tree_hash())
+
+
 def _field(message: str, name: str) -> str | None:
     for line in message.splitlines():
         if line.startswith(name + ":"):
@@ -223,7 +232,10 @@ def verify_proof(proof: dict, network_id: str, offer_payers: list[str] | None) -
         message = str(proof.get("message") or "")
         keys = [_clean(k) for k in (proof.get("keys") or [])]
         payers = [_clean(p) for p in (proof.get("payers") or [])]
-        sig = G2Element.from_bytes(bytes.fromhex(_clean(proof.get("signature"))))
+        # One aggregate signature, or one per key (a wallet's signMessage answers per key).
+        listed = proof.get("signatures")
+        sig = (AugSchemeMPL.aggregate([G2Element.from_bytes(bytes.fromhex(_clean(x))) for x in listed])
+               if isinstance(listed, list) and listed else G2Element.from_bytes(bytes.fromhex(_clean(proof.get("signature")))))
         pks = [G1Element.from_bytes(bytes.fromhex(k)) for k in keys]
     except Exception as exc:  # noqa: BLE001 -- a malformed proof is a reason, not a crash
         return refuse(f"malformed proof: {exc}")
@@ -246,7 +258,8 @@ def verify_proof(proof: dict, network_id: str, offer_payers: list[str] | None) -
         return refuse("the proof's key digest does not match the keys it lists")
     if _field(message, "Payers") != list_digest(payers):
         return refuse("the proof's payer digest does not match the payers it lists")
-    digest = message_digest(message)
+    # AGG_SIG_UNSAFE over sha256(message) (the stand-in spend), or chip0002_signMessage.
+    digest = chip0002_digest(message) if proof.get("scheme") == "chip0002" else message_digest(message)
     if not AugSchemeMPL.aggregate_verify(pks, [digest] * len(pks), sig):
         return refuse("the signature is not every listed key's over the message")
     proven = sorted({key_ph(k) for k in keys})
@@ -324,7 +337,9 @@ def main() -> int:
             str(payload["node_url"]), list(payload.get("phs") or []), list(payload.get("assets") or []))}))
         return 0
     if mode == "sign-keys":
-        digest = message_digest(str(payload["message"]))
+        # For checks. scheme "chip0002" signs as a wallet's chip0002_signMessage does.
+        chip0002 = payload.get("scheme") == "chip0002"
+        digest = chip0002_digest(str(payload["message"])) if chip0002 else message_digest(str(payload["message"]))
         keys, sigs, phs = [], [], []
         for raw in payload["secret_keys"]:
             sk = calculate_synthetic_secret_key(PrivateKey.from_bytes(bytes.fromhex(_clean(raw))), DEFAULT_HIDDEN_PUZZLE_HASH)
@@ -332,7 +347,8 @@ def main() -> int:
             keys.append(_hex(bytes(pk)))
             sigs.append(AugSchemeMPL.sign(sk, digest))
             phs.append(_hex(puzzle_for_synthetic_public_key(pk).get_tree_hash()))
-        print(json.dumps({"success": True, "keys": keys, "signature": _hex(bytes(AugSchemeMPL.aggregate(sigs))), "phs": phs}))
+        print(json.dumps({"success": True, "keys": keys, "signature": _hex(bytes(AugSchemeMPL.aggregate(sigs))), "phs": phs,
+                          "signatures": [_hex(bytes(s)) for s in sigs]}))
         return 0
     if mode == "probe-offer":
         from chia.types.blockchain_format.coin import Coin
