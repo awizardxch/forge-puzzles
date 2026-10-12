@@ -522,12 +522,13 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
                                   **mode)
         extra = {"swap_out": str(result.details["swap_out"]), "redeemed": str(result.details["redeemed"])}
     elif action == "zap-in":
-        # XCH into a pool without XCH: one sale per asset on that asset's XCH pool ("pools"),
-        # sized by the composer so what is left backs the mint exactly.
+        # One asset into a pool's LP (forge_v16_route.zap_in): XCH into a pool without XCH, or
+        # a CAT the pool holds. "pools" names the XCH pools each target asset is traded on
+        # (none for a CAT into a pool holding XCH, which sells on the pool itself).
         if not hasattr(rt, "zap_in"):
             raise ValueError("this pool revision has no zap-in lane")
         target = _lane_pool(payload["pool"])
-        result = rt.zap_in(target, [_lane_pool(entry) for entry in payload["pools"]], offer, height,
+        result = rt.zap_in(target, [_lane_pool(entry) for entry in payload.get("pools") or []], offer, height,
                            surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview, **mode)
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
         extra = {"target": _snapshot_of(target_after),
