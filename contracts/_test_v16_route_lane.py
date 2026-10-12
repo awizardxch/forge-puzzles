@@ -538,6 +538,13 @@ def main() -> int:
     wallet_case("multi-hop XCH -> A -> B", hop2, {None: 100_000_000}, T_B, 0x91, 300)
     wallet_case("multi-hop XCH -> A -> B -> C", hop3, {None: 100_000_000}, T_C, 0x92, 42)
     wallet_case("split XCH -> A", split2, {None: 100_000_000}, T_A, 0x93, 100)
+    # Branch amounts that do not divide the entry evenly (mainnet, 2026-10-12): the floored
+    # shares fell a mojo short of the hub, the preview passed and settlement refused with
+    # "the 00000000 hub holds 1 more than the offer asks for". The shortfall now goes to
+    # the largest branch, so preview and settlement agree to the mojo.
+    odd = {**split2, "branches": [{**split2["branches"][0], "amountIn": 62_812_502},
+                                  {**split2["branches"][1], "amountIn": 36_767_497}]}
+    wallet_case("split XCH -> A, branch shares that do not divide the entry", odd, {None: 100_000_001}, T_A, 0x97, 300)
     wallet_case("vault route XCH -> LP -> A", vroute, {None: 50_000_000}, T_A, 0x94, 300)
     wallet_case("multi-hop B -> A -> XCH (fee in XCH)", {**hop2, "pools": [snap(ab), snap(xa)], "path": [hx(T_B), hx(T_A), hx(None)]},
                 {T_B: 20_000}, None, 0x95, 300, entry_asset=T_B)

@@ -394,8 +394,18 @@ class _Composer:
         if len(producers) == 1 and len(consumers) == 1 and not external:
             consumers[0].gross = total
             return producers
-        # the declared shares of what the producers actually hold
-        grosses = nudge_equal_shares([d * spendable // sum(declared) for d in declared])
+        # the declared shares of what the producers actually hold. Each share floors, so the
+        # shares can fall a few mojos short of the hub, and a hub must pay out exactly what
+        # it holds: the shortfall goes to the largest share, in the preview and at settlement
+        # alike. Without it a wallet-built split (the whole entry in, the declared branch
+        # amounts sized on less) previewed fine and was refused when it settled -- "the
+        # 00000000 hub holds 1 more than the offer asks for" (mainnet, 2026-10-12).
+        shares = [d * spendable // sum(declared) for d in declared]
+        short = spendable - sum(shares)
+        if short > 0:
+            biggest = max(range(len(shares)), key=lambda i: shares[i])
+            shares[biggest] += short
+        grosses = nudge_equal_shares(shares)
         for c, g in zip(consumers, grosses):
             c.gross = g
             if g <= 0:
