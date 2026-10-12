@@ -821,6 +821,16 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
                 marker = Leg(add_leg.pool, "add", asset_in=asset, amount_in=rest)
                 by_input[key].append(marker)
                 remainders[_key(asset)] = marker
+        # A target without XCH still needs XCH for the mint's backing: when sales drink the
+        # offered XCH, the rest is held back for the add (zap_in sizes it to the mint).
+        key = (_key(None), "offer")
+        if None not in target.asset_ids and None in offered and key in by_input:
+            rest = int(offered[None].coin.amount) - sum(int(x.amount_in) for x in by_input[key])
+            if rest <= 0:
+                raise OfferRejected("the sales sell all the offered XCH; nothing is left to back the mint")
+            marker = Leg(add_leg.pool, "add", asset_in=None, amount_in=rest)
+            by_input[key].append(marker)
+            remainders[_key(None)] = marker
 
     settlements: dict[int, Producer] = {}
     extra: dict[str, Any] = {}
@@ -1086,6 +1096,87 @@ def routed_deposit(target, sales: list, offer: Offer, height: int, surplus_ph: b
     result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
     return RouteResult(result.bundle, result.pools, legs,
                        {**result.details, "sale_outputs": [leg.out for leg in sale_legs]})
+
+
+def zap_in_sales(target, sale_pools: list, offered_xch: int) -> list[int]:
+    """XCH into a pool that holds none (owner, 2026-10-12: a zap into the ❤️/🌱 LP found no
+    route). The offered XCH is sold into each of the target's two assets on that asset's own
+    XCH pool, both outputs are deposited, and what is left backs the mint: every LP mojo is
+    an XCH mojo of bundle value, and the add refuses XCH beyond it. So the sales must leave
+    EXACTLY the mint: `sum(sales) + mint == offered_xch`.
+
+    The split between the two sales deposits in the target's own ratio (no imbalance fee).
+    The total sold is the largest whose mint still fits; the mint moves one mojo per ~1/mint
+    of the input, so the sum steps by one almost everywhere, and where it skips the
+    neighbouring splits are tried. Returns the two declared sale amounts."""
+    if len(target.asset_ids) != 2 or None in target.asset_ids:
+        raise OfferRejected("an XCH zap through sales is for a two-asset pool without XCH")
+    if len(sale_pools) != 2 or any(None not in p.asset_ids or a not in p.asset_ids
+                                   for p, a in zip(sale_pools, target.asset_ids)):
+        raise OfferRejected("each of the target's assets needs its own XCH pool to buy it on")
+    if any(p.launcher_id == target.launcher_id for p in sale_pools) or sale_pools[0].launcher_id == sale_pools[1].launcher_id:
+        raise OfferRejected("the sales and the target are three different pools")
+    r = target.state[0]
+
+    def out(i: int, amount: int) -> int:
+        return simulate_chain([sale_pools[i]], [None, target.asset_ids[i]], amount)[-1] if amount > 0 else 0
+
+    def split(total: int) -> int:
+        # the first sale's share: the smallest a0 whose output leads the target's ratio
+        lo, hi = 1, total - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if out(0, mid) * r[1] >= out(1, total - mid) * r[0]:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def mint(a0: int, a1: int) -> int:
+        try:
+            return forge_math.invariant_lp_mint(r, [out(0, a0), out(1, a1)], target.state[1], target.fee_bps,
+                                                target.weights, version=MATH_VERSION)
+        except (ValueError, ZeroDivisionError):
+            return 0
+
+    def fits(total: int) -> bool:
+        a0 = split(total)
+        m = mint(a0, total - a0)
+        return m > 0 and total + m <= offered_xch
+
+    lo, hi, best = 2, offered_xch - 2, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    if not best:
+        raise OfferRejected("the offered XCH is too little to buy both assets and back the mint")
+    base = split(best)
+    for total in (best, best + 1, best - 1, best + 2):
+        for a0 in (base, base + 1, base - 1, base + 2, base - 2):
+            a1 = total - a0
+            if a0 <= 0 or a1 <= 0:
+                continue
+            m = mint(a0, a1)
+            # equal shares are nudged apart by the hub (nudge_equal_shares), which would move the backing
+            if m > 0 and total + m == offered_xch and len({a0, a1, m}) == 3:
+                return [a0, a1]
+    raise OfferRejected("no split of this amount leaves exactly the mint's backing; change the amount by a mojo and quote again")
+
+
+def zap_in(target, sale_pools: list, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0,
+           fee_ph: bytes32 | None = None, preview: bool = False, fee_mode: str = "auto") -> RouteResult:
+    """XCH in, the LP of a pool that holds no XCH out: two sales and the add, one bundle
+    (zap_in_sales sizes them on the offered XCH)."""
+    offered = find_offer_settlements(offer, sorted({a for a in target.asset_ids if a is not None}
+                                                   | {a for p in sale_pools for a in p.asset_ids if a is not None}))
+    if None not in offered or len(offered) != 1:
+        raise OfferRejected("an XCH zap offers XCH and nothing else")
+    amounts = zap_in_sales(target, sale_pools, int(offered[None].coin.amount))
+    sales = [([p], [None, a], amount) for p, a, amount in zip(sale_pools, target.asset_ids, amounts)]
+    return routed_deposit(target, sales, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
 
 
 def zap_out(pool, asset_out, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,

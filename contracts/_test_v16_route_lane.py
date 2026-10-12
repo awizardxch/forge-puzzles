@@ -597,6 +597,36 @@ def main() -> int:
     wallet_case("zap in A -> LP (XCH for the backing only)", zap_in, {T_A: 20_000, None: 5_000_000}, xa.lp_asset_id, 0x77, 42,
                 entry_asset=T_A)
 
+    # A pool without XCH (owner, 2026-10-12: XCH -> the LOVE/SPROUT LP found no route): the
+    # XCH is sold into A on xa and into B on xb, both deposited in A/B, the rest backs the mint.
+    print("zap in to a pool without XCH: two sales and the add, the rest exactly the backing")
+    zap_ab = {"action": "zap-in", "current_height": H, "pool": snap(ab), "pools": [snap(xa), snap(xb)]}
+    for x_in, salt in ((1_000_000_000, 0x78), (3_333_333_337, 0x79), (250_000_001, 0x7A)):
+        offer_ab, want_ab = exact_offer({**zap_ab, "dev_fee": fee}, {None: x_in}, ab.lp_asset_id, salt=salt)
+        out = attempt(f"zap in {x_in} XCH -> A/B LP", {**zap_ab, "dev_fee": fee, "offer": offer_ab.to_bech32()})
+        if not out:
+            continue
+        sales, minted = [int(a) for a in out["sales"]], int(out["minted"])
+        check("  the sales and the backing spend the offered XCH exactly", sum(sales) + minted == x_in, f"{sales} + {minted}")
+        deps = [int(out["deposits"][hx(T_A)]), int(out["deposits"][hx(T_B)])]
+        r_ab = ab.state[0]
+        check("  the deposit sits on the pool's ratio within a mojo of each sale",
+              abs(deps[0] * r_ab[1] - deps[1] * r_ab[0]) <= max(r_ab), f"{deps} vs {r_ab}")
+        check("  the trader gets the LP the preview named", minted == want_ab and
+              paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, ab.lp_asset_id) == want_ab)
+        check("  three successors: both XCH pools and the target", len(out["pools"]) == 3)
+    wallet_case("zap in XCH -> A/B LP", zap_ab, {None: 2_000_000_000}, ab.lp_asset_id, 0x7B, 300)
+    attempt("zap in to a pool without XCH, the sale pools swapped", {**zap_ab, "pools": [snap(xb), snap(xa)],
+            "offer": fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: 1}, salt=0x7C).to_bech32()}, expect_ok=False)
+    attempt("zap in to a pool without XCH, an offer bringing A too", {**zap_ab,
+            "offer": fabricate_offer({None: 1_000_000_000, T_A: 5_000}, {ab.lp_asset_id: 1}, salt=0x7D).to_bech32()}, expect_ok=False)
+    attempt("zap in to a pool holding XCH (the pool's own join zaps it)", {**zap_ab, "pool": snap(xa),
+            "offer": fabricate_offer({None: 1_000_000_000}, {xa.lp_asset_id: 1}, salt=0x7E).to_bech32()}, expect_ok=False)
+    probe_ab = fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: 1}, salt=0x7F)
+    honest_lp = int(run({**zap_ab, "offer": probe_ab.to_bech32(), "preview": True})["forge"]["releases"][hx(ab.lp_asset_id)])
+    attempt("zap in asking one LP mojo more than the mint", {**zap_ab,
+            "offer": fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: honest_lp + 1}, salt=0x7F).to_bech32()}, expect_ok=False)
+
     print("lane guards")
     v10_like = dict(snap(xa)); v10_like["protocol_version"] = 10
     attempt("a route mixing revisions", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), v10_like],

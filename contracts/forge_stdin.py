@@ -83,7 +83,7 @@ else:
 
 # The route actions a composer builds across revisions (forge_v16_route._drv; a route that
 # never touches a V16 pool is built by forge_v15_route, which spends V14 and V15 pools).
-_CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route"})
+_CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-in"})
 
 
 def _lane_version(payload: dict) -> int:
@@ -427,7 +427,7 @@ def _settle_takes_fee(lane) -> bool:
     return "fee_bps" in inspect.signature(lane.settle).parameters
 
 
-ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out")
+ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out", "zap-in")
 
 
 def _snapshot_of(pool) -> dict[str, Any]:
@@ -521,6 +521,20 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
                                   surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph, preview=preview,
                                   **mode)
         extra = {"swap_out": str(result.details["swap_out"]), "redeemed": str(result.details["redeemed"])}
+    elif action == "zap-in":
+        # XCH into a pool without XCH: one sale per asset on that asset's XCH pool ("pools"),
+        # sized by the composer so what is left backs the mint exactly.
+        if not hasattr(rt, "zap_in"):
+            raise ValueError("this pool revision has no zap-in lane")
+        target = _lane_pool(payload["pool"])
+        result = rt.zap_in(target, [_lane_pool(entry) for entry in payload["pools"]], offer, height,
+                           surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview, **mode)
+        target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
+        extra = {"target": _snapshot_of(target_after),
+                 "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
+                 "minted": str(result.details["minted"]), "backing": str(result.details["backing"]),
+                 "sale_outputs": [str(a) for a in result.details["sale_outputs"]],
+                 "sales": [str(leg.gross) for leg in result.legs if leg.kind == "swap"]}
     elif action == "zap-out":
         if not hasattr(rt, "zap_out"):
             raise ValueError("this pool revision has no zap-out lane")
