@@ -348,6 +348,11 @@ def surplus_payout_solution(offer: Offer, asset: bytes32 | None, payout: int, fe
     if surplus > fee + router_surplus_band(fee):
         raise OfferRejected(f"the pool pays {payout} of {_asset_name(asset)}, the offer asks {requested}, leaving "
                             f"{surplus} where the router's fee is {fee}: the price moved; quote again")
+    # A fee that floors to nothing (a small payout at a low tier: 238 mojos at 42 bps) pays
+    # no router coin at all: a zero-amount CAT payment broke the CAT ring ("clvm raise",
+    # mainnet, 2026-10-12), and a zero XCH coin is dust nobody asked for.
+    if surplus <= 0:
+        return Program.to([*groups]), 0
     return Program.to([*groups, [nonce, [router_ph, surplus, [router_ph]]]]), surplus
 
 

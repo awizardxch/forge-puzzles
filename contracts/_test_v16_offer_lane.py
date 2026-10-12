@@ -337,6 +337,10 @@ def main() -> int:
     wallet_case("pair (XCH in, fee in the CAT)", pair, 0, 1, 50_000_000, bps=42)
     wallet_case("pair (CAT in, fee in XCH)", pair, 1, 0, 2_000, bps=300)
     wallet_case("cats", cats, 0, 1, 10_000, bps=100)
+    # A CAT payout so small the fee floors to 0 (mainnet, 2026-10-12: 238 mojos of a CAT at
+    # 42 bps): the settlement used to add a zero-amount router payment, and the CAT ring
+    # refused it ("clvm raise"). No router coin is made when the fee is nothing.
+    wallet_case("pair, a CAT payout whose fee floors to 0", pair, 0, 1, 1_000_000, bps=42, salt=0x5f)
     wallet_case("pair, asking one mojo more than payout less fee", pair, 0, 1, 50_000_000, bps=42, ask_delta=1, expect_ok=False)
     wallet_case("pair, the price moved past the band (a stale quote)", pair, 0, 1, 50_000_000, bps=42, ask_delta=-3, expect_ok=False)
     swap_case("pair, an offer that binds no group (a gift)", pair, 0, 1, 50_000_000, bind=False, expect_ok=False)

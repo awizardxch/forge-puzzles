@@ -615,7 +615,10 @@ class _Composer:
                 if surplus > fee + router_surplus_band(fee):
                     raise OfferRejected(f"the route releases {total} of {_hex(asset)[:8]}, the offer asks {requested}, leaving "
                                         f"{surplus} where the router's fee is {fee}: the price moved; quote again")
-                self.spend_hub(producers, [[self.fee_ph, surplus, [self.fee_ph]]], bound_groups(self.offer, asset), asset)
+                # A fee that floors to nothing pays no router coin (a zero-amount CAT payment
+                # breaks the CAT ring; see forge_v16_offer.surplus_payout_solution).
+                self.spend_hub(producers, [[self.fee_ph, surplus, [self.fee_ph]]] if surplus > 0 else [],
+                               bound_groups(self.offer, asset), asset)
                 self.router_fee = surplus
                 paid[_hex(asset)] = requested
                 continue

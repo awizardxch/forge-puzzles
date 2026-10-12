@@ -545,6 +545,8 @@ def main() -> int:
     odd = {**split2, "branches": [{**split2["branches"][0], "amountIn": 62_812_502},
                                   {**split2["branches"][1], "amountIn": 36_767_497}]}
     wallet_case("split XCH -> A, branch shares that do not divide the entry", odd, {None: 100_000_001}, T_A, 0x97, 300)
+    # A route's CAT payout so small the fee floors to 0 (see the offer lane): no router coin.
+    wallet_case("multi-hop XCH -> A -> B, a payout whose fee floors to 0", hop2, {None: 1_000_000}, T_B, 0x98, 42)
     wallet_case("vault route XCH -> LP -> A", vroute, {None: 50_000_000}, T_A, 0x94, 300)
     wallet_case("multi-hop B -> A -> XCH (fee in XCH)", {**hop2, "pools": [snap(ab), snap(xa)], "path": [hx(T_B), hx(T_A), hx(None)]},
                 {T_B: 20_000}, None, 0x95, 300, entry_asset=T_B)
