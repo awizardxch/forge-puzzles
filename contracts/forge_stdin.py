@@ -364,7 +364,7 @@ def _dev_fee(payload: dict[str, Any]) -> tuple[bytes32 | None, int]:
 def _pool_snapshots(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Every pool snapshot a request carries, whichever lane it names."""
     found: list[dict[str, Any]] = []
-    for key in ("pool", "swapPool", "vault"):
+    for key in ("pool", "swapPool", "vault", "viaPool"):
         if isinstance(payload.get(key), dict):
             found.append(payload[key])
     for entry in payload.get("pools") or []:
@@ -524,18 +524,24 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
     elif action == "zap-in":
         # One asset into a pool's LP (forge_v16_route.zap_in): XCH into a pool without XCH, or
         # a CAT the pool holds. "pools" names the XCH pools each target asset is traded on
-        # (none for a CAT into a pool holding XCH, which sells on the pool itself).
+        # (none for a CAT into a pool holding XCH, which sells on the pool itself); "viaPool"
+        # an LP's pool the XCH mints through first, that LP then deposited into "pool".
         if not hasattr(rt, "zap_in"):
             raise ValueError("this pool revision has no zap-in lane")
         target = _lane_pool(payload["pool"])
+        via = _lane_pool(payload["viaPool"]) if isinstance(payload.get("viaPool"), dict) else None
         result = rt.zap_in(target, [_lane_pool(entry) for entry in payload.get("pools") or []], offer, height,
-                           surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview, **mode)
+                           surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview,
+                           **mode, **({"via": via} if via is not None else {}))
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
         extra = {"target": _snapshot_of(target_after),
                  "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
                  "minted": str(result.details["minted"]), "backing": str(result.details["backing"]),
                  "sale_outputs": [str(a) for a in result.details["sale_outputs"]],
-                 "sales": [str(leg.gross) for leg in result.legs if leg.kind == "swap"]}
+                 "sales": [str(leg.gross) for leg in result.legs if leg.kind == "swap"],
+                 **({"inner_mints": [{"pool": m["pool"], "minted": str(m["minted"]), "backing": str(m["backing"]),
+                                      "deposits": {a: str(v) for a, v in m["deposits"].items()}}
+                                     for m in result.details["inner_mints"]]} if result.details.get("inner_mints") else {})}
     elif action == "zap-out":
         if not hasattr(rt, "zap_out"):
             raise ValueError("this pool revision has no zap-out lane")

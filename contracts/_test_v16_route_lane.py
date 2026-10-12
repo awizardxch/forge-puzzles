@@ -672,6 +672,84 @@ def main() -> int:
     attempt("CAT zap into a pool without XCH with an offer of A and XCH", {**zap_ab,
             "offer": fabricate_offer({T_A: 40_000, None: 1_000_000}, {ab.lp_asset_id: 1}, salt=0x9C).to_bech32()}, expect_ok=False)
 
+    # Owner, 2026-10-12: XCH -> the five-asset ⚒️🧙‍♂️ LP found no route; only one of its assets
+    # trades against XCH. One sale into that asset, deposited one-sided, the rest the backing.
+    print("XCH zap into a multi-asset pool without XCH, one asset tradeable: one sale, one-sided deposit")
+    abc = make([T_A, T_B, T_C], [800_000, 600_000, 900_000], [2, 1, 1], salt=0x5C)
+    zap_abc = {"action": "zap-in", "current_height": H, "pool": snap(abc), "pools": [snap(xa)]}
+    for x_in, salt in ((1_000_000_000, 0xA0), (77_777_777, 0xA1), (3_000_000_003, 0xA2)):
+        offer_m, want_m = exact_offer({**zap_abc, "dev_fee": fee}, {None: x_in}, abc.lp_asset_id, salt=salt)
+        out = attempt(f"zap in {x_in} XCH -> A/B/C LP", {**zap_abc, "dev_fee": fee, "offer": offer_m.to_bech32()})
+        if not out:
+            continue
+        sold, minted = int(out["sales"][0]), int(out["minted"])
+        deps = {k: int(v) for k, v in out["deposits"].items()}
+        check("  the sale and the backing spend the offered XCH exactly", sold + minted == x_in, f"{sold} + {minted}")
+        check("  only A is deposited, all of the sale's output",
+              deps[hx(T_A)] == int(out["sale_outputs"][0]) and deps[hx(T_B)] == 0 and deps[hx(T_C)] == 0, f"{deps}")
+        check("  the trader gets the LP the preview named", minted == want_m
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, abc.lp_asset_id) == want_m)
+        check("  two successors", len(out["pools"]) == 2)
+    wallet_case("XCH zap in -> A/B/C LP", zap_abc, {None: 1_000_000_000}, abc.lp_asset_id, 0xA3, 300)
+    for label, payload, lp, salt in (("one-sale zap buying B on XCH/B instead (any tradeable asset)", {**zap_abc, "pools": [snap(xb)]}, abc.lp_asset_id, 0xA4),
+                                     ("a two-asset pool zapped through one sale, one-sided", {**zap_abc, "pool": snap(ab), "pools": [snap(xa2)]}, ab.lp_asset_id, 0xA5)):
+        offer_o, want_o = exact_offer({**payload, "dev_fee": fee}, {None: 1_000_000_000}, lp, salt=salt)
+        out = attempt(label, {**payload, "dev_fee": fee, "offer": offer_o.to_bech32()})
+        if out:
+            check("  sale plus backing is the offered XCH, and the trader gets the preview's LP",
+                  int(out["sales"][0]) + int(out["minted"]) == 1_000_000_000 and int(out["minted"]) == want_o)
+    attempt("one-sale zap through a pool holding no XCH", {**zap_abc, "pools": [snap(bc)],
+            "offer": fabricate_offer({None: 1_000_000_000}, {abc.lp_asset_id: 1}, salt=0xA6).to_bech32()}, expect_ok=False)
+
+    # A chain of mints (owner, 2026-10-12): XCH -> the A/B LP (both assets bought on their XCH
+    # pools), that LP deposited one-sided into a pool holding it -- two LP mints, one bundle.
+    print("zap through an LP: XCH mints the A/B LP, which is deposited into a pool holding it")
+    # Creation sorts a pool's assets (forge_v16_create.canonical) and the leaves rely on it,
+    # so a fixture holding an LP lists its assets in that order too.
+    def make_sorted(spec, salt):
+        spec = sorted(spec, key=lambda t: bytes(t[0]))
+        return make([a for a, _, _ in spec], [r for _, r, _ in spec], [w for _, _, w in spec], salt=salt)
+    lp_pool = make_sorted([(T_C, 900_000, 1), (ab.lp_asset_id, 300_000, 2)], 0x5D)
+    via_ab = {"action": "zap-in", "current_height": H, "pool": snap(lp_pool), "viaPool": snap(ab), "pools": [snap(xa), snap(xb)]}
+    for x_in, salt in ((1_000_000_000, 0xB0), (333_333_337, 0xB1), (2_500_000_001, 0xB2)):
+        offer_v, want_v = exact_offer({**via_ab, "dev_fee": fee}, {None: x_in}, lp_pool.lp_asset_id, salt=salt)
+        out = attempt(f"zap {x_in} XCH through the A/B LP", {**via_ab, "dev_fee": fee, "offer": offer_v.to_bech32()})
+        if not out:
+            continue
+        sales, minted = [int(a) for a in out["sales"]], int(out["minted"])
+        inner = out.get("inner_mints") or [{}]
+        m1 = int(inner[0].get("minted", -1))
+        check("  sales + the A/B mint's backing + the outer mint's backing == the offered XCH",
+              sum(sales) + m1 + minted == x_in, f"{sales} + {m1} + {minted}")
+        check("  the whole A/B mint is deposited, and nothing else",
+              int(out["deposits"][hx(ab.lp_asset_id)]) == m1 and int(out["deposits"][hx(T_C)]) == 0, f"{out['deposits']}")
+        check("  the trader gets the outer LP the preview named, and no A/B LP",
+              minted == want_v and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, lp_pool.lp_asset_id) == want_v
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, ab.lp_asset_id) == 0)
+        check("  four successors: both XCH pools, A/B and the outer pool", len(out["pools"]) == 4)
+    wallet_case("zap through the A/B LP", via_ab, {None: 1_000_000_000}, lp_pool.lp_asset_id, 0xB3, 300)
+
+    print("zap through an XCH pool's LP: XCH mints the XCH/A LP by its join, deposited into a pool holding it")
+    xa_lp_pool = make_sorted([(T_B, 600_000, 1), (xa.lp_asset_id, 200_000, 1)], 0x5E)
+    via_xa = {"action": "zap-in", "current_height": H, "pool": snap(xa_lp_pool), "viaPool": snap(xa), "pools": []}
+    for x_in, salt in ((1_000_000_000, 0xB4), (55_555_555, 0xB5)):
+        offer_v, want_v = exact_offer({**via_xa, "dev_fee": fee}, {None: x_in}, xa_lp_pool.lp_asset_id, salt=salt)
+        out = attempt(f"zap {x_in} XCH through the XCH/A LP", {**via_xa, "dev_fee": fee, "offer": offer_v.to_bech32()})
+        if out:
+            m1 = int(out["inner_mints"][0]["minted"])
+            check("  the XCH/A mint is deposited whole, and the trader gets the preview's LP",
+                  int(out["deposits"][hx(xa.lp_asset_id)]) == m1 and int(out["minted"]) == want_v
+                  and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa_lp_pool.lp_asset_id) == want_v)
+            check("  two successors", len(out["pools"]) == 2)
+    wallet_case("zap through the XCH/A LP", via_xa, {None: 1_000_000_000}, xa_lp_pool.lp_asset_id, 0xB6, 300)
+    attempt("zap through an LP the target does not hold", {**via_ab, "pool": snap(abc),
+            "offer": fabricate_offer({None: 1_000_000_000}, {abc.lp_asset_id: 1}, salt=0xB7).to_bech32()}, expect_ok=False)
+    attempt("zap through an LP, paid in a CAT", {**via_ab,
+            "offer": fabricate_offer({T_A: 20_000}, {lp_pool.lp_asset_id: 1}, salt=0xB8).to_bech32()}, expect_ok=False)
+    off_by_one, want_lp = exact_offer({**via_ab, "dev_fee": fee}, {None: 1_000_000_000}, lp_pool.lp_asset_id, salt=0xB9)
+    attempt("zap through an LP asking one outer LP mojo more", {**via_ab, "dev_fee": fee,
+            "offer": fabricate_offer({None: 1_000_000_000}, {lp_pool.lp_asset_id: want_lp + 1}, salt=0xB9).to_bech32()}, expect_ok=False)
+
     probe_ab = fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: 1}, salt=0x7F)
     honest_lp = int(run({**zap_ab, "offer": probe_ab.to_bech32(), "preview": True})["forge"]["releases"][hx(ab.lp_asset_id)])
     attempt("zap in asking one LP mojo more than the mint", {**zap_ab,
