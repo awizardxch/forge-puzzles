@@ -548,6 +548,46 @@ def main() -> int:
     if out0:
         check("  the trader receives the whole release", paid_to(SpendBundle.from_json_dict(out0["bundle"]), TRADER_PH, T_B) == release0)
 
+    # Zaps in the Swap tab (owner, 2026-10-11): one asset in, a pool's LP out, and back.
+    # Zap in is the target's own join (a routed deposit with no sales); zap out burns the
+    # LP for every reserve and swaps the others into the one asked for, in the same spend.
+    print("zap out: LP in, one asset out, the remove and the swap in one spend of the pool")
+    burn = xa.state[1] // 50
+    zap_x = {"action": "zap-out", "current_height": H, "pool": snap(xa), "assetOut": hx(None)}
+    zap_a = {**zap_x, "assetOut": hx(T_A)}
+    zx0, za0 = xa.state[0]
+    payout = forge_math.withdrawal_amounts(xa.state[0], burn, xa.state[1], 0)
+    post_rm = [zx0 - payout[0], za0 - payout[1]]
+    gross_x = forge_math.swap_output(post_rm[1], post_rm[0], payout[1], xa.fee_bps, xa.weights[1], xa.weights[0])
+    x_net = gross_x - gross_x * xa.protocol_fee_bps // 10_000 - gross_x * xa.state[5] // 10_000
+    offer_zx, want_zx = exact_offer(zap_x, {xa.lp_asset_id: burn}, None, salt=0x71)
+    check("  the preview releases the removed XCH plus the A swapped back at the post-remove state",
+          want_zx == payout[0] + x_net, f"{want_zx} vs {payout[0]} + {x_net}")
+    out = attempt("zap out to XCH, exact offer", {**zap_x, "offer": offer_zx.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        after = out["pools"][0]["state"]
+        check("  one pool, one successor", [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex()])
+        check("  the trader receives exactly the release, all in XCH", paid_to(bundle, TRADER_PH, None) == want_zx)
+        check("  no A leaves the pool", paid_to(bundle, TRADER_PH, T_A) == 0)
+        check("  total_lp fell by the burn", int(after["total_lp"]) == xa.state[1] - burn, f"{after['total_lp']}")
+        check("  A's reserve is back where the remove took it from, plus the swap's input",
+              int(after["reserves"][1]) == post_rm[1] + payout[1], f"{after['reserves']}")
+    wallet_case("zap out LP -> XCH", zap_x, {xa.lp_asset_id: burn}, None, 0x72, 300, entry_asset=xa.lp_asset_id)
+    wallet_case("zap out LP -> A", zap_a, {xa.lp_asset_id: burn}, T_A, 0x73, 100, entry_asset=xa.lp_asset_id)
+    attempt("zap out of a vault's LP (a vault redeems instead)",
+            {"action": "zap-out", "current_height": H, "pool": snap(vault), "assetOut": hx(T_A),
+             "offer": fabricate_offer({vault.lp_asset_id: 1000}, {T_A: 1}, salt=0x74).to_bech32()}, expect_ok=False)
+    attempt("zap out to an asset the pool does not hold",
+            {**zap_x, "assetOut": hx(T_B), "offer": fabricate_offer({xa.lp_asset_id: burn}, {T_B: 1}, salt=0x75).to_bech32()},
+            expect_ok=False)
+
+    print("zap in: one asset in, the target's own join mints the LP")
+    zap_in = {"action": "routed-deposit", "current_height": H, "pool": snap(xa), "sales": []}
+    wallet_case("zap in XCH -> LP", zap_in, {None: 2_000_000_000}, xa.lp_asset_id, 0x76, 300)
+    wallet_case("zap in A -> LP (XCH for the backing only)", zap_in, {T_A: 20_000, None: 5_000_000}, xa.lp_asset_id, 0x77, 42,
+                entry_asset=T_A)
+
     print("lane guards")
     v10_like = dict(snap(xa)); v10_like["protocol_version"] = 10
     attempt("a route mixing revisions", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), v10_like],

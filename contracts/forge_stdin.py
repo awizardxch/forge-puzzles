@@ -427,7 +427,7 @@ def _settle_takes_fee(lane) -> bool:
     return "fee_bps" in inspect.signature(lane.settle).parameters
 
 
-ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route")
+ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out")
 
 
 def _snapshot_of(pool) -> dict[str, Any]:
@@ -505,8 +505,10 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
         target = _lane_pool(payload["pool"])
         sales = [([_lane_pool(entry) for entry in sale["pools"]], [_bytes32(str(a)) for a in sale["path"]], int(sale["amountIn"]))
                  for sale in payload.get("sales", [])]
+        deposit_mode = mode if "fee_mode" in rt.routed_deposit.__code__.co_varnames else {}
         result = rt.routed_deposit(target, sales, offer, height,
-                               surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview)
+                               surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview,
+                               **deposit_mode)
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
         extra = {"target": _snapshot_of(target_after),
                  "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
@@ -519,6 +521,14 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
                                   surplus_ph if surplus_ph is not None else vault.protocol_ph, fee_bps, fee_ph, preview=preview,
                                   **mode)
         extra = {"swap_out": str(result.details["swap_out"]), "redeemed": str(result.details["redeemed"])}
+    elif action == "zap-out":
+        if not hasattr(rt, "zap_out"):
+            raise ValueError("this pool revision has no zap-out lane")
+        pool = _lane_pool(payload["pool"])
+        result = rt.zap_out(pool, _bytes32(str(payload["assetOut"])), offer, height,
+                            surplus_ph if surplus_ph is not None else pool.protocol_ph, fee_bps, fee_ph, preview=preview, **mode)
+        extra = {"burned": str(result.details["burned"]), "removed": str(result.details["removed"]),
+                 "swapped": [[str(a), str(b)] for a, b in result.details["swapped"]]}
     else:
         raise ValueError(f"unknown route lane {action!r}")
     if preview:

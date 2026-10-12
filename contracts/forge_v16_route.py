@@ -151,6 +151,9 @@ class Leg:
     kind "wrap":   deposit asset_in into a vault mid-route and mint its LP (asset_out) for the
                    next leg; the eve and the backing come from the offer's XCH
     kind "add":    deposit every hub asset the target holds and mint LP (last leg only)
+    kind "remove": burn a multi-asset pool's LP (asset_in) for every reserve, proportionally;
+                   swaps on the same pool chained to it (feed_from) turn the other reserves
+                   into `asset_out`, so one asset leaves (the zap out, owner 2026-10-11)
     `entry` legs drink from the offer's settlement; the rest from earlier legs: from the
     one leg named by `feed_from` (a chain, so an asset may appear twice on a route and
     each appearance is its own coin), or from the asset's shared pot when `feed_from`
@@ -244,7 +247,11 @@ class _Composer:
         k = _key(asset)
         out: list[Producer] = []
         if isinstance(source, tuple):
-            mine = [p for p in self.by_leg.pop(source[1], []) if _key(p.asset) == k]
+            # Only this asset's coins: a remove produces every reserve, and each of its
+            # chained swaps takes its own asset from it (a pop of the whole leg lost the rest).
+            held = self.by_leg.get(source[1], [])
+            mine = [p for p in held if _key(p.asset) == k]
+            self.by_leg[source[1]] = [p for p in held if _key(p.asset) != k]
             rest = [p for p in self.leg_producers.get(k, []) if all(p is not m for m in mine)]
             if rest:
                 self.leg_producers[k] = rest
@@ -476,7 +483,7 @@ class _Composer:
                 raise OfferRejected(f"XCH in the bundle ({xch_total}) does not cover the LP backing ({honest})")
         if honest <= 0:
             raise OfferRejected("the deposit mints no LP")
-        if honest != requested_lp and not self.preview:
+        if honest != requested_lp and not self.preview and not self.wallet_built:
             raise OfferRejected(f"the pool mints {honest} LP, the offer asks {requested_lp}: a deposit asks for exactly "
                                 "what the pool mints at this state; quote again")
         if leftover > 0 and not self.preview:
@@ -643,7 +650,7 @@ def _toposort(legs: list[Leg]) -> list[int]:
     an add runs last. A stuck sort means the intermediates form a cycle."""
     produced_by: dict[bytes, set[int]] = {}
     for i, leg in enumerate(legs):
-        if leg.kind in ("swap", "redeem", "wrap"):
+        if leg.kind in ("swap", "redeem", "wrap", "remove"):
             produced_by.setdefault(_key(leg.asset_out), set()).add(i)
     done: set[int] = set()
     order: list[int] = []
@@ -723,12 +730,26 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
             if len(pool.asset_ids) != 1 or leg.asset_in != pool.asset_ids[0] or leg.asset_in is None:
                 raise OfferRejected("a wrap deposits a vault's own asset into that vault")
             leg.asset_out = pool.lp_asset_id
+        elif leg.kind == "remove":
+            if len(pool.asset_ids) < 2 or leg.asset_in != pool.lp_asset_id:
+                raise OfferRejected("a remove leg burns a multi-asset pool's own LP in that pool")
+            if leg.asset_out not in pool.asset_ids:
+                raise OfferRejected("a remove leg exits in an asset its pool holds")
         elif leg.kind != "add":
             raise OfferRejected(f"unknown leg kind {leg.kind!r}")
     if sum(1 for leg in legs if leg.kind in ("add", "wrap")) > 1:
         raise OfferRejected("a route mints LP in one pool at most")
     for leg in legs:
-        if leg.feed_from is not None and (leg.entry or _key(leg.feed_from.asset_out) != _key(leg.asset_in)):
+        if leg.feed_from is None:
+            continue
+        src = leg.feed_from
+        if src.kind == "remove":
+            # A remove pays out every reserve: a leg chained to it drinks one of the others.
+            ok = (not leg.entry and leg.kind == "swap" and leg.pool == src.pool
+                  and leg.asset_in in pools[src.pool].asset_ids and leg.asset_in != src.asset_out)
+        else:
+            ok = not leg.entry and _key(src.asset_out) == _key(leg.asset_in)
+        if not ok:
             raise OfferRejected("a chained leg consumes exactly what the leg before it produced")
     for leg in legs:
         if leg.entry and _key(leg.asset_in) not in {_key(a) for a in offered}:
@@ -1032,7 +1053,7 @@ def vault_route(swap_pool, asset_in, vault, offer: Offer, height: int, surplus_p
 
 
 def routed_deposit(target, sales: list, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,
-                   preview: bool = False) -> RouteResult:
+                   preview: bool = False, fee_mode: str = "auto") -> RouteResult:
     """sales: [(pools, path, amount_in)] selling excess into deficit assets; then the add.
 
     A sale may cross the target itself: that is the zap (roadmap item 9), one asset in,
@@ -1049,6 +1070,29 @@ def routed_deposit(target, sales: list, offer: Offer, height: int, surplus_ph: b
         legs.extend(_chain(distinct, pools, path, amount_in))
     sale_legs = list(legs)
     legs.append(Leg(_pool_index(distinct, target), "add"))
-    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview)
+    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
     return RouteResult(result.bundle, result.pools, legs,
                        {**result.details, "sale_outputs": [leg.out for leg in sale_legs]})
+
+
+def zap_out(pool, asset_out, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,
+            preview: bool = False, fee_mode: str = "auto") -> RouteResult:
+    """LP in, one asset out (owner, 2026-10-11: "build the zap in and out for lp swaps").
+
+    The pool's remove is proportional only, so the LP burns for every reserve and each
+    other reserve is swapped into `asset_out` on the same pool, in the same spend: the
+    remove, then the swaps, each priced on the state the one before it left. One asset
+    leaves, so a wallet-built offer pays the router its rate off that payout like any swap.
+    """
+    a_out = _asset(asset_out)
+    if len(pool.asset_ids) < 2:
+        raise OfferRejected("a zap out burns a multi-asset pool's LP; a vault's LP redeems")
+    if a_out not in pool.asset_ids:
+        raise OfferRejected(f"the pool does not hold {_hex(a_out)[:8]}")
+    remove = Leg(0, "remove", pool.lp_asset_id, a_out, amount_in=1, entry=True)
+    swaps = [Leg(0, "swap", other, a_out, amount_in=1, feed_from=remove) for other in pool.asset_ids if other != a_out]
+    legs = [remove, *swaps]
+    result = compose([pool], legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
+    return RouteResult(result.bundle, result.pools, legs,
+                       {**result.details, "burned": remove.gross, "removed": remove.out,
+                        "swapped": [[leg.gross, leg.out] for leg in swaps]})
