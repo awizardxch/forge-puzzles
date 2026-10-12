@@ -14,7 +14,13 @@ The dev (protocol) fee rate is the pool's CONFIG, curried at creation: no leaf m
 stdin JSON:
     {kind: "collect" | "dao-fee", pool: <V16 snapshot>, height, new_bps?,
      payer?: {coin: {parent_coin_info, puzzle_hash, amount}, puzzle_reveal},
-     network_fee?, aggregated_signature?}
+     network_fee?, aggregated_signature?, receiver_only?, sender_puzzle_hash?}
+
+`receiver_only` (dao-fee): the DAO recipient is a lock, whose own proposal sends the
+message (owner, 2026-10-11). Only the pool's half is built -- no payer, no signature --
+and returned as `pool_spends` with the message to sign into the lock's conditions and an
+estimate of the pool half's cost. The leaf still runs, so a change it refuses is refused
+here; consensus validation waits for the lock's half at execution.
 
 `payer` pays the network fee (a standard wallet coin; its change goes back to it). A
 collect with no network fee needs no payer at all. Without a signature the answer is the
@@ -103,6 +109,9 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         raise Refused("BAD_REQUEST", "kind is collect or dao-fee")
 
+    if payload.get("receiver_only"):
+        return receiver_only(pool, kind, leaf, solution, message, payload)
+
     payer_spends = []
     payer = payload.get("payer")
     if payer:
@@ -162,6 +171,53 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         out["bundle"] = unsigned.to_json_dict()
         out["transaction_id"] = unsigned.name().hex()
     return out
+
+
+# Chia's cost model, for a half-bundle that cannot be validated alone: CLVM cost, plus
+# 12,000 per byte of puzzle and solution, plus each CREATE_COIN and AGG_SIG.
+COST_PER_BYTE = 12_000
+CREATE_COIN_COST = 1_800_000
+AGG_SIG_COST = 1_200_000
+AGG_SIG_OPCODES = set(range(43, 51))
+
+
+def estimate_cost(coin_spends) -> int:
+    total = 0
+    for cs in coin_spends:
+        puzzle = Program.from_bytes(bytes(cs.puzzle_reveal))
+        solution = Program.from_bytes(bytes(cs.solution))
+        clvm_cost, output = puzzle.run_with_cost(drv.MAX_COST, solution)
+        total += clvm_cost + COST_PER_BYTE * (len(bytes(cs.puzzle_reveal)) + len(bytes(cs.solution)))
+        for condition in output.as_iter():
+            opcode = condition.first().as_int()
+            if opcode == CREATE_COIN:
+                total += CREATE_COIN_COST
+            elif opcode in AGG_SIG_OPCODES:
+                total += AGG_SIG_COST
+    return total
+
+
+def receiver_only(pool: drv.V16Pool, kind: str, leaf: str, solution: list, message, payload: dict[str, Any]) -> dict[str, Any]:
+    if kind != "dao-fee" or message is None:
+        raise Refused("BAD_REQUEST", "receiver_only builds a DAO fee change only")
+    sender = payload.get("sender_puzzle_hash")
+    if sender and _b32(sender) != pool.dao_ph:
+        raise Refused("NOT_DAO", "this lock is not the pool's DAO recipient")
+    pool_bundle, new_state = drv.spend_action(pool, leaf, solution)
+    after = pool.advance(drv.state_to_list(new_state))
+    return {
+        "success": True,
+        "kind": kind,
+        "receiver_only": True,
+        "message": message.hex(),
+        "pool_coin_id": pool.coin.name().hex(),
+        "condition": [SEND_MESSAGE, MODE_PUZZLE_TO_COIN, "0x" + message.hex(), "0x" + pool.coin.name().hex()],
+        "current_bps": int(pool.state[5]),
+        "cost": estimate_cost(pool_bundle.coin_spends),
+        "pool_spends": [cs.to_json_dict() for cs in pool_bundle.coin_spends],
+        "successor": off.pool_to_snapshot(after),
+        "successor_coin_id": after.coin.name().hex(),
+    }
 
 
 def main() -> int:

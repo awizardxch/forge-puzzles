@@ -27,8 +27,9 @@ import forge_pool_admin as admin  # noqa: E402
 import forge_v16_offer as off  # noqa: E402
 from chia.consensus.default_constants import DEFAULT_CONSTANTS  # noqa: E402
 from chia.types.blockchain_format.program import Program  # noqa: E402
+from chia.types.coin_spend import make_spend  # noqa: E402
 from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_for_synthetic_public_key  # noqa: E402
-from chia_rs import AugSchemeMPL, Coin, CoinSpend, PrivateKey, SpendBundle, validate_clvm_and_signature  # noqa: E402
+from chia_rs import AugSchemeMPL, Coin, CoinSpend, G2Element, PrivateKey, SpendBundle, validate_clvm_and_signature  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 from chia_rs.sized_ints import uint64  # noqa: E402
 
@@ -155,6 +156,40 @@ def main() -> int:
     check("the DAO's coin signed by another key is refused by consensus", not ok)
     refused("a payer smaller than the fee is refused", {"kind": "collect", "pool": snapshot, "height": H,
                                                         "payer": coin_at(dev_puzzle, 10, 0x94), "network_fee": fee}, "PAYER_TOO_SMALL")
+
+    print("dao-fee from a lock: the router builds the pool's half, the lock's proposal sends the message")
+    # A stand-in for the lock: a puzzle that emits its solution as conditions, so the test
+    # can play the lock's half exactly as its signed proposal would (one SEND_MESSAGE).
+    lock_puzzle = Program.to(1)
+    lock_ph = bytes32(lock_puzzle.get_tree_hash())
+    lock_pool = kit.make_pool([None, CAT], reserves, total_lp=9_000_000, fees=fees, leaves="forge", salt=0x73,
+                              protocol_ph=PROTOCOL_PH, dao_ph=lock_ph, state=state)
+    lock_snapshot = off.pool_to_snapshot(lock_pool)
+    half = admin.build({"kind": "dao-fee", "pool": lock_snapshot, "height": H, "new_bps": 25, "receiver_only": True,
+                        "sender_puzzle_hash": lock_ph.hex()})
+    check("the pool's half is built with no payer and no signature", half["pool_spends"] and "bundle" not in half
+          and half["successor"]["state"]["dao_fee_bps"] == 25)
+    check("the condition the lock signs is [66, 23, message, pool coin]",
+          half["condition"] == [66, 23, "0x" + admin.dao_fee_message(25).hex(), "0x" + lock_pool.coin.name().hex()])
+    lock_coin = Coin(bytes32(bytes([0x95]) * 32), lock_ph, uint64(3_000_000_000))
+    network_fee = 2_000_000_000
+    lock_conditions = [[66, 23, admin.dao_fee_message(25), lock_pool.coin.name()], [51, lock_ph, 3_000_000_000 - network_fee], [52, network_fee]]
+    lock_spend = make_spend(lock_coin, lock_puzzle, Program.to(lock_conditions))
+    whole = SpendBundle([CoinSpend.from_json_dict(raw) for raw in half["pool_spends"]] + [lock_spend], G2Element())
+    ok, why = mempool_valid(whole.to_json_dict())
+    check("with the lock's half beside it, the bundle is mempool-valid", ok, why)
+    alone = SpendBundle([CoinSpend.from_json_dict(raw) for raw in half["pool_spends"]], G2Element())
+    ok, _ = mempool_valid(alone.to_json_dict())
+    check("the pool's half alone is refused (the message has no sender)", not ok)
+    import forge_v16_driver as drv
+    real, _ = drv.validate(whole)
+    lock_only = admin.estimate_cost([lock_spend])
+    estimate = half["cost"]
+    check("the pool half's cost estimate is within 10% of the measured cost",
+          abs(estimate - (int(real.cost) - lock_only)) <= 0.1 * (int(real.cost) - lock_only), f"{estimate} vs {int(real.cost) - lock_only}")
+    refused("a lock that is not the DAO recipient is refused", {"kind": "dao-fee", "pool": lock_snapshot, "height": H, "new_bps": 25,
+                                                               "receiver_only": True, "sender_puzzle_hash": dao_ph.hex()}, "NOT_DAO")
+    refused("a lock cannot raise it either", {"kind": "dao-fee", "pool": lock_snapshot, "height": H, "new_bps": 150, "receiver_only": True}, "BAD_REQUEST")
 
     print()
     passed = sum(results)
