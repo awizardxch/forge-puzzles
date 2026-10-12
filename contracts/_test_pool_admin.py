@@ -189,6 +189,15 @@ def main() -> int:
           abs(estimate - (int(real.cost) - lock_only)) <= 0.1 * (int(real.cost) - lock_only), f"{estimate} vs {int(real.cost) - lock_only}")
     refused("a lock that is not the DAO recipient is refused", {"kind": "dao-fee", "pool": lock_snapshot, "height": H, "new_bps": 25,
                                                                "receiver_only": True, "sender_puzzle_hash": dao_ph.hex()}, "NOT_DAO")
+    # A proposal that lost its record of the action: the change is read back from the
+    # delegated puzzle the owners signed ((q . conditions)), never from the caller.
+    signed_puzzle = bytes(Program.to((1, lock_conditions))).hex()
+    other_puzzle = bytes(Program.to((1, [[51, lock_ph, 1]]))).hex()
+    found = admin.build({"pool": lock_snapshot, "recover": True, "delegated_puzzles": [other_puzzle, signed_puzzle]})
+    check("recovery reads 25 bps for this pool coin back from the signed conditions",
+          found["found"] and found["new_bps"] == 25 and found["pool_coin_id"] == lock_pool.coin.name().hex(), str(found))
+    elsewhere = admin.build({"pool": snapshot, "recover": True, "delegated_puzzles": [signed_puzzle]})
+    check("a message to another pool's coin is no change for this pool", elsewhere["found"] is False)
     refused("a lock cannot raise it either", {"kind": "dao-fee", "pool": lock_snapshot, "height": H, "new_bps": 150, "receiver_only": True}, "BAD_REQUEST")
 
     print()

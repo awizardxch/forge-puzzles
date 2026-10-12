@@ -83,6 +83,8 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
     if int(snapshot.get("protocol_version") or 0) != PROTOCOL:
         raise Refused("WRONG_REVISION", f"this builder spends protocol {PROTOCOL} pools only")
     pool = off.snapshot_to_pool(snapshot)
+    if payload.get("recover"):
+        return recover_dao_fee(pool, payload)
     kind = str(payload.get("kind") or "")
     height = int(payload.get("height") or 0)
     if height <= 0:
@@ -218,6 +220,35 @@ def receiver_only(pool: drv.V16Pool, kind: str, leaf: str, solution: list, messa
         "successor": off.pool_to_snapshot(after),
         "successor_coin_id": after.coin.name().hex(),
     }
+
+
+def recover_dao_fee(pool: drv.V16Pool, payload: dict[str, Any]) -> dict[str, Any]:
+    """The DAO fee change a lock's signed conditions ask of this pool, if any.
+
+    `delegated_puzzles` are the lock's funds coins' delegated puzzles from its proposal
+    plan ((q . conditions)). A SEND_MESSAGE mode 23 to this pool's coin whose message is
+    dao_fee_message(bps) for some bps below the current rate names that change; anything
+    else is no DAO fee change for this pool. Used when a proposal lost its record of the
+    action, so execution can still attach the pool's half the owners already signed for.
+    """
+    current = int(pool.state[5])
+    wanted = {dao_fee_message(bps): bps for bps in range(current)}
+    coin = pool.coin.name()
+    for raw in payload.get("delegated_puzzles") or []:
+        try:
+            conditions = Program.from_bytes(bytes.fromhex(str(raw).removeprefix("0x"))).run(Program.to(0))
+        except Exception:  # noqa: BLE001 -- not a (q . conditions) puzzle: nothing to find in it
+            continue
+        for condition in conditions.as_iter():
+            items = list(condition.as_iter())
+            if len(items) < 4 or items[0].as_int() != SEND_MESSAGE or items[1].as_int() != MODE_PUZZLE_TO_COIN:
+                continue
+            if bytes(items[3].as_atom()) != bytes(coin):
+                continue
+            message = bytes32(items[2].as_atom()) if len(items[2].as_atom()) == 32 else None
+            if message in wanted:
+                return {"success": True, "found": True, "new_bps": wanted[message], "pool_coin_id": coin.hex()}
+    return {"success": True, "found": False}
 
 
 def main() -> int:
