@@ -762,6 +762,17 @@ def main() -> int:
               and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa_lp_pool.lp_asset_id) == want_c)
         check("  two successors", len(out["pools"]) == 2)
     wallet_case("CAT zap through the XCH/A LP", via_xa, {T_A: 20_000}, xa_lp_pool.lp_asset_id, 0xC3, 300, entry_asset=T_A)
+    # A valuable CAT (mainnet, 2026-10-12: Caster, 2,206 mojos against 14.3 XCH): the sale
+    # search tried one mojo, which rounds to no input after the fee and raised, refusing the
+    # whole zap. One mojo now just buys nothing and the search moves on.
+    xc = make([None, T_C], [10_000_000_000, 2_000], [1, 1], salt=0x5F)
+    xc_holder = make_sorted([(T_B, 600_000, 1), (xc.lp_asset_id, 200_000, 3)], 0x60)
+    via_xc = {"action": "zap-in", "current_height": H, "pool": snap(xc_holder), "viaPool": snap(xc), "pools": []}
+    offer_v, want_v = exact_offer({**via_xc, "dev_fee": fee}, {T_C: 500}, xc_holder.lp_asset_id, salt=0xC5)
+    out = attempt("CAT zap of a valuable CAT through its XCH pool's LP", {**via_xc, "dev_fee": fee, "offer": offer_v.to_bech32()})
+    if out:
+        check("  a mojo-sized sale backs both mints, and the trader gets the preview's LP",
+              int(out["sales"][0]) <= 5 and int(out["minted"]) == want_v, f"sold {out['sales']}, minted {out['minted']}")
     attempt("CAT zap through an LP paying a CAT the inner pool lacks", {**via_xa,
             "offer": fabricate_offer({T_B: 20_000}, {xa_lp_pool.lp_asset_id: 1}, salt=0xC4).to_bech32()}, expect_ok=False)
 

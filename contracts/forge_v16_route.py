@@ -1168,6 +1168,19 @@ def routed_deposit(target, sales: list, offer: Offer, height: int, surplus_ph: b
                        {**result.details, "sale_outputs": [leg.out for leg in sale_legs]})
 
 
+def _sale_out(pool, asset_in, asset_out, amount: int) -> int:
+    """What one swap on `pool` pays out for `amount`, or 0 when it pays nothing: the sizing
+    searches start at a mojo, and a mojo of a valuable CAT rounds to no input after the fee
+    (mainnet, 2026-10-12: 1 mojo of Caster raised "swap effective input rounds to zero"
+    and refused the whole zap while the site, which reads that as 0, quoted it)."""
+    if amount <= 0:
+        return 0
+    try:
+        return simulate_chain([pool], [asset_in, asset_out], amount)[-1]
+    except (ValueError, OfferRejected):
+        return 0
+
+
 def zap_in_sales(target, sale_pools: list, offered_xch: int) -> list[int]:
     """XCH into a pool that holds none (owner, 2026-10-12: a zap into the ❤️/🌱 LP found no
     route). The offered XCH is sold into each of the target's two assets on that asset's own
@@ -1189,7 +1202,7 @@ def zap_in_sales(target, sale_pools: list, offered_xch: int) -> list[int]:
     r = target.state[0]
 
     def out(i: int, amount: int) -> int:
-        return simulate_chain([sale_pools[i]], [None, target.asset_ids[i]], amount)[-1] if amount > 0 else 0
+        return _sale_out(sale_pools[i], None, target.asset_ids[i], amount)
 
     def split(total: int) -> int:
         # the first sale's share: the smallest a0 whose output leads the target's ratio
@@ -1360,7 +1373,7 @@ def zap_via_lp(target, inner, inner_sales: list, offered_xch: int) -> tuple[list
     ri = inner.state[0]
 
     def out(i: int, amount: int) -> int:
-        return simulate_chain([inner_sales[i]], [None, inner.asset_ids[i]], amount)[-1] if amount > 0 else 0
+        return _sale_out(inner_sales[i], None, inner.asset_ids[i], amount)
 
     def split(total: int) -> int:
         lo, hi = 1, total - 1
@@ -1438,7 +1451,7 @@ def zap_cat_via_lp(target, inner, asset_in, amount: int) -> tuple[int, int, int,
             return 0
 
     def xch_for(s: int) -> int:
-        return simulate_chain([inner], [asset_in, None], s)[-1] if s > 0 else 0
+        return _sale_out(inner, asset_in, None, s)
 
     def inner_mint(s: int, x1: int) -> int:
         # the add on the state the sale left (the composer's fixed point, step for step)
@@ -1543,10 +1556,10 @@ def zap_cat_sales(target, sale_pools: list, asset_in, amount: int) -> tuple[int,
     r = target.state[0]
 
     def xch_for(s: int) -> int:
-        return simulate_chain([sale_pools[ci]], [asset_in, None], s)[-1] if s > 0 else 0
+        return _sale_out(sale_pools[ci], asset_in, None, s)
 
     def other_for(y: int) -> int:
-        return simulate_chain([sale_pools[di]], [None, other], y)[-1] if y > 0 else 0
+        return _sale_out(sale_pools[di], None, other, y)
 
     def mint(s: int, y: int) -> int:
         d = [0, 0]
