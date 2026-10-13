@@ -742,6 +742,29 @@ def main() -> int:
                   and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa_lp_pool.lp_asset_id) == want_v)
             check("  two successors", len(out["pools"]) == 2)
     wallet_case("zap through the XCH/A LP", via_xa, {None: 1_000_000_000}, xa_lp_pool.lp_asset_id, 0xB6, 300)
+    # A CAT through an LP (owner, 2026-10-12: Caster -> the ✨❤️‍🔥🧙‍♂️ XCH LP -> a pool holding
+    # it): a little A sold for XCH on XCH/A, the rest of A and that XCH mint the XCH/A LP,
+    # which is deposited into the pool holding it; the sale's XCH backs both mints exactly.
+    print("CAT zap through an LP: A sold on XCH/A, A + XCH mint its LP, deposited into the pool holding it")
+    for a_in, salt in ((20_000, 0xC0), (3_333, 0xC1), (150_000, 0xC2)):
+        offer_c, want_c = exact_offer({**via_xa, "dev_fee": fee}, {T_A: a_in}, xa_lp_pool.lp_asset_id, salt=salt)
+        out = attempt(f"CAT zap {a_in} A through the XCH/A LP", {**via_xa, "dev_fee": fee, "offer": offer_c.to_bech32()})
+        if not out:
+            continue
+        m1 = int(out["inner_mints"][0]["minted"])
+        inner_deps = {k: int(v) for k, v in out["inner_mints"][0]["deposits"].items()}
+        sold, x = int(out["sales"][0]), int(out["sale_outputs"][0])
+        check("  the rest of A goes into XCH/A, and the sale's XCH covers its XCH deposit and both backings",
+              inner_deps[hx(T_A)] == a_in - sold and inner_deps[hx(None)] + m1 + int(out["minted"]) == x,
+              f"sold {sold} for {x}; inner {inner_deps}, minted {m1} then {out['minted']}")
+        check("  the whole XCH/A mint is deposited, and the trader gets the preview's LP",
+              int(out["deposits"][hx(xa.lp_asset_id)]) == m1 and int(out["minted"]) == want_c
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa_lp_pool.lp_asset_id) == want_c)
+        check("  two successors", len(out["pools"]) == 2)
+    wallet_case("CAT zap through the XCH/A LP", via_xa, {T_A: 20_000}, xa_lp_pool.lp_asset_id, 0xC3, 300, entry_asset=T_A)
+    attempt("CAT zap through an LP paying a CAT the inner pool lacks", {**via_xa,
+            "offer": fabricate_offer({T_B: 20_000}, {xa_lp_pool.lp_asset_id: 1}, salt=0xC4).to_bech32()}, expect_ok=False)
+
     attempt("zap through an LP the target does not hold", {**via_ab, "pool": snap(abc),
             "offer": fabricate_offer({None: 1_000_000_000}, {abc.lp_asset_id: 1}, salt=0xB7).to_bech32()}, expect_ok=False)
     attempt("zap through an LP, paid in a CAT", {**via_ab,

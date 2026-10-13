@@ -862,19 +862,33 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
             by_input[leg_keys[0]].append(marker)
             remainders[_key(None)] = marker
 
+    chain_xch_pot = None
     if chain:
         # each add's XCH, one marker per add, from the offer's XCH hub (or alone when no sale
-        # drinks it); the lane sizes the shares so each covers its add exactly
-        key = (_key(None), "offer")
-        if None not in offered:
-            raise OfferRejected("a chain of mints is backed by the offer's XCH")
+        # drinks it); the lane sizes the shares so each covers its add exactly. A CAT zap
+        # through an LP offers no XCH: a sale buys it, and the adds share that pot instead
+        # (owner, 2026-10-12: Caster -> the ✨❤️‍🔥🧙‍♂️ XCH LP -> a pool holding it).
+        key = (_key(None), "offer") if None in offered else (_key(None), "legs")
+        if None not in offered and not any(leg.kind == "swap" and leg.asset_out is None for leg in legs):
+            raise OfferRejected("a chain of mints needs XCH: offered, or bought by a sale")
         for a in adds:
             by_input.setdefault(key, []).append(Leg(a.pool, "add", asset_in=None, amount_in=int(a.amount_in), feed_from=a))
+        if key[1] == "legs":
+            chain_xch_pot = key                  # fed when the first add runs, after the sale paid out
         # no sale drinks the offer's XCH (an inner pool minting by its own join): nothing
         # else would feed that hub, so it is fed here
-        if all(x.kind == "add" for x in by_input[key]):
+        elif all(x.kind == "add" for x in by_input[key]):
             for cons, coin in zip(by_input[key], c.feed(None, by_input[key], "offer")):
                 c.add_xch[id(cons.feed_from)] = coin
+        # an offered CAT a sale drinks part of: the rest is deposited by the add whose pool holds it
+        for asset, s in offered.items():
+            offer_key = (_key(asset), "offer")
+            holder = next((a for a in adds if asset is not None and asset in pools[a.pool].asset_ids), None)
+            if holder is not None and offer_key in by_input:
+                rest = int(s.coin.amount) - sum(int(x.amount_in) for x in by_input[offer_key])
+                if rest <= 0:
+                    raise OfferRejected(f"the sales sell all the offered {_hex(asset)[:8]}; nothing is left to deposit")
+                by_input[offer_key].append(Leg(holder.pool, "add", asset_in=asset, amount_in=rest))
     final_pool = next((a.pool for a in adds if not any(pools[a.pool].lp_asset_id in pools[b.pool].asset_ids for b in adds if b is not a)), None)
 
     settlements: dict[int, Producer] = {}
@@ -882,6 +896,11 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
     for i in order:
         leg = legs[i]
         if leg.kind == "add":
+            if chain_xch_pot is not None:
+                consumers = by_input[chain_xch_pot]
+                for cons, coin in zip(consumers, c.feed(None, consumers, "legs")):
+                    c.add_xch[id(cons.feed_from)] = coin
+                chain_xch_pot = None
             if chain and leg.pool != final_pool:
                 inner = c.add(leg, None)
                 extra.setdefault("inner_mints", []).append({"pool": pools[leg.pool].launcher_id.hex(), **inner})
@@ -1388,6 +1407,87 @@ def zap_via_lp(target, inner, inner_sales: list, offered_xch: int) -> tuple[list
     raise OfferRejected("no split of this amount backs both mints exactly; change the amount by a mojo and quote again")
 
 
+def zap_cat_via_lp(target, inner, asset_in, amount: int) -> tuple[int, int, int, int]:
+    """A CAT into a pool without XCH through the LP of an XCH pool holding that CAT (owner,
+    2026-10-12: Caster -> the ✨❤️‍🔥🧙‍♂️ XCH LP -> a pool holding it, "xch finds the route but
+    not the cat input"). Sell `s` of the CAT for XCH on the inner pool; the inner add takes
+    `x1` of that XCH (its XCH deposit and its backing) with the rest of the CAT; the outer
+    add takes the rest, which must be exactly its backing: `x1 + mint_outer == xch(s)`.
+    Returns (s, x1, inner minted, outer minted)."""
+    if None in target.asset_ids or inner.lp_asset_id not in target.asset_ids:
+        raise OfferRejected("a zap through an LP is for a pool without XCH that holds that LP")
+    if None not in inner.asset_ids or asset_in not in inner.asset_ids:
+        raise OfferRejected("a CAT zap through an LP mints the LP of an XCH pool holding that CAT")
+    ci, xi = inner.asset_ids.index(asset_in), inner.asset_ids.index(None)
+    j = target.asset_ids.index(inner.lp_asset_id)
+    r0 = list(inner.state[0])
+
+    def mint(reserves, deposits) -> int:
+        try:
+            return forge_math.invariant_lp_mint(reserves, deposits, inner.state[1], inner.fee_bps, inner.weights, version=MATH_VERSION)
+        except (ValueError, ZeroDivisionError):
+            return 0
+
+    def outer(m1: int) -> int:
+        if m1 <= 0:
+            return 0
+        try:
+            return forge_math.invariant_lp_mint(target.state[0], [m1 if k == j else 0 for k in range(len(target.asset_ids))],
+                                                target.state[1], target.fee_bps, target.weights, version=MATH_VERSION)
+        except (ValueError, ZeroDivisionError):
+            return 0
+
+    def xch_for(s: int) -> int:
+        return simulate_chain([inner], [asset_in, None], s)[-1] if s > 0 else 0
+
+    def inner_mint(s: int, x1: int) -> int:
+        # the add on the state the sale left (the composer's fixed point, step for step)
+        r = list(r0)
+        r[ci] += s
+        r[xi] -= xch_for(s)
+        deposits = [0] * len(r)
+        deposits[ci] = amount - s
+        honest = mint(r, deposits)
+        for _ in range(12):
+            deposits[xi] = x1 - honest
+            if deposits[xi] < 0:
+                return 0
+            nh = mint(r, deposits)
+            if nh == honest:
+                break
+            honest = nh
+        return honest
+
+    one_sided = [amount if k == ci else 0 for k in range(len(r0))]
+    est1 = mint(r0, one_sided)
+    if est1 <= 0:
+        raise OfferRejected("the deposit mints no LP")
+    need = 2 * (est1 + outer(est1)) + 2
+    if xch_for(amount - 1) < need:
+        raise OfferRejected("too little to zap: selling it all would not back both mints")
+    lo, hi = 1, amount - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if xch_for(mid) >= need:
+            hi = mid
+        else:
+            lo = mid + 1
+    for s in (lo, lo + 1, lo + 2, lo + 3):
+        x = xch_for(s)
+        x1 = x - outer(est1)
+        for _ in range(16):
+            m2 = outer(inner_mint(s, x1))
+            if x1 + m2 == x:
+                break
+            x1 = x - m2
+        m1 = inner_mint(s, x1)
+        m2 = outer(m1)
+        # the two XCH shares of one hub must differ, or the hub nudges them apart
+        if m1 > 0 and m2 > 0 and x1 + m2 == x and x1 != m2:
+            return s, x1, m1, m2
+    raise OfferRejected("no split of this amount backs both mints exactly; change the amount slightly and quote again")
+
+
 def zap_backing_sale(target, asset_in, amount: int) -> int:
     """A CAT zap into a pool holding XCH and that CAT (owner, 2026-10-12: "build the CAT-in
     zap"): every LP mojo needs an XCH mojo of bundle value, so some of the CAT is sold for
@@ -1504,7 +1604,8 @@ def zap_in(target, sale_pools: list, offer: Offer, height: int, surplus_ph: byte
         both deposited, the rest the backing (zap_cat_sales).
       XCH into a pool holding XCH: the pool's own join (a routed deposit with no sales)."""
     offered = find_offer_settlements(offer, sorted({a for a in target.asset_ids if a is not None}
-                                                   | {a for p in sale_pools for a in p.asset_ids if a is not None}))
+                                                   | {a for p in [*sale_pools, *([via] if via is not None else [])]
+                                                      for a in p.asset_ids if a is not None}))
     if len(offered) != 1:
         raise OfferRejected("a zap offers one asset")
     (asset_in, settlement), = offered.items()
@@ -1512,7 +1613,15 @@ def zap_in(target, sale_pools: list, offer: Offer, height: int, surplus_ph: byte
     if via is not None:
         # through an LP the target holds: `via` is that LP's pool, `sale_pools` its assets' XCH pools
         if asset_in is not None:
-            raise OfferRejected("a zap through an LP is paid in XCH")
+            if sale_pools:
+                raise OfferRejected("a CAT zap through an LP sells on the LP's own pool")
+            s, x1, _m1, m2 = zap_cat_via_lp(target, via, asset_in, amount)
+            distinct: list = []
+            legs = [Leg(_pool_index(distinct, via), "swap", asset_in, None, amount_in=s, entry=True),
+                    Leg(_pool_index(distinct, via), "add", amount_in=x1),
+                    Leg(_pool_index(distinct, target), "add", amount_in=m2)]
+            result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
+            return RouteResult(result.bundle, result.pools, legs, {**result.details, "sale_outputs": [legs[0].out]})
         sales, inner_xch, backing = zap_via_lp(target, via, sale_pools, amount)
         distinct: list = []
         legs: list[Leg] = []
