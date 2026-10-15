@@ -286,12 +286,19 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
     # spend. AGG_SIG_UNSAFE over a digest of this creation's own creator coins: consensus
     # refuses the whole bundle unless the key's holder signed, so naming a public key one
     # does not hold proves nothing, and the signature cannot be lifted onto other coins.
+    digest = None
     if gate_proof_keys:
         import forge_network
         digest = gate_proof_digest(forge_network.network_id(), [xch.coin.name(), *(c.coin.name() for c in cats.values())])
         for proof_key in gate_proof_keys:
             conditions.append([AGG_SIG_UNSAFE, bytes(proof_key), digest])
     creator_spends = [make_spend(xch.coin, xch.puzzle, drv.p2_delegated_solution(conditions))]
+    # The proof only binds if the paying coin's puzzle actually OUTPUTS those conditions.
+    # Its puzzle comes from the caller: one that runs the delegated conditions but drops
+    # opcode 49 would pass the gate on a public approved key and never need its signature
+    # (2026-10-15 security review, forge-ui U-04). Run it and require every pair.
+    if gate_proof_keys and not emits_gate_proofs(creator_spends[0], gate_proof_keys, digest):
+        raise OfferRejected("the paying coin's puzzle does not emit the creation gate's key proof; pay from a standard wallet coin")
     for asset, cat in cats.items():
         i = config.asset_ids.index(asset)
         conds = [[CREATE_COIN, drv.RESERVE_LAUNCHER_HASH, config.reserves[i]]]   # V16: CAT-wrapped by the layer
@@ -305,6 +312,26 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
         "need_xch": need, "change": change, "genesis_lp": config.total_lp, "burned_lp": drv.LOCKED_BURN,
         "creator_lp": config.total_lp - drv.LOCKED_BURN, "name": config.name, "symbol": config.symbol,
     })
+
+
+GATE_PROOF_MAX_COST = 11_000_000_000     # one spend's share of a block: the caller's puzzle is untrusted
+
+
+def emits_gate_proofs(spend: CoinSpend, proof_keys, digest: bytes) -> bool:
+    """Whether `spend`, run as consensus would run it, outputs AGG_SIG_UNSAFE(key, digest)
+    for every key in `proof_keys`. A puzzle that fails, runs over the cost cap, or leaves
+    any pair out does not."""
+    try:
+        _cost, out = Program.from_bytes(bytes(spend.puzzle_reveal)).run_with_cost(
+            GATE_PROOF_MAX_COST, Program.from_bytes(bytes(spend.solution)))
+        found = set()
+        for condition in out.as_iter():
+            parts = list(condition.as_iter())
+            if len(parts) >= 3 and parts[0].atom is not None and parts[0].as_int() == AGG_SIG_UNSAFE:
+                found.add((parts[1].as_atom(), parts[2].as_atom()))
+    except Exception:  # noqa: BLE001 -- anything that does not run cleanly proves nothing
+        return False
+    return all((bytes(key), bytes(digest)) in found for key in proof_keys)
 
 
 def finalize(plan_: CreationPlan, signature: G2Element, signed_creator_spends: list | None = None) -> SpendBundle:

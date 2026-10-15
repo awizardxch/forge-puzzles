@@ -270,6 +270,36 @@ def main() -> int:
     other_digest = [m for k, m, _ in agg_sig_pairs(p5.creator_spends, network)[1]]
     check("  the signature cannot be lifted onto another creation: other coins, other digest", other_digest and other_digest[0] != digest)
 
+    # 2026-10-15 security review (forge-ui U-04): the paying coin's puzzle comes from the
+    # caller. One that runs the delegated conditions but leaves out opcode 49 passed the gate
+    # on a public approved key and never needed its signature. plan() now runs the spend and
+    # refuses unless every AGG_SIG_UNSAFE(key, digest) is in its output.
+    def dropping_puzzle() -> Program:
+        # Takes the standard solution shape (key delegated_puzzle delegated_solution), runs
+        # the delegated puzzle, and returns its conditions with every opcode 49 removed.
+        # FILTER's environment is (FILTER LIST): 2 is FILTER, 5 is LIST.
+        rec = "(a 2 (c 2 (c (r 5) ())))"
+        filt = (f"(a (i 5 (q . (a (i (= (f (f 5)) (q . 49)) (q . {rec}) (q . (c (f 5) {rec}))) 1)) (q . ())) 1)")
+        return Program.to(binutils_assemble(f"(a (q . {filt}) (c (q . {filt}) (c (a 5 11) ())))"))
+    try:
+        from clvm_tools.binutils import assemble as binutils_assemble
+        dropper = dropping_puzzle()
+        xch_drop = create.CreatorXch(Coin(bytes32(b"\x3f" * 32), dropper.get_tree_hash(), uint64(2 + 1_000_000 + 9_999 + fee)), dropper)
+        # the dropper really does run the delegated conditions without the proof
+        probe_conditions = [[51, bytes(CREATOR_PH), 1], [49, bytes(approved_pk), b"\x00" * 32]]
+        out = dropper.run(drv.p2_delegated_solution(probe_conditions))
+        kept = [int(Program.to(c).first().as_int()) for c in out.as_iter()]
+        check("  the probe puzzle passes the delegated conditions through and drops opcode 49", kept == [51], str(kept))
+        try:
+            create.plan(reg2, slots2, cfg4, xch_drop, {T_B: cat4}, CREATOR_PH, fee, gate_proof_keys=(approved_pk,))
+            check("  a paying coin whose puzzle drops the key proof is refused at plan time", False, "planned")
+        except v16.OfferRejected as exc:
+            check("  a paying coin whose puzzle drops the key proof is refused at plan time", "key proof" in str(exc), str(exc))
+        check("  a standard wallet coin emits the proof (the gate's normal path still plans)",
+              create.emits_gate_proofs(p4.creator_spends[0], (approved_pk,), digest))
+    except ImportError as exc:
+        check("  clvm_tools available for the dropping-puzzle probe", False, str(exc))
+
     print()
     passed = sum(results)
     print(f"{passed}/{len(results)} creation checks passed")

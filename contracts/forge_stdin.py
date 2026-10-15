@@ -703,6 +703,13 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     the push confirms; `commit-create` applies that patch to the registry driver's record."""
     off, rt, cre, drv = _lane(payload)
     if action == "commit-create":
+        # Writes the registry record named by `record_path`. Only the server's own create
+        # flow (api/forge-create.js) may ask, and it says so through the environment, which a
+        # request body cannot set: /api/forge-pool passed raw bodies here, so anyone could
+        # rewrite the router's record (2026-10-15 security review, forge-ui U-03 / P-01).
+        import os
+        if os.environ.get("FORGE_STDIN_COMMIT") != "1":
+            raise ValueError("commit-create runs only inside the server's own create flow")
         return cre.commit_record(payload["record_path"], payload["record_patch"])
     registry = _lane_registry(payload["registry"], drv)
     xch, cats = _creator_coins(payload, cre)
