@@ -1880,6 +1880,10 @@ def cmd_sign_request(payload: dict[str, Any], _factory: Callable[[str], Node]) -
         "selected_pubkeys": [pubkey_hex(k) for k in selection],
         "coin_spends": [spend_to_json(s) for s in to_sign],
         "bundle_spends": len(spends),
+        # The whole bundle, so the browser can check that the delegated puzzle the owner
+        # signs authorizes exactly these funds spends and that they pay what the card shows
+        # (2026-10-15 review, forge-ui U-05; src/lib/signGuard.ts verifyLockProposal).
+        "bundle": [spend_to_json(s) for s in spends],
         "partial": partial,
         "required_keys": [key.hex() for key in sorted(required)],
         "messages": [plan.message.hex()],

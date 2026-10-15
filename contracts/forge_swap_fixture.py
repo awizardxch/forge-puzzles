@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -276,32 +277,56 @@ def pool_from_inline_state(state: dict[str, Any]) -> PoolFixture:
     )
 
 
+FIXTURE_DIR = Path(__file__).resolve().parent / "compiled"
+DEFAULT_FIXTURE = "testnet_lifecycle_e35984cdde6c.json"
+FIXTURE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}\.json$", re.IGNORECASE)
+
+
+def fixture_path_for(name: Any) -> Path:
+    """A fixture is named, never pathed: a basename under contracts/compiled/.
+
+    `fixture_path` used to be taken from the request as given -- relative to the
+    workspace or absolute -- which was a file-existence oracle and a path leak
+    (2026-10-15 review, T-01). The default is the pinned live fixture.
+    """
+    if name is None or (isinstance(name, str) and not name.strip()):
+        name = DEFAULT_FIXTURE
+    if not isinstance(name, str) or not FIXTURE_NAME.match(name) or ".." in name:
+        raise ValueError("fixture must name a .json file under contracts/compiled/")
+    resolved = FIXTURE_DIR / name
+    if not resolved.is_file():
+        # Named, not pathed, in the error too: no absolute path leaves the script.
+        raise ValueError(f"fixture {name} is not in contracts/compiled/")
+    return resolved
+
+
 def run_action(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action") or "plan").strip().lower()
+
+    if "fixture_path" in payload:
+        raise ValueError("fixture_path is not an input; name a fixture under contracts/compiled/ with `fixture`")
 
     # Prefer inline pool state (no fixture file needed — works for any pool)
     inline_state = payload.get("pool_state")
     if isinstance(inline_state, dict) and inline_state:
         pool = pool_from_inline_state(inline_state)
     else:
-        fixture_raw = payload.get("fixture_path") or payload.get("fixture")
-        if not isinstance(fixture_raw, str) or not fixture_raw.strip():
-            fixture_path = Path(__file__).parent / "compiled" / "testnet_lifecycle_e35984cdde6c.json"
-        else:
-            supplied_path = Path(fixture_raw)
-            fixture_path = supplied_path if supplied_path.is_absolute() else workspace_root() / Path(fixture_raw)
-        pool = load_pool_fixture(fixture_path)
+        pool = load_pool_fixture(fixture_path_for(payload.get("fixture")))
 
     if action == "status":
         return {
             "success": True,
             "available": True,
             "launcher_id": pool.launcher_id,
-            "fixture_path": str(pool.fixture_path),
+            "fixture": pool.fixture_path.name,
             "message": "Forge swap fixture planner is available.",
         }
 
-    if action not in {"plan", "validate", "submit"}:
+    # This planner plans and validates. It had a `submit` action that made the
+    # wallet beside the responder take the caller's offer, at the caller's fee,
+    # on a host and port the caller named (2026-10-15 review, U-01 / T-01).
+    # Gone: nothing here reaches a wallet.
+    if action not in {"plan", "validate"}:
         raise ValueError(f"Unsupported action: {action}")
 
     plan = plan_swap(
@@ -320,36 +345,6 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
                 f"expected_amount_out {expected_amount_out} does not match computed amount_out {plan['quote']['amount_out']}"
             )
 
-    if action == "submit":
-        offer = str(payload.get("offer") or "").strip()
-        if not offer:
-            raise ValueError("submit action requires an offer string")
-
-        host = str(payload.get("host") or "127.0.0.1")
-        port = int(payload.get("port") or 9257)
-        fee = int(payload.get("fee") or 0)
-
-        from sage_rpc import SageRPC  # noqa: PLC0415
-        sage = SageRPC(host=host, port=port)
-        sage_result = sage.take_offer(offer, fee=fee)
-
-        return {
-            "success": True,
-            "action": "submit",
-            "transaction_id": sage_result.get("transaction_id"),
-            "offer_id": sage_result.get("offer_id"),
-            "quote": plan["quote"],
-            "pool_before": plan["pool_before"],
-            "pool_after": plan["pool_after"],
-            "submission_context": {
-                "type": "forge-swap-sage-taker",
-                "pool_aware": True,
-                "can_broadcast_live": True,
-                "note": "Sage wallet takes the user offer. Pool singleton reserves require on-chain swap mode for trustless settlement.",
-            },
-            "raw_sage": sage_result,
-        }
-
     return {
         "success": True,
         "action": action,
@@ -359,7 +354,7 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
 
 def cli() -> int:
     parser = argparse.ArgumentParser(description="Plan or validate a deterministic Forge swap against a live fixture")
-    parser.add_argument("--fixture", default=str(Path(__file__).parent / "compiled" / "testnet_lifecycle_e35984cdde6c.json"))
+    parser.add_argument("--fixture", default=DEFAULT_FIXTURE, help="a fixture's file name under contracts/compiled/")
     parser.add_argument("--in-index", type=int, default=0)
     parser.add_argument("--out-index", type=int, default=1)
     parser.add_argument("--amount-in", type=int, default=1000)
@@ -372,7 +367,7 @@ def cli() -> int:
 
     summary = run_action({
         "action": args.action,
-        "fixture_path": args.fixture,
+        "fixture": Path(args.fixture).name,
         "in_index": args.in_index,
         "out_index": args.out_index,
         "amount_in": args.amount_in,
