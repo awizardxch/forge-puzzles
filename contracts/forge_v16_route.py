@@ -669,6 +669,11 @@ def _toposort(legs: list[Leg], pools: list | None = None) -> list[int]:
     for i, leg in enumerate(legs):
         if leg.kind in ("swap", "redeem", "wrap", "remove"):
             produced_by.setdefault(_key(leg.asset_out), set()).add(i)
+        if leg.kind == "remove" and pools is not None:
+            # a remove pays out EVERY reserve, so a leg drinking any of them from the pot (an
+            # LP-to-LP zap buying with the removed XCH) waits for it too
+            for asset in pools[leg.pool].asset_ids:
+                produced_by.setdefault(_key(asset), set()).add(i)
     done: set[int] = set()
     order: list[int] = []
     while len(order) < len(legs):
@@ -777,9 +782,14 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
             continue
         src = leg.feed_from
         if src.kind == "remove":
-            # A remove pays out every reserve: a leg chained to it drinks one of the others.
-            ok = (not leg.entry and leg.kind == "swap" and leg.pool == src.pool
-                  and leg.asset_in in pools[src.pool].asset_ids and leg.asset_in != src.asset_out)
+            # A remove pays out every reserve: a leg chained to it drinks one of the others,
+            # on the same pool (the zap out) or, for an LP-to-LP zap, on another pool (owner,
+            # 2026-10-15: the 🌱💗 LP into the 🍫 XCH LP, its CATs sold for XCH elsewhere).
+            # Each reserve is drunk by one leg at most.
+            ok = (not leg.entry and leg.kind == "swap" and leg.asset_in in pools[src.pool].asset_ids
+                  and (leg.pool != src.pool or leg.asset_in != src.asset_out)
+                  and not any(other is not leg and other.feed_from is src and _key(other.asset_in) == _key(leg.asset_in)
+                              for other in legs))
         else:
             ok = not leg.entry and _key(src.asset_out) == _key(leg.asset_in)
         if not ok:
@@ -1697,3 +1707,222 @@ def zap_out(pool, asset_out, offer: Offer, height: int, surplus_ph: bytes32, fee
     return RouteResult(result.bundle, result.pools, legs,
                        {**result.details, "burned": remove.gross, "removed": remove.out,
                         "swapped": [[leg.gross, leg.out] for leg in swaps]})
+
+
+def _sim_swap(res: dict, pool, a_in, a_out, amount: int) -> int:
+    """One swap on the simulated reserves `res` (launcher id -> reserves), as the composer's
+    swap leg runs it: the release less the protocol and DAO slices (each floored, the DAO
+    rate the pool's current one) is paid on, and the out-reserve falls by the WHOLE release
+    (the slices are owed, outside the reserves). 0, and no change, when it releases nothing."""
+    if amount <= 0:
+        return 0
+    r = res.setdefault(pool.launcher_id, list(pool.state[0]))
+    i, o = pool.asset_ids.index(a_in), pool.asset_ids.index(a_out)
+    try:
+        honest = forge_math.swap_output(r[i], r[o], amount, pool.fee_bps, pool.weights[i], pool.weights[o])
+    except (ValueError, ZeroDivisionError, OfferRejected):
+        return 0
+    net = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
+    if honest <= 0 or net <= 0:
+        return 0
+    r[i] += amount
+    r[o] -= honest
+    return net
+
+
+def zap_lp_exit(source, burn: int, sales: list) -> tuple[dict, dict, list[int], list[int]]:
+    """The deterministic half of an LP-to-LP zap: `burn` of the source's LP removed for every
+    reserve, then each sale `(pool, asset_in, asset_out)` selling ALL of one removed reserve,
+    in order, each on the state the one before it left. Returns (the simulated reserves, the
+    pots by asset key, the removed payouts, each sale's output; a sale of a reserve the
+    remove pays nothing of outputs 0 and is dropped by the lane). A sale that releases
+    nothing for a real coin refuses the zap."""
+    state = source.state
+    vf = forge_math.vault_fee_bps(len(state[0]), MATH_VERSION, source.fee_bps)
+    payouts = [int(p) for p in forge_math.withdrawal_amounts(state[0], burn, state[1], vf)]
+    res = {source.launcher_id: [int(r) - p for r, p in zip(state[0], payouts)]}
+    pots: dict[bytes, int] = {}
+    sold = {_key(a_in) for _p, a_in, _o in sales}
+    for asset, pay in zip(source.asset_ids, payouts):
+        if pay > 0 and _key(asset) not in sold:
+            pots[_key(asset)] = pots.get(_key(asset), 0) + pay
+    outs: list[int] = []
+    for pool, a_in, a_out in sales:
+        pay = payouts[source.asset_ids.index(a_in)]
+        if pay <= 0:
+            outs.append(0)
+            continue
+        got = _sim_swap(res, pool, a_in, a_out, pay)
+        if got <= 0:
+            raise OfferRejected(f"selling the removed {_hex(a_in)[:8]} on pool {pool.launcher_id.hex()[:8]} releases nothing")
+        pots[_key(a_out)] = pots.get(_key(a_out), 0) + got
+        outs.append(got)
+    return res, pots, payouts, outs
+
+
+def zap_lp_buys(target, res: dict, pots: dict, buys: list) -> tuple[list[int], int]:
+    """An LP-to-LP zap into a pool WITHOUT XCH: the XCH the exit raised (`pots`) buys one or
+    two of the target's assets on their XCH pools (`buys`: `(pool, asset)`), everything the
+    target holds is deposited, and the XCH left must be EXACTLY the mint's backing (the add
+    refuses XCH beyond it, and leftover XCH would be a second payout): `sum(y) + mint == X`.
+    One buy: the largest y whose mint fits, the neighbours tried where the sum skips (as
+    zap_in_one_sale). Two: split in the target's ratio for those two slots, counting what is
+    already deposited, the total the largest that fits (as zap_in_sales). The shares of the
+    XCH hub must differ (nudge_equal_shares would move the backing). Returns (ys, mint)."""
+    x_total = int(pots.get(_key(None), 0))
+    if x_total <= 2:
+        raise OfferRejected("the zap raises too little XCH to buy into the pool and back the mint")
+    base = [int(pots.get(_key(a), 0)) for a in target.asset_ids]
+    slots = [target.asset_ids.index(asset) for _p, asset in buys]
+    r = target.state[0]
+
+    def outs(ys: list[int]) -> list[int]:
+        sim = {k: list(v) for k, v in res.items()}
+        return [_sim_swap(sim, pool, None, asset, y) for (pool, asset), y in zip(buys, ys)]
+
+    def mint(ys: list[int]) -> int:
+        got = outs(ys)
+        if any(g <= 0 for g in got):
+            return 0
+        d = list(base)
+        for slot, g in zip(slots, got):
+            d[slot] += g
+        try:
+            return forge_math.invariant_lp_mint(r, d, target.state[1], target.fee_bps, target.weights, version=MATH_VERSION)
+        except (ValueError, ZeroDivisionError):
+            return 0
+
+    if len(buys) == 1:
+        lo, hi, best = 1, x_total - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            m = mint([mid])
+            if m > 0 and mid + m <= x_total:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if not best:
+            raise OfferRejected("the XCH the zap raises is too little to buy into the pool and back the mint")
+        for y in (best, best + 1, best - 1, best + 2):
+            m = mint([y]) if y > 0 else 0
+            if m > 0 and y + m == x_total and y != m:
+                return [y], m
+        raise OfferRejected("no purchase leaves exactly the mint's backing; change the amount by a mojo and quote again")
+    i, j = slots
+
+    def split(total: int) -> int:
+        lo, hi = 1, total - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            g = outs([mid, total - mid])
+            if (base[i] + g[0]) * r[j] >= (base[j] + g[1]) * r[i]:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def fits(total: int) -> bool:
+        a0 = split(total)
+        m = mint([a0, total - a0])
+        return m > 0 and total + m <= x_total
+
+    lo, hi, best = 2, x_total - 2, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    if not best:
+        raise OfferRejected("the XCH the zap raises is too little to buy both assets and back the mint")
+    first = split(best)
+    for total in (best, best + 1, best - 1, best + 2):
+        for a0 in (first, first + 1, first - 1, first + 2, first - 2):
+            a1 = total - a0
+            if a0 <= 0 or a1 <= 0:
+                continue
+            m = mint([a0, a1])
+            if m > 0 and total + m == x_total and len({a0, a1, m}) == 3:
+                return [a0, a1], m
+    raise OfferRejected("no split of this amount leaves exactly the mint's backing; change the amount by a mojo and quote again")
+
+
+def zap_lp(source, target, sales: list, buys: list, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0,
+           fee_ph: bytes32 | None = None, preview: bool = False, fee_mode: str = "auto") -> RouteResult:
+    """One LP in, a DIFFERENT pool's LP out, one bundle (owner, 2026-10-15: the LOVE/SPROUT LP
+    to the Choco Taco XCH LP found no route, "these LPs which do have a route through XCH").
+
+    The source LP is removed for every reserve (the zap out's "remove" leg); each reserve the
+    target does not take as it is is sold on `sales` -- `(pool, asset_in, asset_out)`, the
+    whole removed coin, into XCH or into an asset the target holds; then:
+      * a target holding XCH: the add deposits everything the target holds and every XCH
+        mojo, the mint taking its backing out of it (the pool's own join, as routed_deposit);
+      * a target without XCH: the XCH raised buys one or two of its assets on `buys` --
+        `(pool, asset)`, XCH pools -- and what is left is exactly the mint's backing
+        (zap_lp_buys).
+    One asset offered (the source LP) and one paid out (the target LP), so a wallet-built
+    offer works, and the router's rate is charged once, like any zap: beside the entry, or
+    off the payout for a wallet-built offer. The planner (forgeAdapter.getZapQuotes) picks
+    the sales and buys that mint the most; this lane checks them and sizes the buys."""
+    sales = [(p, _asset(a_in), _asset(a_out)) for p, a_in, a_out in sales]
+    buys = [(p, _asset(a)) for p, a in buys]
+    if source.launcher_id == target.launcher_id:
+        raise OfferRejected("an LP-to-LP zap is between two different pools")
+    if len(source.asset_ids) < 2 or len(target.asset_ids) < 2:
+        raise OfferRejected("an LP-to-LP zap burns and mints multi-asset pools' LP; a vault's LP redeems and wraps")
+    if source.lp_asset_id in target.asset_ids or target.lp_asset_id in source.asset_ids:
+        raise OfferRejected("one pool holds the other's LP: that is a deposit or a zap out, not an LP-to-LP zap")
+    offered = find_offer_settlements(offer, sorted({source.lp_asset_id} | {a for a in target.asset_ids if a is not None}
+                                                   | {a for a in source.asset_ids if a is not None}))
+    if len(offered) != 1 or next(iter(offered)) != source.lp_asset_id:
+        raise OfferRejected("an LP-to-LP zap offers the source pool's LP alone")
+    burn = int(offered[source.lp_asset_id].coin.amount)
+    seen: set = set()
+    for pool, a_in, a_out in sales:
+        if pool.launcher_id == target.launcher_id:
+            raise OfferRejected("an LP-to-LP zap sells on pools other than the target")
+        if a_in is None or a_in not in source.asset_ids or _key(a_in) in seen:
+            raise OfferRejected("each sale sells one CAT the source pool pays out, once")
+        seen.add(_key(a_in))
+        if len(pool.asset_ids) < 2 or a_in not in pool.asset_ids or a_out not in pool.asset_ids or a_in == a_out:
+            raise OfferRejected(f"sale pool {pool.launcher_id.hex()[:8]} does not trade {_hex(a_in)[:8]} for {_hex(a_out)[:8]}")
+        if a_out is not None and a_out not in target.asset_ids:
+            raise OfferRejected("a sale ends in XCH or in an asset the target holds")
+    for asset in source.asset_ids:
+        if asset is not None and _key(asset) not in seen and asset not in target.asset_ids:
+            raise OfferRejected(f"the removed {_hex(asset)[:8]} is neither deposited nor sold; it would be a second payout")
+    xch_target = None in target.asset_ids
+    if xch_target and buys:
+        raise OfferRejected("a target holding XCH takes the XCH as it is; it buys on no other pool")
+    if not xch_target:
+        if len(buys) not in (1, 2):
+            raise OfferRejected("a target without XCH buys one or two of its assets with the XCH the zap raises")
+        if len({_key(a) for _p, a in buys}) != len(buys):
+            raise OfferRejected("two buys of the same asset")
+        for pool, asset in buys:
+            if pool.launcher_id == target.launcher_id or None not in pool.asset_ids or asset is None or asset not in pool.asset_ids \
+                    or asset not in target.asset_ids:
+                raise OfferRejected("a buy spends XCH for one of the target's assets on an XCH pool that holds it")
+    res, pots, payouts, _outs = zap_lp_exit(source, burn, sales)
+    # a sale of a reserve the remove pays nothing of has no coin to sell
+    sales = [(p, a_in, a_out) for p, a_in, a_out in sales if payouts[source.asset_ids.index(a_in)] > 0]
+    if _key(None) not in pots:
+        raise OfferRejected("the zap raises no XCH: the new LP needs XCH to back it")
+    ys, backing = zap_lp_buys(target, res, pots, buys) if not xch_target else ([], 0)
+
+    distinct: list = []
+    src_i = _pool_index(distinct, source)
+    sold = {_key(a) for _p, a, _o in sales}
+    exit_asset = next((a for a in source.asset_ids if _key(a) not in sold), source.asset_ids[0])
+    remove = Leg(src_i, "remove", source.lp_asset_id, exit_asset, amount_in=1, entry=True)
+    sale_legs = [Leg(_pool_index(distinct, p), "swap", a_in, a_out, amount_in=1, feed_from=remove) for p, a_in, a_out in sales]
+    buy_legs = [Leg(_pool_index(distinct, p), "swap", None, a, amount_in=y) for (p, a), y in zip(buys, ys)]
+    add = Leg(_pool_index(distinct, target), "add", amount_in=backing)
+    legs = [remove, *sale_legs, *buy_legs, add]
+    if len(distinct) > 20:
+        raise OfferRejected("an LP-to-LP zap spends at most 20 pools")
+    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
+    return RouteResult(result.bundle, result.pools, legs, {
+        **result.details, "burned": remove.gross, "removed": payouts,
+        "sales": [leg.gross for leg in sale_legs], "sale_outputs": [leg.out for leg in sale_legs],
+        "buys": [leg.gross for leg in buy_legs], "buy_outputs": [leg.out for leg in buy_legs]})

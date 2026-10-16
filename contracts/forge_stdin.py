@@ -83,7 +83,7 @@ else:
 
 # The route actions a composer builds across revisions (forge_v16_route._drv; a route that
 # never touches a V16 pool is built by forge_v15_route, which spends V14 and V15 pools).
-_CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-in"})
+_CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-in", "zap-lp"})
 
 
 def _lane_version(payload: dict) -> int:
@@ -364,13 +364,13 @@ def _dev_fee(payload: dict[str, Any]) -> tuple[bytes32 | None, int]:
 def _pool_snapshots(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Every pool snapshot a request carries, whichever lane it names."""
     found: list[dict[str, Any]] = []
-    for key in ("pool", "swapPool", "vault", "viaPool"):
+    for key in ("pool", "swapPool", "vault", "viaPool", "sourcePool"):
         if isinstance(payload.get(key), dict):
             found.append(payload[key])
     for entry in payload.get("pools") or []:
         if isinstance(entry, dict):
             found.append(entry)
-    for group_key in ("legs", "sales", "branches"):
+    for group_key in ("legs", "sales", "branches", "buys"):
         for group in payload.get(group_key) or []:
             if not isinstance(group, dict):
                 continue
@@ -427,7 +427,7 @@ def _settle_takes_fee(lane) -> bool:
     return "fee_bps" in inspect.signature(lane.settle).parameters
 
 
-ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out", "zap-in")
+ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out", "zap-in", "zap-lp")
 
 
 def _snapshot_of(pool) -> dict[str, Any]:
@@ -542,6 +542,27 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
                  **({"inner_mints": [{"pool": m["pool"], "minted": str(m["minted"]), "backing": str(m["backing"]),
                                       "deposits": {a: str(v) for a, v in m["deposits"].items()}}
                                      for m in result.details["inner_mints"]]} if result.details.get("inner_mints") else {})}
+    elif action == "zap-lp":
+        # One pool's LP into ANOTHER pool's LP (forge_v16_route.zap_lp, owner 2026-10-15):
+        # "sourcePool" is removed, "sales" sell its reserves the target ("pool") does not take
+        # as they are, "buys" spend the XCH raised on a target without XCH.
+        if not hasattr(rt, "zap_lp"):
+            raise ValueError("this pool revision has no LP-to-LP zap lane")
+        source, target = _lane_pool(payload["sourcePool"]), _lane_pool(payload["pool"])
+        sales = [(_lane_pool(sale["pool"]), _bytes32(str(sale["assetIn"])), _bytes32(str(sale["assetOut"])))
+                 for sale in payload.get("sales") or []]
+        buys = [(_lane_pool(buy["pool"]), _bytes32(str(buy["asset"]))) for buy in payload.get("buys") or []]
+        result = rt.zap_lp(source, target, sales, buys, offer, height,
+                           surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview, **mode)
+        target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
+        extra = {"target": _snapshot_of(target_after),
+                 "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
+                 "minted": str(result.details["minted"]), "backing": str(result.details["backing"]),
+                 "burned": str(result.details["burned"]), "removed": [str(a) for a in result.details["removed"]],
+                 "sales": [str(a) for a in result.details["sales"]],
+                 "sale_outputs": [str(a) for a in result.details["sale_outputs"]],
+                 "buys": [str(a) for a in result.details["buys"]],
+                 "buy_outputs": [str(a) for a in result.details["buy_outputs"]]}
     elif action == "zap-out":
         if not hasattr(rt, "zap_out"):
             raise ValueError("this pool revision has no zap-out lane")
