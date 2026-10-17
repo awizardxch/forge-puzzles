@@ -40,8 +40,10 @@ import itertools
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -184,12 +186,90 @@ def spend_to_json(spend: CoinSpend) -> dict[str, Any]:
 # ─── Node access ─────────────────────────────────────────────────────────────
 
 
-class Node:
-    """Thin coinset/full-node REST client. Tests replace ``rpc`` outright."""
+_REPORTED_INVALID_FAILOVERS: set[str] = set()
 
-    def __init__(self, node_url: str, timeout: int = 30) -> None:
+
+def failover_node_urls(raw: str | None = None) -> list[str]:
+    """The operator's failover nodes for the lock tools: MULTISIG_NODE_FAILOVER_URLS.
+
+    The Python half of api/_nodeUrl.js failoverNodeUrls: comma-separated, https only,
+    no credentials, query or fragment. An entry that is not one is ignored and named
+    once on stderr by its host, never in full (a URL can carry a key).
+    """
+    text = os.environ.get("MULTISIG_NODE_FAILOVER_URLS", "") if raw is None else raw
+    out: list[str] = []
+    for index, entry in enumerate(part.strip() for part in str(text).split(",")):
+        if not entry:
+            continue
+        reason = ""
+        try:
+            parts = urllib.parse.urlsplit(entry)
+        except ValueError:
+            parts = None
+            reason = "not a URL"
+        if parts is not None and not reason:
+            if parts.scheme != "https" or not parts.hostname:
+                reason = "not https"
+            elif parts.username or parts.password:
+                reason = "carries credentials"
+            elif parts.query or parts.fragment:
+                reason = "carries a query or fragment"
+        if reason:
+            key = f"{index}:{reason}"
+            if key not in _REPORTED_INVALID_FAILOVERS:
+                _REPORTED_INVALID_FAILOVERS.add(key)
+                host = f": {parts.hostname}" if parts is not None and parts.hostname else ""
+                print(f"[aWizard] MULTISIG_NODE_FAILOVER_URLS entry {index + 1} ignored ({reason}){host}", file=sys.stderr)
+            continue
+        url = f"{parts.scheme}://{parts.netloc}{parts.path}".rstrip("/")
+        if url not in out:
+            out.append(url)
+    return out
+
+
+def failover_anchor() -> str:
+    """The node the failover list stands behind: MULTISIG_NODE_URL, else the public node
+    of the responder's own network. A Node built for any other URL (a lock on the other
+    network) gets no failovers, so a same-network list is never asked about another chain."""
+    explicit = os.environ.get("MULTISIG_NODE_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    network = "mainnet" if os.environ.get("FORGE_NETWORK", "").strip().lower() == "mainnet" else "testnet11"
+    return NETWORKS[network]["node_url"]
+
+
+def _node_host(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).hostname or "invalid-url"
+    except ValueError:
+        return "invalid-url"
+
+
+def _push_accepted(body: Any) -> bool:
+    """A failover node took the bundle: SUCCESS, or already in its mempool. PENDING is not."""
+    if not isinstance(body, dict):
+        return False
+    status = str(body.get("status") or "").upper()
+    return (body.get("success") is True and status == "SUCCESS") or "ALREADY_INCLUDING_TRANSACTION" in str(body.get("error") or "")
+
+
+class Node:
+    """Thin coinset/full-node REST client. Tests replace ``rpc`` outright.
+
+    Reads ask this node (with the retry below) and, only when it still has not answered,
+    each failover node once. A push goes to this node and every failover node at once;
+    this node's answer stands unless it did not answer and a failover node accepted the
+    bundle. The JavaScript router applies the same rules (api/_nodeRpc.js).
+    """
+
+    FAILOVER_PUSH_TIMEOUT_S = 15
+
+    def __init__(self, node_url: str, timeout: int = 30, failover_urls: list[str] | None = None) -> None:
         self.node_url = node_url.rstrip("/")
         self.timeout = timeout
+        if failover_urls is None:
+            failover_urls = failover_node_urls() if self.node_url == failover_anchor() else []
+        self.failover_urls = [url for url in dict.fromkeys(u.rstrip("/") for u in failover_urls) if url != self.node_url]
 
     # A read the node's edge drops (a 5xx, a reset connection) is asked again: the
     # lock page showed "HTTP 503: upstream connect error" for a balance coinset
@@ -199,19 +279,74 @@ class Node:
     RETRY_PAUSE_S = 0.6
 
     def rpc(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
-        attempts = 1 if route == "push_tx" else 1 + self.READ_RETRIES
+        if route == "push_tx":
+            return self._push(payload)
+        attempts = 1 + self.READ_RETRIES
         for attempt in range(attempts):
             try:
                 return self._rpc_once(route, payload)
             except _Transient as exc:
                 if attempt + 1 >= attempts:
+                    # This node still has not answered: each failover node, once. A 4xx
+                    # from one is its answer and is raised as such.
+                    for url in self.failover_urls:
+                        try:
+                            body = self._rpc_at(url, route, payload, self.timeout)
+                        except _Transient:
+                            continue
+                        print(f"[aWizard] node read {route} answered by failover {_node_host(url)}", file=sys.stderr)
+                        return body
                     raise MultisigError(str(exc)) from exc
                 time.sleep(self.RETRY_PAUSE_S * (attempt + 1))
         raise MultisigError(f"node {route} did not answer")  # unreachable
 
+    def _push(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Never repeated on the same node: a push that timed out may have landed."""
+        if not self.failover_urls:
+            try:
+                return self._rpc_once("push_tx", payload)
+            except _Transient as exc:
+                raise MultisigError(str(exc)) from exc
+        answers: dict[str, Any] = {}
+
+        def send(url: str) -> None:
+            try:
+                answers[url] = self._rpc_at(url, "push_tx", payload, self.FAILOVER_PUSH_TIMEOUT_S)
+            except (_Transient, MultisigError) as exc:
+                answers[url] = exc
+
+        threads = [threading.Thread(target=send, args=(url,), daemon=True) for url in self.failover_urls]
+        started = time.monotonic()
+        for thread in threads:
+            thread.start()
+        body: dict[str, Any] | None = None
+        primary_error: Exception | None = None
+        try:
+            body = self._rpc_once("push_tx", payload)
+        except (_Transient, MultisigError) as exc:
+            primary_error = exc
+        for thread in threads:
+            thread.join(max(0.0, self.FAILOVER_PUSH_TIMEOUT_S + 1 - (time.monotonic() - started)))
+        for url in self.failover_urls:
+            answer = answers.get(url, "no answer in time")
+            summary = answer.get("status") or answer.get("error") if isinstance(answer, dict) else answer
+            print(f"[aWizard] push_tx broadcast to {_node_host(url)}: {str(summary)[:160]}", file=sys.stderr)
+        if primary_error is None:
+            return body  # this node answered: its answer stands
+        if isinstance(primary_error, _Transient):
+            for url in self.failover_urls:
+                if _push_accepted(answers.get(url)):
+                    print(f"[aWizard] push_tx: {_node_host(self.node_url)} did not answer; failover {_node_host(url)} accepted the bundle", file=sys.stderr)
+                    return answers[url]
+            raise MultisigError(str(primary_error)) from primary_error
+        raise primary_error
+
     def _rpc_once(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._rpc_at(self.node_url, route, payload, self.timeout)
+
+    def _rpc_at(self, node_url: str, route: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         request = urllib.request.Request(
-            f"{self.node_url}/{route}",
+            f"{node_url}/{route}",
             data=json.dumps(payload).encode(),
             headers={
                 "Content-Type": "application/json",
@@ -221,7 +356,7 @@ class Node:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 body = json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")
