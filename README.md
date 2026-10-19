@@ -7,8 +7,12 @@ Everything here can move funds. That is the whole point of the split — the
 interface lives in a separate repository, so what is in front of you *is* the
 attack surface and nothing dilutes that claim.
 
-> **Status: testnet research. Unaudited.** V16 (protocol 17) is live on testnet11 beside V15 (protocol 16) and V14 (protocol 15), which are kept, not retired
-> with 32 pools. It replaces V13, which a fourth independent review retired on
+> **Status: unaudited.** V16 (protocol 17) is the shipping revision. It runs on
+> mainnet, where it is the only revision (21 pools on 2026-10-18), and on testnet11
+> beside V15 (protocol 16) and V14 (protocol 15), which are kept, not retired. V16
+> changes one thing from V15, the burn address of the locked minimum; V15 changed
+> the `coinid` derivations, canonical state atoms and the creation fee. Both build
+> on V14, which replaced V13 after a fourth independent review retired it on
 > 2026-09-15: the registry admitted a pool whose reserves were never funded, and
 > the slot it took could never be spent by anyone. V14 derives every reserve's
 > parent from a reserve launcher the registration bundle must spend, and every
@@ -86,7 +90,7 @@ python contracts/_test_v16_actions.py            # the leaves, accept and refuse
 python contracts/_test_v16_registry.py           # admission, and the locked minimum burned at 0x000...dead
 python contracts/_test_v16_reserves_proved.py    # the reserve launcher and the derived parent (R-1)
 python contracts/_test_v16_settlement_amount.py  # the settlement binding, attacks value-balanced
-python contracts/_test_v16_before_after.py       # each change against the V13 AND V14 builds
+python contracts/_test_v16_before_after.py       # each change against the V13 AND V16 builds
 python contracts/_test_v16_manipulation.py       # flash-loan-analog sequences
 python contracts/_test_v16_curve_equivalence.py
 python contracts/_test_v16_genesis.py            # the eve-bound genesis mint

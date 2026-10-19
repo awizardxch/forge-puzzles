@@ -1,5 +1,7 @@
 # Forge puzzle V14 -- the fourth-review revision
 
+> **Status (2026-10-18): kept live on testnet11, not on mainnet.** The shipping revision is **V16** (protocol 17), see [FORGE_PUZZLE_V16.md](FORGE_PUZZLE_V16.md); V15 and V16 change only what those two documents list, so this one still describes the architecture.
+
 Testnet research only; unaudited. Protocol 15 on chain.
 
 On 2026-09-15 a fourth independent review of V13 (Chia-Network/chips#217, trgarrett)

@@ -1,5 +1,7 @@
 # Forge V14 — specification of the improvements
 
+> **Status (2026-10-18):** the V14 specification, built and kept live on testnet11; the shipping revision is **V16** (protocol 17), see [FORGE_PUZZLE_V16.md](FORGE_PUZZLE_V16.md).
+
 **Status: spec, for review. Nothing built, nothing pushed.**
 Testnet research only; unaudited. V14 is **protocol 15**.
 

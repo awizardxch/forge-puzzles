@@ -1,5 +1,7 @@
 # Forge puzzle V15 -- the 2026-10-07 review revision
 
+> **Status (2026-10-18): kept live on testnet11, not on mainnet.** The shipping revision is **V16** (protocol 17), see [FORGE_PUZZLE_V16.md](FORGE_PUZZLE_V16.md), which changes only the burn address.
+
 Testnet research only; unaudited. Protocol 16 on chain.
 
 V14 (protocol 15) was reviewed a sixth time on 2026-10-07 (the chialisp.com rows, run

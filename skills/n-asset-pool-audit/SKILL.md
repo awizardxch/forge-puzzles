@@ -19,8 +19,10 @@ rule here is wrong, or your own audit needed something this does not say, open a
 a pull request -- a better runbook is worth more to this project than a quiet fix.
 
 Paths in this file refer to this repository, so the commands are runnable rather than
-illustrative. `contracts/_sim_harness.py` and `scripts/sim-v14.py` are the simulator lane,
-`contracts/_v14_testkit.py` the offline one, and `scripts/mutate-v14.py` the mutation run.
+illustrative. `contracts/_sim_harness.py` and `scripts/sim-v16.py` are the simulator lane,
+`contracts/_v16_testkit.py` the offline one, and `scripts/mutate-v16.py` the mutation run
+(V16, protocol 17, is the shipping revision; the `v14`/`v15` scripts remain for the kept
+revisions).
 
 **One caveat for an outside reader.** Rule 6 asks you to demonstrate a finding against the
 revision it was found in. Retired revisions are not published here -- a working recipe
@@ -42,9 +44,12 @@ the private tree. Say which build you tested; that is the part that matters.
    announcements, conditions, and bundle structure before claiming a drain or bricking
    vector. Do not push an exploit bundle to a public network without explicit user
    authorization.
-5. **Read the revision's own references first.** `docs/FORGE_PUZZLE_V14.md` is the
-   shipping revision's disposition, `docs/FORGE_PUZZLE_V14_SPEC.md` the design decisions
-   behind it, `docs/FORGE_V14_ARCHITECTURE.md` the shape, and `docs/FORGE_SECURITY.md` the
+5. **Read the revision's own references first.** The shipping revision is V16 (protocol
+   17): `docs/FORGE_PUZZLE_V16.md` is its change (the burn address) and
+   `docs/FORGE_PUZZLE_V15.md` the one before it (`coinid` derivations, canonical atoms, the
+   creation fee as registry state). The architecture they build on is V14's:
+   `docs/FORGE_PUZZLE_V14.md` its disposition, `docs/FORGE_PUZZLE_V14_SPEC.md` the design
+   decisions, `docs/FORGE_V14_ARCHITECTURE.md` the shape. `docs/FORGE_SECURITY.md` is the
    scope and how to report. Four rounds of external review are recorded in them, with what
    each found; reading them first stops an audit re-finding a closed defect and calling it
    new.
