@@ -12,7 +12,7 @@
 The dev (protocol) fee rate is the pool's CONFIG, curried at creation: no leaf moves it.
 
 stdin JSON:
-    {kind: "collect" | "dao-fee", pool: <V16 snapshot>, height, new_bps?,
+    {kind: "collect" | "dao-fee", pool: <V16 or V17 snapshot>, height, new_bps?,
      payer?: {coin: {parent_coin_info, puzzle_hash, amount}, puzzle_reveal},
      network_fee?, aggregated_signature?, receiver_only?, sender_puzzle_hash?}
 
@@ -44,10 +44,32 @@ from chia_rs import Coin, G2Element, SpendBundle  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 from chia_rs.sized_ints import uint64  # noqa: E402
 
-import forge_v16_driver as drv  # noqa: E402
+import forge_v16_driver as drv  # noqa: E402  -- shared helpers only (p2 solution, validate, MAX_COST)
 import forge_v16_offer as off  # noqa: E402
+try:   # optional: the public repository ships V18 and not the frozen V17
+    import forge_v17_driver as drv17  # noqa: E402
+    import forge_v17_offer as off17  # noqa: E402
+except ImportError:
+    drv17 = off17 = None
+import forge_v18_driver as drv18  # noqa: E402
+import forge_v18_offer as off18  # noqa: E402
 
 PROTOCOL = 17
+# V16 (17), V17 (18) and V18 (19) are served side by side (owner, 2026-11-11, 2026-11-13). Their
+# collect and dao_fee leaves take the same solutions; each pool is rebuilt and spent by its OWN
+# revision's driver.
+LANES = {17: (drv, off), 18: (drv17, off17), 19: (drv18, off18)}
+if drv17 is None:
+    del LANES[18]
+PROTOCOLS = tuple(sorted(LANES))
+
+
+def lane_of(snapshot: dict[str, Any]):
+    """(driver, offer module) for the snapshot's revision, or WRONG_REVISION."""
+    version = int((snapshot or {}).get("protocol_version") or 0)
+    if version not in LANES:
+        raise Refused("WRONG_REVISION", f"this builder spends protocol {' and '.join(str(v) for v in PROTOCOLS)} pools only")
+    return LANES[version]
 SEND_MESSAGE = 66
 MODE_PUZZLE_TO_COIN = 0b010111   # sender committed by puzzle hash, receiver by coin id (23)
 CREATE_COIN = 51
@@ -72,17 +94,101 @@ def dao_fee_message(new_bps: int) -> bytes32:
     return bytes32(Program.to([b"forge-dao-fee-v1", new_bps]).get_tree_hash())
 
 
-def owed_indices(pool: drv.V16Pool) -> list[int]:
+def owed_indices(pool) -> list[int]:
     """Asset indices with a dev or DAO fee owed: the collect leaf asserts one or the other is positive."""
     fees, dao = pool.state[2], pool.state[6]
     return [i for i in range(len(fees)) if int(fees[i]) > 0 or int(dao[i]) > 0]
 
 
+def payer_spend(payer: dict[str, Any], fee: int, extra_conditions: list | None = None):
+    """The paying coin's spend: its change back to its own address, and the network fee."""
+    coin_in = payer["coin"]
+    coin = Coin(_b32(coin_in["parent_coin_info"]), _b32(coin_in["puzzle_hash"]), uint64(int(coin_in["amount"])))
+    puzzle = Program.from_bytes(bytes.fromhex(str(payer["puzzle_reveal"]).removeprefix("0x")))
+    if puzzle.get_tree_hash() != coin.puzzle_hash:
+        raise Refused("BAD_REQUEST", "the payer's puzzle reveal is not its coin's puzzle")
+    if int(coin.amount) < fee:
+        raise Refused("PAYER_TOO_SMALL", f"the paying coin holds {int(coin.amount)} mojos; the network fee is {fee}")
+    conditions = list(extra_conditions or [])
+    change = int(coin.amount) - fee
+    if change > 0:
+        conditions.append([CREATE_COIN, coin.puzzle_hash, change, [coin.puzzle_hash]])
+    if fee > 0:
+        conditions.append([RESERVE_FEE, fee])
+    return coin, make_spend(coin, puzzle, drv.p2_delegated_solution(conditions))
+
+
+def build_collect_all(payload: dict[str, Any]) -> dict[str, Any]:
+    """Collect several pools in ONE bundle (owner, 2026-10-24: "a collect all button which
+    collects all the fees for all the pools in 1 transaction we sign"): each pool's collect
+    spend, and one payer coin paying the whole network fee. Each collect is permissionless and
+    pays only its own pool's recipients, so nothing here can move a fee anywhere else; the
+    wallet signs the payer's spend alone. Pools owing nothing are refused, not skipped: the
+    router sends only pools that owe."""
+    snapshots = payload.get("pools") or []
+    if not isinstance(snapshots, list) or not snapshots:
+        raise Refused("BAD_REQUEST", "collect-all names at least one pool")
+    height = int(payload.get("height") or 0)
+    if height <= 0:
+        raise Refused("BAD_REQUEST", "height is the chain's last transaction block")
+    fee = int(payload.get("network_fee") or 0)
+    if fee < 0:
+        raise Refused("BAD_REQUEST", "network_fee is a whole number of mojos")
+    payer = payload.get("payer")
+    if fee > 0 and not payer:
+        raise Refused("BAD_REQUEST", "a network fee needs a paying coin")
+    spends, payer_spends, successors, pool_coin_ids, paid = [], [], [], [], []
+    seen: set[bytes] = set()
+    for snapshot in snapshots:
+        pdrv, poff = lane_of(snapshot)
+        pool = poff.snapshot_to_pool(snapshot)
+        if bytes(pool.launcher_id) in seen:
+            raise Refused("BAD_REQUEST", "a pool is named twice")
+        seen.add(bytes(pool.launcher_id))
+        indices = owed_indices(pool)
+        if not indices:
+            raise Refused("NOTHING_OWED", f"pool {pool.launcher_id.hex()[:8]} owes no dev or DAO fee yet")
+        bundle, new_state = pdrv.spend_action(pool, "forge_action_collect", [height, indices])
+        spends.extend(bundle.coin_spends)
+        after = pool.advance(pdrv.state_to_list(new_state))
+        successors.append(poff.pool_to_snapshot(after))
+        pool_coin_ids.append(pool.coin.name().hex())
+        paid.append({
+            "launcher_id": pool.launcher_id.hex(),
+            "fees_owed": [str(int(x)) for x in pool.state[2]], "dao_owed": [str(int(x)) for x in pool.state[6]],
+            "protocol_puzzle_hash": pool.protocol_ph.hex(), "dao_puzzle_hash": pool.dao_ph.hex(),
+        })
+    if payer:
+        _, spend = payer_spend(payer, fee)
+        payer_spends.append(spend)
+    unsigned = SpendBundle([*spends, *payer_spends], G2Element())
+    try:
+        conds, _ = drv.validate(unsigned)
+    except drv.Rejected as exc:
+        raise Refused("INVALID", f"the collect-all bundle fails consensus validation: {exc}") from exc
+    out: dict[str, Any] = {
+        "success": True, "kind": "collect-all", "cost": int(conds.cost), "network_fee": str(fee),
+        "payer_spends": [cs.to_json_dict() for cs in payer_spends],
+        "pool_coin_ids": pool_coin_ids, "successors": successors,
+        "successor_coin_ids": [lane_of(s)[1].snapshot_to_pool(s).coin.name().hex() for s in successors], "paid": paid,
+    }
+    signature = str(payload.get("aggregated_signature") or "").strip().lower().removeprefix("0x")
+    if signature:
+        bundle = SpendBundle(unsigned.coin_spends, G2Element.from_bytes(bytes.fromhex(signature)))
+        out["bundle"] = bundle.to_json_dict()
+        out["transaction_id"] = bundle.name().hex()
+    elif not payer_spends:
+        out["bundle"] = unsigned.to_json_dict()
+        out["transaction_id"] = unsigned.name().hex()
+    return out
+
+
 def build(payload: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("kind") or "") == "collect-all":
+        return build_collect_all(payload)
     snapshot = payload.get("pool") or {}
-    if int(snapshot.get("protocol_version") or 0) != PROTOCOL:
-        raise Refused("WRONG_REVISION", f"this builder spends protocol {PROTOCOL} pools only")
-    pool = off.snapshot_to_pool(snapshot)
+    pdrv, poff = lane_of(snapshot)
+    pool = poff.snapshot_to_pool(snapshot)
     if payload.get("recover"):
         return recover_dao_fee(pool, payload)
     kind = str(payload.get("kind") or "")
@@ -112,41 +218,28 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         raise Refused("BAD_REQUEST", "kind is collect or dao-fee")
 
     if payload.get("receiver_only"):
-        return receiver_only(pool, kind, leaf, solution, message, payload)
+        return receiver_only(pool, kind, leaf, solution, message, payload, pdrv, poff)
 
     payer_spends = []
     payer = payload.get("payer")
     if payer:
-        coin_in = payer["coin"]
-        coin = Coin(_b32(coin_in["parent_coin_info"]), _b32(coin_in["puzzle_hash"]), uint64(int(coin_in["amount"])))
-        puzzle = Program.from_bytes(bytes.fromhex(str(payer["puzzle_reveal"]).removeprefix("0x")))
-        if puzzle.get_tree_hash() != coin.puzzle_hash:
-            raise Refused("BAD_REQUEST", "the payer's puzzle reveal is not its coin's puzzle")
-        if int(coin.amount) < fee:
-            raise Refused("PAYER_TOO_SMALL", f"the paying coin holds {int(coin.amount)} mojos; the network fee is {fee}")
-        if message is not None and coin.puzzle_hash != pool.dao_ph:
+        if message is not None and _b32(payer["coin"]["puzzle_hash"]) != pool.dao_ph:
             raise Refused("NOT_DAO", "only a coin at the pool's DAO recipient can lower its DAO fee")
-        conditions = []
-        if message is not None:
-            conditions.append([SEND_MESSAGE, MODE_PUZZLE_TO_COIN, message, pool.coin.name()])
-        change = int(coin.amount) - fee
-        if change > 0:
-            conditions.append([CREATE_COIN, coin.puzzle_hash, change, [coin.puzzle_hash]])
-        if fee > 0:
-            conditions.append([RESERVE_FEE, fee])
-        payer_spends.append(make_spend(coin, puzzle, drv.p2_delegated_solution(conditions)))
+        extra = [[SEND_MESSAGE, MODE_PUZZLE_TO_COIN, message, pool.coin.name()]] if message is not None else []
+        _, spend = payer_spend(payer, fee, extra)
+        payer_spends.append(spend)
     elif message is not None:
         raise Refused("NOT_DAO", "lowering the DAO fee needs a coin at the DAO recipient to authorize it")
     elif fee > 0:
         raise Refused("BAD_REQUEST", "a network fee needs a paying coin")
 
-    pool_bundle, new_state = drv.spend_action(pool, leaf, solution, extra_spends=payer_spends)
+    pool_bundle, new_state = pdrv.spend_action(pool, leaf, solution, extra_spends=payer_spends)
     unsigned = SpendBundle(pool_bundle.coin_spends, G2Element())
     try:
-        conds, _ = drv.validate(unsigned)
-    except drv.Rejected as exc:
+        conds, _ = pdrv.validate(unsigned)
+    except pdrv.Rejected as exc:
         raise Refused("INVALID", f"the {kind} bundle fails consensus validation: {exc}") from exc
-    after = pool.advance(drv.state_to_list(new_state))
+    after = pool.advance(pdrv.state_to_list(new_state))
     out: dict[str, Any] = {
         "success": True,
         "kind": kind,
@@ -154,7 +247,7 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         "network_fee": str(fee),
         "payer_spends": [cs.to_json_dict() for cs in payer_spends],
         "pool_coin_id": pool.coin.name().hex(),
-        "successor": off.pool_to_snapshot(after),
+        "successor": poff.pool_to_snapshot(after),
         "successor_coin_id": after.coin.name().hex(),
         "paid": {
             "fees_owed": [str(int(x)) for x in pool.state[2]],
@@ -199,14 +292,15 @@ def estimate_cost(coin_spends) -> int:
     return total
 
 
-def receiver_only(pool: drv.V16Pool, kind: str, leaf: str, solution: list, message, payload: dict[str, Any]) -> dict[str, Any]:
+def receiver_only(pool, kind: str, leaf: str, solution: list, message, payload: dict[str, Any],
+                  pdrv=drv, poff=off) -> dict[str, Any]:
     if kind != "dao-fee" or message is None:
         raise Refused("BAD_REQUEST", "receiver_only builds a DAO fee change only")
     sender = payload.get("sender_puzzle_hash")
     if sender and _b32(sender) != pool.dao_ph:
         raise Refused("NOT_DAO", "this lock is not the pool's DAO recipient")
-    pool_bundle, new_state = drv.spend_action(pool, leaf, solution)
-    after = pool.advance(drv.state_to_list(new_state))
+    pool_bundle, new_state = pdrv.spend_action(pool, leaf, solution)
+    after = pool.advance(pdrv.state_to_list(new_state))
     return {
         "success": True,
         "kind": kind,
@@ -217,12 +311,12 @@ def receiver_only(pool: drv.V16Pool, kind: str, leaf: str, solution: list, messa
         "current_bps": int(pool.state[5]),
         "cost": estimate_cost(pool_bundle.coin_spends),
         "pool_spends": [cs.to_json_dict() for cs in pool_bundle.coin_spends],
-        "successor": off.pool_to_snapshot(after),
+        "successor": poff.pool_to_snapshot(after),
         "successor_coin_id": after.coin.name().hex(),
     }
 
 
-def recover_dao_fee(pool: drv.V16Pool, payload: dict[str, Any]) -> dict[str, Any]:
+def recover_dao_fee(pool, payload: dict[str, Any]) -> dict[str, Any]:
     """The DAO fee change a lock's signed conditions ask of this pool, if any.
 
     `delegated_puzzles` are the lock's funds coins' delegated puzzles from its proposal

@@ -82,7 +82,8 @@ REJECTED = (drv.Rejected, drv14.Rejected)
 if drv14.LP_MINT_INNER is not None and drv.LP_MINT_INNER is not None:
     assert drv14.LP_MINT_INNER.get_tree_hash() == drv.LP_MINT_INNER.get_tree_hash(), "the LP mint inner moved between V14 and V15"
     assert drv14.LP_MELT_INNER.get_tree_hash() == drv.LP_MELT_INNER.get_tree_hash(), "the LP melt inner moved between V14 and V15"
-from forge_offer import ZERO_32, find_offer_settlements, requested_amounts, requested_solution  # noqa: E402
+from forge_offer import (ZERO_32, duplicate_payee_reason, find_offer_settlements, requested_amounts,  # noqa: E402
+                         requested_solution)
 from forge_v15_offer import (MATH_VERSION, OFFER_PH, OfferRejected, bound_groups, minimum_router_fee,  # noqa: E402
                              router_fee_paid, settle_ph)
 
@@ -706,6 +707,11 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
     for asset, s in offered.items():
         c.offer_producers[_key(asset)] = Producer(s.coin, asset, s.lineage_proof, "offer settlement")
     candidates = sorted(all_cats | {a for a in wanted if a is not None})
+    # Every maker is paid out of the one entry hub: two asking one puzzle hash for one
+    # amount would have it create one coin twice (DUPLICATE_OUTPUT), refused here by name.
+    duplicate = duplicate_payee_reason(list(externals or []))
+    if duplicate:
+        raise OfferRejected(duplicate)
     for maker in externals or []:
         _take_external(c, maker, {_key(a) for a in offered}, {_key(a) for a, v in wanted.items() if int(v) > 0}, candidates)
 

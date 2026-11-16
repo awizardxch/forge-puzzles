@@ -24,7 +24,11 @@ lineage from the launcher id and see every policy the lock ever had, on chain.
 Two conventions make a vault findable from its deposit address: at launch a
 1-mojo **pointer** coin is created at the deposit address with memos
 ``[hint, "forge-vault/1", launcher_id]``; and the launcher's key/value list is
-``(("forge-vault/1" . "<name>|<m>|<label>=<key>;…"))``.
+``(("forge-vault/1" . "<name>|<m>|<label>=<key>;…"))``. A third makes it findable
+from any OWNER's address: a **membership** coin of a few mojos at each owner's
+address, memos ``[owner puzzle hash, "forge-vault-owner/1", launcher_id]``, made at
+launch and by a re-key's sponsor for each newly seated owner (``locks_for_owner``
+reads them and checks each against the lock's current policy).
 
 Commands mirror ``multisig_tool.py``: one JSON object in, one out.
 """
@@ -32,11 +36,14 @@ Commands mirror ``multisig_tool.py``: one JSON object in, one out.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import itertools
 import json
 import math
 import os
+import pathlib
+import time
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -60,6 +67,7 @@ from chia.wallet.puzzles.singleton_top_layer_v1_1 import (
     puzzle_for_singleton,
     solution_for_singleton,
 )
+from chia.wallet.puzzles.p2_delegated_puzzle_or_hidden_puzzle import puzzle_hash_for_synthetic_public_key
 from chia.wallet.util.merkle_tree import MerkleTree, hash_a_pair, hash_an_atom
 from chia.wallet.wallet_spend_bundle import WalletSpendBundle
 from chia_puzzles_py import programs as PUZZLES
@@ -74,6 +82,7 @@ from multisig_tool import (
     MultisigError,
     Node,
     Output,
+    run_timing,
     PlannedSponsor,
     Safe,
     announcement_id,
@@ -89,7 +98,9 @@ from multisig_tool import (
     parse_outputs,
     parse_pubkey,
     pubkey_hex,
+    coins_status,
     record_coin,
+    records_by_names as _records_by_names,
     select_coins,
     spend_to_json,
     sponsor_key_of,
@@ -112,6 +123,15 @@ PLAN_VERSION = 2
 PUZZLE_KIND = "vault"
 VAULT_TAG = b"forge-vault/1"
 SINGLETON_AMOUNT = 1
+# An owner's membership coin: a few mojos at the owner's own address, memos
+# ``[owner puzzle hash, OWNER_TAG, launcher_id]``. A lock is otherwise found only through
+# an address something else names (a pool's DAO recipient, an owner's profile coin), so an
+# owner who never published a profile, of a lock nothing points at, could not be found
+# from the chain (owner, 2026-10-21: "the connected address should detect a lock/multisig
+# its associated with"). With one of these at every owner's address, a wallet's own coins
+# list its locks, and each is checked against the lock's launcher, never trusted.
+OWNER_TAG = b"forge-vault-owner/1"
+MAX_OWNER_HINT_AMOUNT = 16
 MAX_LINEAGE_STEPS = 2000
 MAX_COINS_PER_PROPOSAL = 40
 
@@ -222,6 +242,14 @@ class Policy:
         if self.is_mips:
             return self.custody().custody_hash()
         return self.inner_puzzle().get_tree_hash()
+
+    def mips_memo(self) -> Program | None:
+        """The CHIP-0043 memo for this custody, which ``chia-wallet-sdk`` parses
+        (``parseMipsMemo``) and rebuilds into this inner puzzle hash. None for a
+        legacy lock: its puzzle is not a MIPS composition, so no memo describes it."""
+        if not self.is_mips:
+            return None
+        return mips.custody_memo(self.m, [bytes(key) for key in self.keys])
 
     def encode(self) -> bytes:
         return profile.encode_safe({"name": self.name, "m": self.m, "format": self.fmt, "owners": [{"label": label, "pubkey": pubkey_hex(key)} for label, key in self.owners]})
@@ -368,6 +396,21 @@ def policy_from_launcher(solution: Program) -> Policy:
     raise MultisigError("the launcher carries no readable vault policy")
 
 
+def mips_memo_from_launcher(solution: Program) -> bytes32 | None:
+    """The custody hash a launcher's CHIP-0043 memo describes, if it carries one in
+    the shape Forge writes (see ``mips.parse_custody_memo``). Locks launched before
+    2026-10-24 carry none: their custody is described only by the VAULT_TAG pair."""
+    try:
+        key_values = list(solution.as_iter())[2]
+        for item in key_values.as_iter():
+            found = mips.custody_memo_hash(item)
+            if found is not None:
+                return found
+    except (ValueError, TypeError, IndexError):
+        pass
+    return None
+
+
 def policy_change(current: Policy, updated: Policy | None) -> str | None:
     """What a policy memo in a singleton spend does to the lock, if anything.
 
@@ -445,6 +488,69 @@ class VaultState:
         }
 
 
+def owner_puzzle_hashes(policy: Policy) -> list[bytes32]:
+    """Each owner's standard address, once: MIPS seats one owner per nonce, so a key may sit twice."""
+    out: list[bytes32] = []
+    for _label, key in policy.owners:
+        ph = puzzle_hash_for_synthetic_public_key(key)
+        if ph not in out:
+            out.append(ph)
+    return out
+
+
+def owner_hint_conditions(owner_phs: list[bytes32], launcher_id: bytes32, taken: set) -> list[Any]:
+    """One membership coin per owner address. `taken` holds the (puzzle hash, amount) pairs the
+    same spend already creates -- a profile coin, change -- because two equal outputs in one
+    spend are refused by consensus (DUPLICATE_OUTPUT); an amount already taken moves up a mojo.
+    `taken` is updated, so the caller can check its own later outputs against it."""
+    conditions = []
+    for ph in owner_phs:
+        amount = 1
+        while (ph, amount) in taken:
+            amount += 1
+        if amount > MAX_OWNER_HINT_AMOUNT:
+            raise MultisigError("too many outputs to one owner address to add a membership coin")
+        taken.add((ph, amount))
+        conditions.append([CREATE_COIN, ph, amount, [ph, OWNER_TAG, launcher_id]])
+    return conditions
+
+
+def locks_for_owner(node: Node, owner_ph: bytes32) -> list[dict[str, Any]]:
+    """The locks an address belongs to, from the membership coins at it, each verified against
+    the lock itself: the lock is read from its launcher to its tip, and listed as `current` only
+    if the address is an owner in its policy NOW. A coin anyone could send proves nothing alone;
+    a former owner's coin stays behind after a re-key and reads `current: false`."""
+    body = node.rpc("get_coin_records_by_puzzle_hash", {"puzzle_hash": owner_ph.hex(), "include_spent_coins": True})
+    records = [r for r in body.get("coin_records") or []
+               if isinstance(r, dict) and 0 < int((r.get("coin") or {}).get("amount", 0)) <= MAX_OWNER_HINT_AMOUNT]
+    found: dict[bytes32, dict[str, Any]] = {}
+    for record in records:
+        coin = record_coin(record)
+        height = int(record.get("confirmed_block_index") or 0)
+        if height <= 0:
+            continue
+        try:
+            puzzle, solution = coin_spend_of(node, coin.parent_coin_info, height)
+            memos = profile.memos_creating(puzzle, solution, coin)
+        except Exception:  # noqa: BLE001 -- not a coin this reader understands
+            continue
+        if not memos or len(memos) < 3 or memos[1] != OWNER_TAG or len(memos[2]) != 32:
+            continue
+        launcher_id = bytes32(memos[2])
+        if launcher_id in found:
+            continue
+        try:
+            state = read_vault(node, launcher_id)
+        except MultisigError as exc:
+            found[launcher_id] = {"launcher_id": launcher_id.hex(), "verified": False, "error": str(exc)}
+            continue
+        current = owner_ph in owner_puzzle_hashes(state.policy)
+        found[launcher_id] = {"launcher_id": launcher_id.hex(), "verified": True, "current": current,
+                              "name": state.policy.name, "m": state.policy.m, "owners": len(state.policy.owners),
+                              "deposit_puzzle_hash": deposit_puzzle_hash(launcher_id).hex(), "hint_height": height}
+    return list(found.values())
+
+
 def read_vault(node: Node, launcher_id: bytes32) -> VaultState:
     """Walk the singleton from its launcher to the unspent tip, collecting
     every policy along the way. Everything here is chain data."""
@@ -517,13 +623,15 @@ def find_launcher_from_deposit(node: Node, deposit_ph: bytes32) -> bytes32 | Non
 # ─── Launch ──────────────────────────────────────────────────────────────────
 
 
-def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile_raw: Any = None) -> dict[str, Any]:
+def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile_raw: Any = None,
+                 hint_owners: bool = True) -> dict[str, Any]:
     """The creator's wallet coin launches the singleton and plants the pointer.
 
     One standard-puzzle spend (signed by the creator's Sage) creates the
     launcher; the launcher spend, which needs no signature, creates the eve
     singleton with the policy in its key/value list. The same wallet spend
-    also drops the 1-mojo pointer at the deposit address and, optionally, the
+    also drops the 1-mojo pointer at the deposit address, a membership coin at
+    every owner's address (`hint_owners`, see OWNER_TAG) and, optionally, the
     creator's updated profile record at their own address.
     """
     config = network_config(network)
@@ -544,7 +652,12 @@ def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile
     profile_memos: list[bytes] | None = None
     profile_ph: bytes32 | None = None
     inner = policy.inner_puzzle()
-    comment = Program.to([(VAULT_TAG, policy.encode())])
+    # The launcher's key/value list. Forge's own policy pair names the lock and labels
+    # its owners; before it, for a MIPS lock, the CHIP-0043 memo any SDK wallet reads
+    # (2026-10-24). Readers of either skip the other: ours looks for the VAULT_TAG
+    # pair, the SDK's parser for the "CHIP-0043" list.
+    memo = policy.mips_memo()
+    comment = Program.to(([memo] if memo is not None else []) + [(VAULT_TAG, policy.encode())])
     launch_conditions, launcher_spend = launch_conditions_and_coinsol(max(wallet_coins, key=lambda pair: int(pair[0].amount))[0], inner, comment, uint64(SINGLETON_AMOUNT))
     del launch_conditions, launcher_spend  # recomputed below for the chosen parent
     if isinstance(profile_raw, dict) and profile_raw.get("pubkey"):
@@ -558,10 +671,18 @@ def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile
             entries.append({"name": "", "puzzle_hash": "__self__"})
         profile_memos = entries  # finalised after the parent coin is chosen
 
-    needed = SINGLETON_AMOUNT + 1 + fee + (1 if profile_memos else 0)
+    # The membership coins' amounts depend only on which outputs share an address (the profile
+    # coin sits at the creator's own, usually an owner's), never on the launcher, so they are
+    # sized before the paying coin is chosen and written after.
+    owner_phs = owner_puzzle_hashes(policy) if hint_owners else []
+    base_taken = {(profile_ph, 1)} if profile_memos is not None and profile_ph is not None else set()
+    hint_total = sum(c[2] for c in owner_hint_conditions(owner_phs, bytes32(b"\x00" * 32), set(base_taken)))
+
+    needed = SINGLETON_AMOUNT + 1 + fee + (1 if profile_memos else 0) + hint_total
     candidates = [pair for pair in wallet_coins if int(pair[0].amount) >= needed]
     if not candidates:
-        raise MultisigError(f"no wallet coin covers {needed} mojos (singleton, pointer, fee{', profile' if profile_memos else ''})")
+        raise MultisigError(f"no wallet coin covers {needed} mojos (singleton, pointer, fee"
+                            f"{', profile' if profile_memos else ''}{', owner hints' if hint_total else ''})")
     parent, parent_puzzle = max(candidates, key=lambda pair: int(pair[0].amount))
 
     launch_conditions, launcher_spend = launch_conditions_and_coinsol(parent, inner, comment, uint64(SINGLETON_AMOUNT))
@@ -574,7 +695,12 @@ def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile
     if profile_memos is not None and profile_ph is not None:
         entries = [({**e, "puzzle_hash": deposit_ph.hex()} if isinstance(e, dict) and e.get("puzzle_hash") == "__self__" else e) for e in profile_memos]
         conditions.append([CREATE_COIN, profile_ph, 1, profile.profile_memos(profile_ph, profile.normalize_safes(entries))])
+    taken = set(base_taken)
+    hints = owner_hint_conditions(owner_phs, launcher_id, taken)
+    conditions.extend(hints)
     change = int(parent.amount) - needed
+    if change > 0 and (parent.puzzle_hash, change) in taken:
+        raise MultisigError("the change would equal a membership coin at the same address; choose another coin")
     if change > 0:
         conditions.append([CREATE_COIN, parent.puzzle_hash, change, [parent.puzzle_hash]])
     if fee > 0:
@@ -585,6 +711,8 @@ def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile
     # Prove the launch reads back: the launcher solution carries the policy.
     if policy_from_launcher(Program.from_bytes(bytes(launcher_spend.solution))).inner_puzzle_hash() != inner.get_tree_hash():
         raise MultisigError("launch does not round-trip its policy")
+    if memo is not None and mips_memo_from_launcher(Program.from_bytes(bytes(launcher_spend.solution))) != inner.get_tree_hash():
+        raise MultisigError("launch does not round-trip its CHIP-0043 memo")
 
     return {
         "success": True,
@@ -600,6 +728,7 @@ def build_launch(network: str, policy: Policy, coins_raw: Any, fee: int, profile
         "deposit_puzzle_hash": deposit_ph.hex(),
         "deposit_address": encode_puzzle_hash(deposit_ph, config["hrp"]),
         "coin_spends": [spend_to_json(parent_spend), spend_to_json(launcher_spend)],
+        "owner_hints": [{"address": encode_puzzle_hash(c[1], config["hrp"]), "amount": c[2]} for c in hints],
         "eve": {
             "coin": coin_to_json(Coin(launcher_id, vault_puzzle(launcher_id, policy).get_tree_hash(), uint64(SINGLETON_AMOUNT))),
             "lineage_proof": {"parent_name": launcher_coin.parent_coin_info.hex(), "inner_puzzle_hash": None, "amount": SINGLETON_AMOUNT},
@@ -925,6 +1054,7 @@ def build_vault_plan(
     action_builder: Any = None,
     singleton_spends: list[FundsSpend] | None = None,
     asset_conditions_builder: Any = None,
+    hint_owners: bool = True,
 ) -> VaultPlan:
     nonce = nonce or os.urandom(32)
     launcher_id = state.launcher_id
@@ -1053,6 +1183,11 @@ def build_vault_plan(
     memos: list[Any] = [launcher_id]
     if successor is not None:
         memos = [launcher_id, VAULT_TAG, successor.encode()]
+        # The new custody, described for SDK wallets as well (CHIP-0043). Last, so the
+        # hint stays first and our own reader, which takes atoms only, never sees it.
+        successor_memo = successor.mips_memo()
+        if successor_memo is not None:
+            memos.append(successor_memo)
     singleton_conds: list[Any] = [[CREATE_COIN, next_inner_hash, SINGLETON_AMOUNT, memos]]
     for f in funds:
         # Authorize exactly this funds coin with exactly this delegated puzzle…
@@ -1071,14 +1206,27 @@ def build_vault_plan(
 
     sponsor_nonce = hashlib.sha256(nonce + b"sponsor").digest()
     planned_sponsor: PlannedSponsor | None = None
+    hints: list[Any] = []
     if sponsor is not None:
         sponsor_coin, sponsor_puzzle = sponsor
         sponsor_key = sponsor_key_of(sponsor_puzzle, sponsor_coin)
-        if int(sponsor_coin.amount) < fee:
-            raise MultisigError(f"sponsor coin holds {int(sponsor_coin.amount)} mojos; the fee is {fee}")
+        # A re-key that seats new owners gives each a membership coin (OWNER_TAG), paid by the
+        # sponsor: the lock's own spend recreates only the singleton. Owners already seated have
+        # theirs from the launch or an earlier re-key. With no sponsor there is nothing to pay
+        # them from, and they can be found through the lock's other handles meanwhile.
+        if successor is not None and hint_owners:
+            seated = set(owner_puzzle_hashes(policy))
+            taken: set = set()
+            hints = owner_hint_conditions([ph for ph in owner_puzzle_hashes(successor) if ph not in seated], launcher_id, taken)
+        hint_total = sum(c[2] for c in hints)
+        if int(sponsor_coin.amount) < fee + hint_total:
+            raise MultisigError(f"sponsor coin holds {int(sponsor_coin.amount)} mojos; the fee is {fee}"
+                                + (f" and the new owners' membership coins {hint_total}" if hint_total else ""))
         singleton_conds.append([ASSERT_COIN_ANNOUNCEMENT, announcement_id(sponsor_coin.name(), sponsor_nonce)])
-        sconds: list[Any] = []
-        sponsor_change = int(sponsor_coin.amount) - fee
+        sconds: list[Any] = list(hints)
+        sponsor_change = int(sponsor_coin.amount) - fee - hint_total
+        if sponsor_change > 0 and (sponsor_coin.puzzle_hash, sponsor_change) in {(c[1], c[2]) for c in hints}:
+            raise MultisigError("the sponsor's change would equal a membership coin at the same address; choose another coin")
         if sponsor_change > 0:
             sconds.append([CREATE_COIN, sponsor_coin.puzzle_hash, sponsor_change, [sponsor_coin.puzzle_hash]])
         if fee > 0:
@@ -1102,6 +1250,7 @@ def build_vault_plan(
         "fee": fee,
         "fee_paid_by": "sponsor" if sponsor else "lock",
         "sponsor": {"coin_id": planned_sponsor.coin.name().hex(), "pubkey": pubkey_hex(planned_sponsor.pubkey), "amount": int(planned_sponsor.coin.amount), "outputs": []} if planned_sponsor else None,
+        "owner_hints": [{"address": encode_puzzle_hash(c[1], hrp), "amount": c[2]} for c in hints],
         "change": change_summary,
         "coin_count": 1 + len(funds) + (1 if planned_sponsor else 0),
         "nonce": nonce.hex(),
@@ -1191,7 +1340,8 @@ def cmd_launch(payload: dict[str, Any], _factory: Callable[[str], Node]) -> dict
     if isinstance(raw_policy, dict) and not raw_policy.get("format"):
         raw_policy = {**raw_policy, "format": FORMAT_MIPS}
     policy = Policy.from_json(raw_policy)
-    build = lambda fee: build_launch(network, policy, payload.get("coins"), fee, payload.get("profile"))  # noqa: E731
+    hint_owners = payload.get("hint_owners") is not False
+    build = lambda fee: build_launch(network, policy, payload.get("coins"), fee, payload.get("profile"), hint_owners)  # noqa: E731
     rate = parse_fee_rate(payload)
     if rate is None:
         return build(parse_amount(payload.get("fee", 0), "fee"))
@@ -1214,6 +1364,116 @@ def cmd_read(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[st
         launcher_id = found
     state = read_vault(node, launcher_id)
     return {"success": True, "found": True, "network": network, "puzzle": PUZZLE_KIND, **state.to_json(network)}
+
+
+# Reveal reads that cannot be batched run this many at a time. Every one used to
+# wait for the last: a lock with 12 hinted singletons cost 26 serial node calls,
+# 36 s to over 90 s on the router (owner, 2026-10-24: "why does it take soo long
+# for the holdings of a single multisig wallet to show up?").
+SCAN_WORKERS = 8
+
+
+class _Prefetched:
+    """A node that answers from reads already made: coin records from one batch,
+    and spends fetched side by side.
+
+    Only the raw JSON is fetched on other threads. chia's ``Program`` is bound
+    to the thread that made it and panics when another one touches it, so every
+    reveal is still parsed here, by ``Node.puzzle_and_solution`` itself, on the
+    calling thread. Anything not prefetched goes to the node, so a record the
+    batch missed is still found rather than reported as absent.
+    """
+
+    def __init__(self, node: Node, records: dict[bytes32, dict[str, Any]]) -> None:
+        self._node = node
+        self._records = records
+        self._spends: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def prefetch_spends(self, wanted: list[tuple[bytes32, int]]) -> None:
+        """Fetch these spends' JSON concurrently, SCAN_WORKERS at a time."""
+        keys = list(dict.fromkeys((bytes32(coin_id).hex(), int(height)) for coin_id, height in wanted))
+
+        def fetch(key: tuple[str, int]) -> dict[str, Any] | None:
+            try:
+                return self._node.rpc("get_puzzle_and_solution", {"coin_id": key[0], "height": key[1]})
+            except MultisigError:
+                return None                                    # asked again, and reported, when used
+
+        if not keys:
+            return
+        with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(keys))) as pool:
+            for key, body in zip(keys, pool.map(fetch, keys)):
+                if isinstance(body, dict):
+                    self._spends[key] = body
+
+    def rpc(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if route == "get_puzzle_and_solution":
+            hit = self._spends.get((strip0x(str(payload.get("coin_id"))), int(payload.get("height") or 0)))
+            if hit is not None:
+                return hit
+        return self._node.rpc(route, payload)
+
+    def coin_record(self, coin_id: bytes32) -> dict[str, Any] | None:
+        hit = self._records.get(bytes32(coin_id))
+        return hit if hit is not None else self._node.coin_record(coin_id)
+
+    def puzzle_and_solution(self, coin_id: bytes32, height: int) -> tuple[Program, Program]:
+        return Node.puzzle_and_solution(self, coin_id, height)   # type: ignore[arg-type]
+
+    def puzzle_reveal(self, coin_id: bytes32, height: int) -> Program:
+        return self.puzzle_and_solution(coin_id, height)[0]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._node, name)
+
+
+# A hinted coin's kind never changes: it is read from the spend that created the
+# coin, and that spend is fixed forever. So each answer is kept on disk and only
+# new coins are looked up (owner, 2026-10-24: "add the singleton cache too", after
+# the batched scan still took 9-15 s on the router's node).
+MAX_CACHED_SINGLETONS = 50_000
+SINGLETON_CACHE_FILE = "lock-singleton-kinds.json"
+
+
+def _singleton_cache_path() -> pathlib.Path:
+    state = os.environ.get("AWIZARD_STATE_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    base = pathlib.Path(state) if state else pathlib.Path(__file__).resolve().parent.parent / ".awizard"
+    return base / SINGLETON_CACHE_FILE
+
+
+def _load_singleton_cache(path: pathlib.Path | None) -> dict[str, dict[str, Any]]:
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def _save_singleton_cache(path: pathlib.Path | None, cache: dict[str, dict[str, Any]]) -> None:
+    if path is None:
+        return
+    try:
+        if len(cache) > MAX_CACHED_SINGLETONS:                # keep the newest; it is only a cache
+            cache = dict(list(cache.items())[-MAX_CACHED_SINGLETONS:])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(cache), encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        pass                                                   # a cache that cannot be written only costs the next scan time
+
+
+def _cacheable_kind(kind: dict[str, Any] | None) -> bool:
+    """Only answers the chain can never change: not a read that failed this time."""
+    if not kind:
+        return False
+    if kind.get("kind") == "nft":
+        return True
+    if kind.get("kind") == "did":
+        return bool(kind.get("name"))                         # a missing name may be a failed read
+    return kind.get("kind") == "unknown" and kind.get("reason") == "not an NFT or DID singleton"
 
 
 def _singleton_kind(node: Node, record: dict[str, Any]) -> dict[str, Any] | None:
@@ -1354,20 +1614,31 @@ def _launched_dids(node: Node, lock_launcher_id: bytes32, deposit_ph: bytes32) -
     spent = [r for r in records if r.get("spent")]
     spent.sort(key=lambda r: int(r.get("spent_block_index") or 0), reverse=True)
 
+    # Every candidate launcher, and then every eve coin a spent launcher could
+    # have made, is read in one batch each rather than one call per coin.
+    launcher_ids = [
+        Coin(record_coin(record).name(), SINGLETON_LAUNCHER_HASH, uint64(SINGLETON_AMOUNT)).name()
+        for record in spent[:MAX_LAUNCH_SCAN_COINS]
+    ]
+    launchers = _records_by_names(node, launcher_ids)
+    live = [launcher_id for launcher_id in launcher_ids if launchers.get(launcher_id, {}).get("spent")]
+    eves = _records_by_names(node, [
+        did_eve_coin(lock_launcher_id, launcher_id, owner_as_hash=owner_as_hash).name()
+        for launcher_id in live for owner_as_hash in (False, True)
+    ])
+
     out: list[dict[str, Any]] = []
-    for record in spent[:MAX_LAUNCH_SCAN_COINS]:
-        payer = record_coin(record)
-        launcher_id = Coin(payer.name(), SINGLETON_LAUNCHER_HASH, uint64(SINGLETON_AMOUNT)).name()
-        launcher = node.coin_record(launcher_id)
-        if not launcher or not launcher.get("spent"):
-            continue
+    for launcher_id in live:
+        launcher = launchers[launcher_id]
         # Two shapes are checked: the correct one, whose owner is the deposit
         # PUZZLE, and the inert one Forge shipped once, whose owner was curried
         # as the deposit puzzle's HASH. The second cannot be spent at all, and
         # saying so is far better than leaving it out and letting it look lost.
         for owner_as_hash in (False, True):
             eve = did_eve_coin(lock_launcher_id, launcher_id, owner_as_hash=owner_as_hash)
-            eve_record = node.coin_record(eve.name())
+            # The batch is authoritative here: an eve coin it did not return
+            # does not exist, which is the usual case.
+            eve_record = eves.get(eve.name())
             if not eve_record or eve_record.get("spent"):
                 # Spent means the DID moved on and hinted itself; the hint scan has it.
                 continue
@@ -1480,7 +1751,8 @@ def _launcher_name(node: Node, launcher_id: bytes32, height: int) -> str | None:
     return None
 
 
-def scan_singletons(node: Node, lock_launcher_id: bytes32, deposit_ph: bytes32) -> list[dict[str, Any]]:
+def scan_singletons(node: Node, lock_launcher_id: bytes32, deposit_ph: bytes32,
+                    cache_path: pathlib.Path | None = None) -> list[dict[str, Any]]:
     """Every singleton this lock owns, classified.
 
     Two sources, because one is not enough. Hints find singletons that were
@@ -1492,8 +1764,7 @@ def scan_singletons(node: Node, lock_launcher_id: bytes32, deposit_ph: bytes32) 
     considered: a singleton always carries an odd amount, and the launcher's
     own even coin is not one.
     """
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    candidates: list[dict[str, Any]] = []
     for record in node.coin_records_by_hint(deposit_ph):
         if record.get("spent"):
             continue
@@ -1506,13 +1777,38 @@ def scan_singletons(node: Node, lock_launcher_id: bytes32, deposit_ph: bytes32) 
             # singleton, and listing it as one put a permanent "unknown" row in
             # the assets list.
             continue
+        candidates.append(record)
+
+    # Coins classified before are answered from the cache; only new ones are read.
+    cache = _load_singleton_cache(cache_path)
+    coin_ids = [record_coin(r).name().hex() for r in candidates]
+    fresh = [r for r, coin_id in zip(candidates, coin_ids) if coin_id not in cache]
+
+    # Every parent in one batch, then the parents' spends (one call each, no
+    # batch form) side by side; the classifying itself reads from those.
+    parents = _records_by_names(node, [bytes32(record_coin(r).parent_coin_info) for r in fresh]) if fresh else {}
+    prefetched = _Prefetched(node, parents)
+    prefetched.prefetch_spends([
+        (parent_id, int(parent["spent_block_index"]))
+        for parent_id, parent in parents.items() if parent.get("spent_block_index")
+    ])
+    learned = {record_coin(r).name().hex(): _singleton_kind(prefetched, r) for r in fresh}
+    added = {coin_id: kind for coin_id, kind in learned.items() if kind and _cacheable_kind(kind)}
+    if added:
+        _save_singleton_cache(cache_path, {**cache, **added})
+    kinds = [dict(cache[coin_id]) if coin_id in cache else learned[coin_id] for coin_id in coin_ids]
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record, kind in zip(candidates, kinds):
+        coin = record_coin(record)
         entry = {
             **coin_to_json(coin),
             "coin_id": coin.name().hex(),
             "confirmed_block_index": int(record.get("confirmed_block_index") or 0),
             "hinted": True,
         }
-        entry.update(_singleton_kind(node, record) or {})
+        entry.update(kind or {})
         seen.add(entry["coin_id"])
         out.append(entry)
 
@@ -1525,6 +1821,7 @@ def scan_singletons(node: Node, lock_launcher_id: bytes32, deposit_ph: bytes32) 
 
 
 def cmd_balance(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[str, Any]:
+    started = time.monotonic()
     network = str(payload.get("network") or "testnet11")
     node = node_for(payload, network, factory)
     launcher_id = hex32(payload.get("launcher_id"), "launcher_id")
@@ -1549,7 +1846,7 @@ def cmd_balance(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
             cats[outer[coin.puzzle_hash]].append(entry)
     # NFTs and DIDs are singletons owned by this address, not coins AT it, so they
     # are found by hint. Skipped unless asked for: it costs a parent lookup each.
-    singletons = scan_singletons(node, launcher_id, deposit_ph) if payload.get("include_singletons") else []
+    singletons = scan_singletons(node, launcher_id, deposit_ph, _singleton_cache_path()) if payload.get("include_singletons") else []
     # A DID hinted here but owned by another puzzle is not this lock's to use: the
     # owners cannot spend it and cannot mint under it. It belongs with the other
     # singletons, not in the DID list, where its presence read as capability the
@@ -1557,6 +1854,7 @@ def cmd_balance(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
     owned_did = lambda x: x.get("kind") == "did" and x.get("owner_puzzle_hash") == deposit_ph.hex()
     return {
         "success": True,
+        "timing": run_timing(started),
         "network": network,
         "puzzle_hash": deposit_ph.hex(),
         "address": encode_puzzle_hash(deposit_ph, network_config(network)["hrp"]),
@@ -1660,8 +1958,15 @@ def cmd_propose(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
 
     sponsor_raw = payload.get("sponsor")
     has_sponsor = isinstance(sponsor_raw, dict) and isinstance(sponsor_raw.get("coins"), list)
+    hint_owners = payload.get("hint_owners") is not False
+    # A re-key's sponsor also pays each NEW owner's membership coin, one mojo apiece (their
+    # addresses are distinct, so none moves up); the coin chosen must cover that too.
+    hint_need = (len([ph for ph in owner_puzzle_hashes(successor) if ph not in set(owner_puzzle_hashes(state.policy))])
+                 if successor is not None and hint_owners else 0)
 
     def pick_sponsor(fee: int) -> tuple[Coin, Program] | None:
+        fee_need = fee
+        fee = fee + hint_need
         if has_sponsor:
             candidates: list[tuple[Coin, Program]] = []
             for entry in sponsor_raw["coins"]:
@@ -1674,9 +1979,10 @@ def cmd_propose(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
                 if int(coin.amount) >= fee:
                     candidates.append((coin, Program.from_bytes(bytes.fromhex(reveal))))
             if not candidates:
-                raise MultisigError(f"the proposer's wallet has no XCH coin covering the {fee} mojo fee")
+                raise MultisigError(f"the proposer's wallet has no XCH coin covering the {fee} mojo fee"
+                                    + (" and the new owners' membership coins" if hint_need else ""))
             return max(candidates, key=lambda pair: int(pair[0].amount))
-        if successor is not None and fee > 0 and not outputs:
+        if successor is not None and fee_need > 0 and not outputs:
             # A pure re-key spends no funds coin, so only a sponsor can pay a fee.
             raise MultisigError("a re-key with a fee needs the proposer's wallet to sponsor it")
         return None
@@ -1687,7 +1993,7 @@ def cmd_propose(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict
     def build(fee: int) -> VaultPlan:
         return build_vault_plan(node, network, state, outputs, fee, pick_sponsor(fee), successor,
                                 nonce, action_conditions,
-                                action_value, action_builder, singleton_spends)
+                                action_value, action_builder, singleton_spends, hint_owners=hint_owners)
 
     # `fee_rate` (mojos per cost) sizes the fee from the spend itself: build it,
     # measure what the mempool will charge, and set the fee to that cost times
@@ -2081,18 +2387,168 @@ def cmd_assemble(payload: dict[str, Any], factory: Callable[[str], Node]) -> dic
 
 def cmd_status(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[str, Any]:
     network = str(payload.get("network") or "testnet11")
+    return coins_status(node_for(payload, network, factory), payload)
+
+
+def cmd_owner_locks(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[str, Any]:
+    """The locks an address (or a key's address) belongs to, from its membership coins, each
+    verified against the lock's own policy. `current: false` marks a seat a re-key took away."""
+    network = str(payload.get("network") or "testnet11")
     node = node_for(payload, network, factory)
-    coin_ids = [hex32(c, "coin_id") for c in payload.get("coin_ids") or []]
-    if not coin_ids:
-        raise MultisigError("no coin ids to check")
-    coins = []
-    for coin_id in coin_ids:
-        record = node.coin_record(coin_id)
-        coins.append({"coin_id": coin_id.hex(), "found": record is not None, "spent": bool(record and record.get("spent")), "spent_block_index": int((record or {}).get("spent_block_index") or 0)})
-    return {"success": True, "coins": coins, "all_spent": all(c["spent"] for c in coins), "any_spent": any(c["spent"] for c in coins)}
+    if payload.get("pubkey"):
+        owner_ph = profile.signer_puzzle_hash(str(payload["pubkey"]))
+    else:
+        owner_ph = profile.parse_target(payload, network)
+    locks = locks_for_owner(node, owner_ph)
+    return {"success": True, "network": network, "puzzle_hash": owner_ph.hex(),
+            "address": encode_puzzle_hash(owner_ph, network_config(network)["hrp"]), "locks": locks}
+
+
+# ─── The lock index, checked against the chain ───────────────────────────────
+#
+# The router's lock index (api/_multisigIndex.js) is a cache of the chain, and it has
+# held rows nothing on chain stands behind: a legacy row written for a vault lock's
+# policy (PRs 56-57), launches that never broadcast (PR 75). Each row names a
+# configuration -- a launcher and a policy, or a legacy safe's owners and threshold --
+# and the configuration determines puzzle hashes. So a row is checked by recomputing
+# those hashes and looking for a live coin there, never by trusting the row.
+#
+# Verdicts:
+#   live     the configuration is on chain now: a vault's current singleton has exactly
+#            this custody, or a legacy safe's owners and threshold make its address
+#   stale    the lock is real but its policy has moved on (a re-key the row missed);
+#            the refresh route mirrors the chain, so the row is kept
+#   phantom  the chain contradicts the row: its address is not what its configuration
+#            makes, or its launcher does not exist or is not a singleton launcher
+#   unknown  the node did not answer, or the lineage could not be read; never dropped
+#
+# Only a definite contradiction is `phantom`.
+
+VERDICTS = ("live", "stale", "phantom", "unknown")
+MAX_VERIFIED_ROWS = 200
+
+
+def _launcher_state(node: Node, launcher_id: bytes32) -> dict[str, Any] | None:
+    """The launcher's coin record; None ONLY when the node says it does not exist.
+    Any other failure raises, so an unreachable node is never read as "absent"."""
+    body = node.rpc("get_coin_record_by_name", {"name": launcher_id.hex()})
+    record = body.get("coin_record")
+    if isinstance(record, dict):
+        return record
+    if body.get("success") is False and "not found" in str(body.get("error") or "").lower():
+        return None
+    raise MultisigError(f"get_coin_record_by_name gave no answer for {launcher_id.hex()}")
+
+
+def _is_lock_singleton(node: Node, record: dict[str, Any], launcher_id: bytes32) -> bool:
+    """Whether a coin found at the lock's singleton puzzle hash IS the lock's singleton.
+
+    Anyone can send a coin to any puzzle hash, so presence proves nothing alone. A
+    singleton's coin is created either by its launcher (the eve) or by a spend of the
+    singleton top layer curried with the same launcher, and the top layer refuses any
+    spend whose lineage is not the launcher's, so checking the parent is enough."""
+    coin = record_coin(record)
+    if int(coin.amount) % 2 != 1:
+        return False
+    if coin.parent_coin_info == launcher_id:
+        return True
+    parent = node.coin_record(coin.parent_coin_info)
+    if not parent or not parent.get("spent"):
+        return False
+    puzzle, _solution = coin_spend_of(node, coin.parent_coin_info, int(parent.get("spent_block_index") or 0))
+    try:
+        mod, args = puzzle.uncurry()
+    except Exception:                                          # noqa: BLE001
+        return False
+    if mod.get_tree_hash() != SINGLETON_TOP_LAYER_HASH:
+        return False
+    return _struct_launcher_id(args.first()) == launcher_id.hex()
+
+
+def _row_policy(row: dict[str, Any]) -> Policy:
+    owners = [{"label": str(o.get("label") or ""), "pubkey": str(o.get("pubkey") or "")}
+              for o in row.get("owners") or [] if isinstance(o, dict)]
+    fmt = FORMAT_MIPS if row.get("policyFormat") == FORMAT_MIPS else FORMAT_LEGACY
+    return Policy.from_json({"name": str(row.get("name") or ""), "m": row.get("threshold"), "owners": owners, "format": fmt})
+
+
+def verify_vault_row(node: Node, row: dict[str, Any]) -> dict[str, Any]:
+    launcher_hex = strip0x(str(row.get("launcherId") or "")).lower()
+    if len(launcher_hex) != 64:
+        return {"verdict": "phantom", "reason": "a vault row without a launcher names no lock"}
+    launcher_id = bytes32.fromhex(launcher_hex)
+    if deposit_puzzle_hash(launcher_id).hex() != strip0x(str(row.get("puzzleHash") or "")).lower():
+        return {"verdict": "phantom", "reason": "its address is not the deposit address of its launcher"}
+    try:
+        policy = _row_policy(row)
+    except (MultisigError, ValueError, TypeError) as exc:
+        return {"verdict": "phantom", "reason": f"its policy is not a policy: {exc}"}
+    launcher = _launcher_state(node, launcher_id)
+    if launcher is None:
+        return {"verdict": "phantom", "reason": "its launcher does not exist on chain"}
+    if record_coin(launcher).puzzle_hash != SINGLETON_LAUNCHER_HASH:
+        return {"verdict": "phantom", "reason": "its launcher is not a singleton launcher"}
+    if not launcher.get("spent"):
+        return {"verdict": "unknown", "reason": "the launcher is not spent yet"}
+    singleton_ph = vault_puzzle(launcher_id, policy).get_tree_hash()
+    body = node.rpc("get_coin_records_by_puzzle_hash", {"puzzle_hash": singleton_ph.hex(), "include_spent_coins": False})
+    if body.get("success") is False:
+        raise MultisigError(f"get_coin_records_by_puzzle_hash failed: {body.get('error')}")
+    for record in body.get("coin_records") or []:
+        if isinstance(record, dict) and not record.get("spent") and _is_lock_singleton(node, record, launcher_id):
+            return {"verdict": "live", "singleton_puzzle_hash": singleton_ph.hex(),
+                    "coin_id": record_coin(record).name().hex(), "custody_hash": policy.inner_puzzle_hash().hex()}
+    # No live singleton with the row's policy. Read the lock itself to say why.
+    try:
+        state = read_vault(node, launcher_id)
+    except MultisigError as exc:
+        return {"verdict": "unknown", "reason": f"the lock could not be read: {exc}"}
+    if state.policy.inner_puzzle_hash() == policy.inner_puzzle_hash():
+        # The tip moved between the two reads: what the lineage walk found is live.
+        return {"verdict": "live", "singleton_puzzle_hash": singleton_ph.hex(),
+                "coin_id": state.tip.name().hex(), "custody_hash": policy.inner_puzzle_hash().hex()}
+    return {"verdict": "stale", "reason": "the lock's policy on chain is not the row's",
+            "policy": state.policy.to_json(), "custody_hash": state.policy.inner_puzzle_hash().hex()}
+
+
+def verify_legacy_row(_node: Node, row: dict[str, Any]) -> dict[str, Any]:
+    """A legacy safe IS its owners and threshold: its address is a pure function of
+    them. A row whose configuration does not make its own address names nothing."""
+    try:
+        safe = Safe.from_json({"m": row.get("threshold"),
+                               "pubkeys": [o.get("pubkey") for o in row.get("owners") or [] if isinstance(o, dict)]})
+    except MultisigError as exc:
+        return {"verdict": "phantom", "reason": f"its owners and threshold are not a safe: {exc}"}
+    if safe.puzzle_hash().hex() != strip0x(str(row.get("puzzleHash") or "")).lower():
+        return {"verdict": "phantom", "reason": "its owners and threshold do not make its address"}
+    return {"verdict": "live", "puzzle_hash": safe.puzzle_hash().hex()}
+
+
+def verify_index_rows(node: Node, rows: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows[:MAX_VERIFIED_ROWS]:
+        if not isinstance(row, dict):
+            continue
+        check = verify_vault_row if row.get("puzzle") == "vault" else verify_legacy_row
+        try:
+            result = check(node, row)
+        except MultisigError as exc:
+            result = {"verdict": "unknown", "reason": str(exc)}
+        out.append({"id": str(row.get("id") or ""), **result})
+    return out
+
+
+def cmd_verify_rows(payload: dict[str, Any], factory: Callable[[str], Node]) -> dict[str, Any]:
+    network = str(payload.get("network") or "testnet11")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise MultisigError("rows must be a list of index rows")
+    return {"success": True, "network": network, "rows": verify_index_rows(node_for(payload, network, factory), rows)}
 
 
 COMMANDS: dict[str, Callable[[dict[str, Any], Callable[[str], Node]], dict[str, Any]]] = {
+    "owner-locks": cmd_owner_locks,
+    "verify-rows": cmd_verify_rows,
     "derive": cmd_derive,
     "launch": cmd_launch,
     "read": cmd_read,

@@ -25,7 +25,10 @@ The record is handled as TEXT until Python parses it: it carries integers past 2
 silently rounds -- 114 of them in testnet11's record.
 
 stdin:  {"action": "check" | "upload", "network": "mainnet", "node_url": "...",
-         "record_text": "...", "held_path": "/data/v16-mainnet.json"}
+         "record_text": "...", "held_path": "/data/v16-mainnet.json", "protocol_version"?: 17 | 18 | 19}
+        `protocol_version` picks the registry's revision (V16 = 17, V17 = 18, V18 = 19; served
+        side by side since 2026-11-11 / 2026-11-13). Absent, a held_path named v18-* is V18,
+        v17-* is V17, anything else V16.
         check: verifies record_text, or the held file when record_text is absent.
         upload: verifies record_text, merges it into held_path, writes held_path.
 stdout: {"success": true, "summary": {...}, ...} or {"success": false, "code": ..., "error": ...}
@@ -44,7 +47,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import forge_v16_driver as drv  # noqa: E402
+import importlib  # noqa: E402
+
+import forge_v16_driver as drv  # noqa: E402  -- the default revision (V16 = protocol 17)
 from chia.util.bech32m import encode_puzzle_hash  # noqa: E402
 from forge_stdin import _lane_registry  # noqa: E402
 
@@ -53,6 +58,27 @@ class Refused(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+# protocol -> revision tag: the registry driver and index that record is checked with
+REVISIONS = {17: "v16", 18: "v17", 19: "v18"}
+
+
+def revision_of(payload: dict[str, Any]) -> str:
+    declared = payload.get("protocol_version")
+    if declared is not None:
+        if int(declared) not in REVISIONS:
+            raise Refused("WRONG_REVISION", f"registry records of protocol {sorted(REVISIONS)} only, not {declared}")
+        return REVISIONS[int(declared)]
+    held = Path(str(payload.get("held_path") or "")).name
+    for tag in ("v18", "v17"):
+        if held.startswith(f"{tag}-"):
+            return tag
+    return "v16"
+
+
+def driver_for(revision: str):
+    return importlib.import_module(f"forge_{revision}_driver")
 
 
 def _rpc(node_url: str, route: str, body: dict) -> dict:
@@ -70,7 +96,8 @@ def _hex(value: Any) -> str:
     return str(value or "").strip().lower().removeprefix("0x")
 
 
-def verify(record: dict[str, Any], network: str, node_url: str | None, prefix: str) -> dict[str, Any]:
+def verify(record: dict[str, Any], network: str, node_url: str | None, prefix: str, revision: str = "v16") -> dict[str, Any]:
+    drv = driver_for(revision)
     if record.get("network") != network:
         raise Refused("WRONG_NETWORK", f"the record is for {record.get('network')!r}; this router serves {network!r}")
     registry = record.get("registry")
@@ -149,12 +176,13 @@ def merge(held: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, An
     return merged
 
 
-def upload(record_text: str, held_path: Path, network: str, node_url: str | None, prefix: str) -> dict[str, Any]:
+def upload(record_text: str, held_path: Path, network: str, node_url: str | None, prefix: str,
+           revision: str = "v16") -> dict[str, Any]:
     try:
         incoming = json.loads(record_text)
     except json.JSONDecodeError as exc:
         raise Refused("MALFORMED", f"the record is not JSON: {exc}") from exc
-    summary = verify(incoming, network, node_url, prefix)
+    summary = verify(incoming, network, node_url, prefix, revision)
     held = json.loads(held_path.read_text(encoding="utf-8")) if held_path.is_file() else None
     merged = merge(held, incoming)
     held_path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,13 +196,12 @@ def upload(record_text: str, held_path: Path, network: str, node_url: str | None
     return {"summary": summary, "pools": len(merged["pools"]), "backup": backup}
 
 
-def set_dao(held_path: Path, launcher_id: str, dao_ph: str) -> dict[str, Any]:
+def set_dao(held_path: Path, launcher_id: str, dao_ph: str, revision: str = "v16") -> dict[str, Any]:
     """Repair a record pool committed without its DAO recipient (site creations before
     2026-10-10 left it out, and the index then rebuilt a puzzle that is not the pool's).
     Written only if the pool then rebuilds to ITS OWN puzzle: forge_v16_index rebuilds it
     and proves the state against the coin's puzzle hash, so a wrong recipient cannot enter
     the record. Python holds the record's big integers exactly; JavaScript would not."""
-    import importlib
     if not held_path.is_file():
         raise Refused("NO_REGISTRY", "this router holds no registry record")
     launcher = launcher_id.strip().lower().removeprefix("0x")
@@ -188,10 +215,11 @@ def set_dao(held_path: Path, launcher_id: str, dao_ph: str) -> dict[str, Any]:
     candidate = dict(pool, dao_ph=ph)
     if isinstance(pool.get("state"), list) and len(pool["state"]) > 5:
         candidate["dao_fee_bps"] = int(pool["state"][5])
-    index = importlib.import_module("forge_v16_index")
+    index = importlib.import_module(f"forge_{revision}_index")
+    lane = getattr(index, revision)          # the index's own offer module (index.v16, index.v17)
     try:
         rebuilt = index.pool_from_record(candidate)
-        index.v16.snapshot_to_pool(json.loads(json.dumps(index.v16.pool_to_snapshot(rebuilt))))
+        lane.snapshot_to_pool(json.loads(json.dumps(lane.pool_to_snapshot(rebuilt))))
     except Exception as exc:  # noqa: BLE001 -- any failure to rebuild is a refusal
         raise Refused("INCONSISTENT", f"with that DAO recipient the pool still does not rebuild: {type(exc).__name__}: {exc}")
     if rebuilt.coin.puzzle_hash.hex() != str(pool["coin"]["puzzle_hash"]).lower().removeprefix("0x"):
@@ -212,16 +240,17 @@ def main() -> int:
     node_url = payload.get("node_url") or None
     held_path = Path(payload["held_path"]) if payload.get("held_path") else None
     try:
+        revision = revision_of(payload)
         if payload.get("action") == "set-dao":
             if not held_path:
                 raise Refused("BAD_REQUEST", "set-dao needs held_path")
-            out = set_dao(held_path, str(payload.get("launcher_id") or ""), str(payload.get("dao_ph") or ""))
+            out = set_dao(held_path, str(payload.get("launcher_id") or ""), str(payload.get("dao_ph") or ""), revision)
             print(json.dumps({"success": True, **out}))
             return 0
         if payload.get("action") == "upload":
             if not held_path or not payload.get("record_text"):
                 raise Refused("BAD_REQUEST", "upload needs record_text and held_path")
-            out = upload(str(payload["record_text"]), held_path, network, node_url, prefix)
+            out = upload(str(payload["record_text"]), held_path, network, node_url, prefix, revision)
             print(json.dumps({"success": True, **out}))
             return 0
         if payload.get("record_text"):
@@ -231,7 +260,7 @@ def main() -> int:
         else:
             print(json.dumps({"success": True, "held": False}))
             return 0
-        print(json.dumps({"success": True, "held": True, "summary": verify(record, network, node_url, prefix)}))
+        print(json.dumps({"success": True, "held": True, "summary": verify(record, network, node_url, prefix, revision)}))
     except Refused as exc:
         print(json.dumps({"success": False, "code": exc.code, "error": str(exc)}))
     except Exception as exc:  # noqa: BLE001 -- a node that cannot be reached is a refusal, never a pass

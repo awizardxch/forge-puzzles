@@ -128,6 +128,31 @@ def main() -> int:
     check("  the successor pool snapshot rebuilds", v16.snapshot_to_pool(snap).coin == p.pool.coin)
     check("  plan_json carries the spends to sign and the pool", len(create.plan_json(p)["creator_spends"]) == 2)
 
+    print("a CAT reserve no single coin holds, from several coins in one ring")
+    # (owner, 2026-10-29: "can't you simply use a combine first"): NINJA's 89,443 held across
+    # coins where the pool wants 89,030 in one. Three coins of 25,000 fund a 60,000 reserve.
+    reg_m, slots_m = fresh_registry()
+    cfg_m = create.CreationConfig([None, T_B], [100_000_000, 60_000], [1, 1], 30, 5, bytes32(b"\x55" * 32), 50_000, "TXCH B", "TXCH/B")
+    xch_m = creator_xch(2 + 100_000_000 + 1_000_000 + 49_999 + fee + 777, 0x41)
+    parts = [creator_cat(T_B, 25_000, 0x42 + k) for k in range(3)]
+    ringed = create.CreatorCat(T_B, parts[0].coin, parts[0].inner, parts[0].lineage,
+                               tuple((c.coin, c.inner, c.lineage) for c in parts[1:]))
+    pm = create.plan(reg_m, slots_m, cfg_m, xch_m, {T_B: ringed}, CREATOR_PH, fee)
+    bundle_m = create.finalize(pm, G2Element())
+    conds_m, additions_m = drv.validate(bundle_m)
+    check("  the bundle validates through consensus, every coin of the ring spent", True, f"cost {conds_m.cost:,}")
+    spent = {cs.coin.name() for cs in bundle_m.coin_spends}
+    check("  all three CAT coins are spent", all(c.coin.name() in spent for c in parts))
+    check("  the reserve launcher's parent is the first coin, as with one coin",
+          any(cs.coin.parent_coin_info == parts[0].coin.name() and cs.coin.amount == 60_000 for cs in bundle_m.coin_spends))
+    check("  the change, 75,000 - 60,000, returns to the creator once", paid_to(bundle_m, P2.get_tree_hash(), T_B) == 15_000)
+    short = create.CreatorCat(T_B, parts[0].coin, parts[0].inner, parts[0].lineage, ((parts[1].coin, parts[1].inner, parts[1].lineage),))
+    try:
+        create.plan(reg_m, slots_m, cfg_m, xch_m, {T_B: short}, CREATOR_PH, fee)
+        check("  coins holding less than the reserve together are refused", False, "accepted")
+    except v16.OfferRejected as exc:
+        check("  coins holding less than the reserve together are refused", "50000" in str(exc), str(exc)[:90])
+
     print("the creator's bind")
     # a hostile router rewrites the LP payment to itself: the creator's assertion fails
     hostile = []

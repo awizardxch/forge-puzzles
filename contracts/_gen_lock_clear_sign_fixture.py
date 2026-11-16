@@ -1,0 +1,122 @@
+"""Writes src/lib/__checks__/helpers/lockClearSign.json: lock proposals built by
+vault_tool.build_vault_plan, for the clear-signing check (lockClearSign.check.ts).
+
+The coins are fabricated and the keys come from fixed seeds; nothing here touches a
+chain. The shapes are the builder's own: a 2-of-3 MIPS lock paying XCH and two CATs in
+one vote (the batch the panel stages), with the network fee reserved by the lock, and the
+same lock re-keyed. The check runs from the JSON, so it needs no Python.
+
+    python contracts/_gen_lock_clear_sign_fixture.py
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from chia.types.blockchain_format.coin import Coin
+from chia.wallet.cat_wallet.cat_utils import CAT_MOD, construct_cat_puzzle
+from chia.wallet.lineage_proof import LineageProof as SingletonLineageProof
+from chia_rs import AugSchemeMPL
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint64
+
+import multisig_tool as tool
+import vault_tool as vault
+
+NETWORK = "testnet11"
+LAUNCHER = bytes32([0x7C] * 32)
+CAT_A = bytes32([0xA1] * 32)
+CAT_B = bytes32([0xB2] * 32)
+OWNERS = [AugSchemeMPL.key_gen(bytes([41 + i] * 32)).get_g1() for i in range(3)]
+POLICY = vault.Policy("clear", 2, tuple((label, key) for label, key in zip("abc", OWNERS)), vault.FORMAT_MIPS)
+SUCCESSOR = vault.Policy("clear", 1, tuple((label, key) for label, key in zip("ab", OWNERS)), vault.FORMAT_MIPS)
+
+DEPOSIT = vault.deposit_puzzle(LAUNCHER)
+DEPOSIT_PH = DEPOSIT.get_tree_hash()
+OUTER = {asset: construct_cat_puzzle(CAT_MOD, asset, DEPOSIT).get_tree_hash() for asset in (CAT_A, CAT_B)}
+TIP = Coin(bytes32([0x03] * 32), vault.vault_puzzle(LAUNCHER, POLICY).get_tree_hash(), uint64(1))
+STATE = vault.VaultState(
+    LAUNCHER, POLICY, TIP,
+    SingletonLineageProof(bytes32([0x04] * 32), POLICY.inner_puzzle_hash(), uint64(1)),
+    height=10, spends=1,
+)
+XCH_COINS = [Coin(bytes32([0x13] * 32), DEPOSIT_PH, uint64(2_000_000))]
+CAT_PARENTS = {
+    CAT_A: Coin(bytes32([0x23] * 32), OUTER[CAT_A], uint64(9_000)),
+    CAT_B: Coin(bytes32([0x24] * 32), OUTER[CAT_B], uint64(4_000)),
+}
+CAT_COINS = {asset: Coin(parent.name(), OUTER[asset], parent.amount) for asset, parent in CAT_PARENTS.items()}
+PARENT_BY_ID = {parent.name(): (asset, parent) for asset, parent in CAT_PARENTS.items()}
+ALICE = bytes32([0x5A] * 32)
+BOB = bytes32([0x5B] * 32)
+
+
+def record(coin: Coin, spent: bool = False) -> dict:
+    return {
+        "coin": {"parent_coin_info": "0x" + coin.parent_coin_info.hex(), "puzzle_hash": "0x" + coin.puzzle_hash.hex(), "amount": int(coin.amount)},
+        "spent": spent, "spent_block_index": 5 if spent else 0, "confirmed_block_index": 4,
+    }
+
+
+class FakeNode(tool.Node):
+    def __init__(self) -> None:
+        super().__init__("http://fake")
+
+    def rpc(self, route: str, payload: dict) -> dict:
+        if route == "get_coin_records_by_puzzle_hashes":
+            wanted = {tool.strip0x(ph) for ph in payload["puzzle_hashes"]}
+            records = [record(coin) for coin in XCH_COINS] if DEPOSIT_PH.hex() in wanted else []
+            records += [record(CAT_COINS[asset]) for asset, outer in OUTER.items() if outer.hex() in wanted]
+            return {"success": True, "coin_records": records}
+        if route == "get_coin_record_by_name":
+            found = PARENT_BY_ID.get(bytes32(bytes.fromhex(tool.strip0x(payload["name"]))))
+            return {"success": True, "coin_record": record(found[1], spent=True) if found else None}
+        if route == "get_puzzle_and_solution":
+            found = PARENT_BY_ID[bytes32(bytes.fromhex(tool.strip0x(payload["coin_id"])))]
+            puzzle = construct_cat_puzzle(CAT_MOD, found[0], DEPOSIT)
+            return {"success": True, "coin_solution": {"puzzle_reveal": bytes(puzzle).hex(), "solution": "80"}}
+        raise AssertionError(f"unexpected route {route}")
+
+
+def view(plan: vault.VaultPlan, signer) -> dict:
+    """What /api/multisig-sign hands the browser (vault_tool.cmd_sign_request)."""
+    selection = POLICY.signing_selection(signer)
+    spends = plan.materialize(selection)
+    vault.validate_vault_bundle(plan, spends, None)
+    return {
+        "summary": plan.summary,
+        "coin_ids": [c.hex() for c in plan.all_coin_ids()],
+        "coin_spends": [tool.spend_to_json(s) for s in vault.spends_needing_signature(spends, list(selection))],
+        "bundle": [tool.spend_to_json(s) for s in spends],
+        "message": plan.message.hex(),
+    }
+
+
+node = FakeNode()
+out = lambda to, amount, asset=None: tool.Output(to, amount, asset, "")  # noqa: E731
+batch = vault.build_vault_plan(
+    node, NETWORK, STATE,
+    [out(ALICE, 150_000), out(BOB, 500, CAT_A), out(ALICE, 250, CAT_B)],
+    700, None, None, nonce=bytes([0x0C] * 32),
+)
+rekey = vault.build_vault_plan(node, NETWORK, STATE, [], 0, None, SUCCESSOR, nonce=bytes([0x0D] * 32))
+
+fixture = {
+    "note": "generated by contracts/_gen_lock_clear_sign_fixture.py on fabricated coins and fixed-seed keys; nothing here is on any chain",
+    "network": NETWORK,
+    "launcher_id": LAUNCHER.hex(),
+    "threshold": POLICY.m,
+    "owners": [{"label": label, "pubkey": tool.pubkey_hex(key)} for label, key in POLICY.owners],
+    "custody_hash": POLICY.inner_puzzle_hash().hex(),
+    "deposit_puzzle_hash": DEPOSIT_PH.hex(),
+    "cat_outer": {asset.hex(): ph.hex() for asset, ph in OUTER.items()},
+    "batch": view(batch, OWNERS[0]),
+    "rekey": {**view(rekey, OWNERS[1]), "successor": {"m": SUCCESSOR.m, "owners": [{"label": label, "pubkey": tool.pubkey_hex(key)} for label, key in SUCCESSOR.owners]}},
+}
+target = pathlib.Path(__file__).resolve().parent.parent / "src" / "lib" / "__checks__" / "helpers" / "lockClearSign.json"
+target.write_text(json.dumps(fixture, indent=1) + "\n", encoding="utf-8")
+print(f"wrote {target}")

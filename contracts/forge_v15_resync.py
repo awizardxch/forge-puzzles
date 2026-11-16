@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chia.types.blockchain_format.program import Program  # noqa: E402
 
 import forge_v15_driver as drv  # noqa: E402
+from untrusted_clvm import run_capped  # noqa: E402
 from forge_v15_driver import replace  # noqa: E402
 from forge_v15_offer import pool_to_snapshot, snapshot_to_pool  # noqa: E402
 
@@ -72,26 +73,40 @@ def replay_spend(pool: drv.V15Pool, solution: Program) -> tuple[drv.V15Pool, lis
     # swap and produced a state that never existed, which is how the double-settlement spend
     # on H6 (4,693,721) first read back as a single swap. Each action's leaf is resolved
     # through its selector instead: `selectors_and_proofs` is in REVERSE execution order, and
-    # selectors run 2, 5, 11, ... over `puzzles` in order of first use (forge_v15_driver
-    # .spend_actions).
-    puzzle_list = list(puzzles.as_iter())
-    selector_list = [list(entry.as_iter())[0].as_int() for entry in selectors.as_iter()][::-1]
+    # the driver's selectors run 2, 5, 11, ... over `puzzles` in order of first use
+    # (forge_v15_driver.spend_actions).
+    #
+    # the action layer picks each leaf by RUNNING its selector with
+    # the revealed `puzzles` as the environment. The driver writes selectors as the paths
+    # 2, 5, 11, ... over a flat list, and this function used to decode them by that
+    # convention -- but the puzzle enforces neither. A selector may be any program
+    # (`(q . leaf)` returns the leaf whatever `puzzles` holds) and `puzzles` any tree.
+    # Consensus accepts such a spend, it creates the very successor the honest spend would,
+    # and a reader that could not decode it left the pool's index on a spent coin for good,
+    # for the price of one permissionless `observe`. So do exactly what the puzzle does: run
+    # the selector, then identify the leaf by its module hash, as below. Nothing about a
+    # solution may be assumed here that the puzzle does not enforce.
+    try:
+        selector_list = [entry.first() for entry in selectors.as_iter()][::-1]
+    except Exception as exc:  # noqa: BLE001 -- an entry that is not a pair cannot have run on chain
+        raise ResyncError("an on-chain spend has a selector entry this pool cannot read", "UNKNOWN_LEAF") from exc
 
-    def puzzle_for_selector(selector: int) -> Program:
-        index, value = 0, drv.SINGLE_LEAF_SELECTOR
-        while value != selector:
-            value, index = value * 2 + 1, index + 1
-            if index >= len(puzzle_list):
-                raise ResyncError("an on-chain spend names a leaf selector this pool cannot resolve", "UNKNOWN_LEAF")
-        return puzzle_list[index]
+    def puzzle_for_selector(selector: Program) -> Program:
+        try:
+            return run_capped(selector, puzzles, drv.MAX_COST)
+        except Exception as exc:  # noqa: BLE001 -- a selector the action layer could not have run either
+            raise ResyncError("an on-chain spend names a leaf selector this pool cannot resolve", "UNKNOWN_LEAF") from exc
 
     solution_list = list(solutions.as_iter())
     if len(selector_list) != len(solution_list):
         raise ResyncError("an on-chain spend has a selector count its solutions do not match", "UNKNOWN_LEAF")
     ephemeral, new_state, names = None, pool.state, []
     for leaf_prog, leaf_sol in ((puzzle_for_selector(sel), sol) for sel, sol in zip(selector_list, solution_list)):
-        mod, _ = leaf_prog.uncurry()
-        name = names_by_mod.get(bytes(mod.get_tree_hash()))
+        try:
+            mod, _ = leaf_prog.uncurry()
+            name = names_by_mod.get(bytes(mod.get_tree_hash()))
+        except Exception:  # noqa: BLE001 -- the selector returned something that is not a program
+            name = None
         if name is None:
             raise ResyncError("an on-chain spend ran a leaf this pool does not commit to", "UNKNOWN_LEAF")
         names.append(name)
@@ -136,7 +151,21 @@ def resync(payload: dict[str, Any]) -> dict[str, Any]:
         pool, names = replay_spend(pool, solution)
         steps.append("+".join(names))
     else:
-        raise ResyncError(f"more than {MAX_WALK_DEPTH} spends behind the tip; resync in two passes", "WALK_TOO_DEEP")
+        if not payload.get("allow_partial"):
+            raise ResyncError(f"more than {MAX_WALK_DEPTH} spends behind the tip; resync in two passes", "WALK_TOO_DEEP")
+        # A pass, not the tip (2026-10-30: a pool sent back to genesis sat 64 spends behind and
+        # every resync gave up, so every trade through it was refused). The coin the walk stopped
+        # on is checked as the tip is: a real coin whose puzzle the replayed state hashes to.
+        # The caller persists it and walks again from there.
+        stop_id = pool.coin.name().hex()
+        stop = (_rpc(node_url, "get_coin_record_by_name", {"name": "0x" + stop_id}) or {}).get("coin_record")
+        if not stop:
+            raise ResyncError("a pass stopped on a coin the node does not know", "TIP_STATE_MISMATCH")
+        if _strip(stop["coin"]["puzzle_hash"]).lower() != pool.coin.puzzle_hash.hex():
+            raise ResyncError("a pass stopped on a coin that does not hash to the replayed state", "TIP_STATE_MISMATCH")
+        pool = replace(pool, birth=int(stop.get("confirmed_block_index") or 0))
+        return {"success": True, "changed": True, "partial": True, "tip_coin_id": stop_id, "steps": steps,
+                "birth": pool.birth, "snapshot": pool_to_snapshot(pool)}
 
     tip_id = pool.coin.name().hex()
     live = (_rpc(node_url, "get_coin_record_by_name", {"name": "0x" + tip_id}) or {}).get("coin_record")

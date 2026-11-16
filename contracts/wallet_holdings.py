@@ -91,13 +91,18 @@ def unspent(node: Node, puzzle_hashes: list[bytes32]) -> list[dict[str, Any]]:
     return records
 
 
-def holdings(node: Node, pubkeys: list[str], asset_ids: list[str]) -> dict[str, Any]:
+def holdings(node: Node, pubkeys: list[str], asset_ids: list[str], amounts: bool = False) -> dict[str, Any]:
     inners = inner_hashes(pubkeys)
     if not inners:
         raise MultisigError("no usable public keys were given")
 
     xch_records = unspent(node, inners)
     xch = {"amount": sum(int(record_coin(r).amount) for r in xch_records), "coins": len(xch_records)}
+    # `amounts`: every coin's own amount too -- how many coins an offer would spend
+    # (src/lib/trade/consolidate.ts asks before an offer of many), read from the chain where the
+    # website used to page through the wallet's coins over WalletConnect (2026-10-23).
+    if amounts:
+        xch["amounts"] = sorted((int(record_coin(r).amount) for r in xch_records), reverse=True)
 
     assets: list[bytes32] = []
     for raw in asset_ids[:MAX_ASSETS]:
@@ -116,6 +121,11 @@ def holdings(node: Node, pubkeys: list[str], asset_ids: list[str]) -> dict[str, 
             continue
         cats[asset.hex()]["amount"] += int(coin.amount)
         cats[asset.hex()]["coins"] += 1
+        if amounts:
+            cats[asset.hex()].setdefault("amounts", []).append(int(coin.amount))
+    if amounts:
+        for entry in cats.values():
+            entry["amounts"] = sorted(entry.get("amounts", []), reverse=True)
     return {"addresses": len(inners), "xch": xch, "cats": cats}
 
 
@@ -316,7 +326,7 @@ def main() -> int:
         if not isinstance(pubkeys, list) or not pubkeys:
             raise MultisigError("pubkeys must be a non-empty list")
         asset_ids = payload.get("asset_ids") if isinstance(payload.get("asset_ids"), list) else []
-        out = holdings(node, [str(k) for k in pubkeys], [str(a) for a in asset_ids])
+        out = holdings(node, [str(k) for k in pubkeys], [str(a) for a in asset_ids], amounts=payload.get("amounts") is True)
         if payload.get("discover") is True:
             # {asset_id: {amount, coins}} for every CAT found by hint, asked about or not.
             out["discovered"] = discover_cats(node, inner_hashes([str(k) for k in pubkeys]), _default_cache_path())

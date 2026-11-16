@@ -19,6 +19,12 @@ its test), `FORGE_SECURITY_AUDIT.md` (the findings log and what the internal
 audit probed), `FORGE_V11_FOUNDATIONS.md` (the phase record with chain
 heights).
 
+> **Update 2026-11-14.** This document describes V11.1; the design has moved on since, and the
+> CHIP (CHIP-0062, PR 217) tracks each revision. Mainnet runs V16 (protocol 17). V17
+> (protocol 18) is a testnet revision, and V18 (protocol 19) follows V16 on mainnet directly,
+> adding revocable CATs (CHIP-0038). Section 7 summarizes the path; the CHIP's revisions 14 and
+> 15 are the text of record.
+
 ---
 
 ## 1. Which CHIPs, for which part
@@ -33,6 +39,7 @@ The composition is the contribution, so each part names its standard.
 | **0014** `ASSERT_BEFORE_*` | The prologue pins the spend to a height `h` (`ASSERT_HEIGHT_ABSOLUTE h`) and bounds it (`ASSERT_BEFORE_HEIGHT_ABSOLUTE h + oracle_window`), so an oracle observation is made against a height the chain agrees on. | `forge_action_common.rue::prologue` |
 | Singleton top layer, CAT2, settlement payments (`OFFER_MOD`) | Unchanged standard puzzles: the pool is a singleton, reserves and LP are CATs, and a trade is a signed Offer whose settlement coins the pool consumes and whose notarized payments the pool's payout coin fulfills. | `forge_v11_driver.py`, `forge_v11_offer.py` |
 | **0040** `everything_with_singleton` TAIL | Evaluated, not adopted: Forge's TAIL also binds the supply change to the pool's next state root and requires a melt's parent to be a CAT of the same asset. Recorded as a candidate once the standard TAIL carries an equivalent line. | `forge_lp_cat_tail.rue` |
+| **0038** Revocable CATs | From V18, a pool may hold a revocable CAT. Its hidden puzzle hash `H` is fixed in the pool's configuration at creation; the reserve stays under the revocation layer with that `H`, and every payout keeps it. The LP stays a plain CAT. Two leaves serve the issuer: `rebase` (on a message from a coin at `H`) and anyone's `refund` after a clawback. | `forge_action_rebase.rue`, `forge_action_refund.rue`, the finalizer's adopt rule (V18) |
 | **0051** Reward Distributor | Evaluated, declined for trading fees: it distributes by staking, and Forge's fees accrue to the reserve and are paid by the pool's own `collect` leaf. | — |
 
 The reference puzzles are compiled from source by rue and compared to the pins
@@ -301,3 +308,44 @@ package. Mainnet follows the review, not before.
   the wallet-sdk fixtures (private); the one-line invocation is in
   `FORGE_V11_FOUNDATIONS.md`.
 - Pins: the V11 pin file (private; V14's is `contracts/v14/pins.json`), checked by `_test_v11_integrity.py`.
+
+---
+
+## 7. Since then: V16, V17 and V18
+
+The shape above holds in every later revision: one singleton, one reserve per asset, an LP CAT
+only the pool can move, every authorization a CHIP-0025 message to a derived receiver. What
+changed, revision by revision, is in the CHIP's revision history. The path that matters now:
+
+- **V16 (protocol 17), on mainnet ("v1").** Six leaves; the locked minimum burned to Chia's burn
+  address. Its pools stay listed and trading.
+- **V17 (protocol 18), testnet only.** Canonicalizes the reserve index in fee collection, so a
+  payout always reaches the reserve it names, and makes several configuration and registration
+  properties into rules: an exact, canonical configuration; the protocol fee rate pinned by the
+  registry; a named DAO's consent; a genesis supply floor. It is also where revocable-CAT
+  support was built and tested.
+- **V18 (protocol 19), next on mainnet ("v2").** V17 plus one registration rule: a pool may not
+  hold its own LP token as a reserve. Revocable CATs ship here: the configuration always carries
+  one hidden puzzle hash per asset (zero for a plain one), the reserve and every payout keep the
+  pool's `H`, the LP is a plain CAT, and every pool carries eight leaves, `rebase` and `refund`
+  inert unless it holds a revocable asset. V18 goes to mainnet before the independent audit.
+
+Off chain, two things go with V18. **The `H` check:** the chain cannot know which `H` an asset was
+minted under, so the router, the site and the Sage app walk each revocable asset back to its mint
+(or accept an issuer attestation) and refuse a pool whose `H` cannot be determined: more than one
+`H` on the lineage, no eve coin found, or a mint that does not resolve. **Migration:** a V16 LP
+holder sees "Migrate to v2" on the market's page; one bundle burns their V16 LP through the V16
+pool's own `remove` and deposits what it releases into the equivalent V18 pool, with no router fee.
+
+**For Discord: what is v2?**
+The next pool revision. It adds revocable CATs (CHIP-0038) and a few stricter rules at pool
+creation. v1 pools are not going anywhere: they stay listed and keep trading. If you provide
+liquidity in a v1 pool and want to move, "Migrate to v2" moves your position into the matching v2
+pool in one transaction you sign once.
+
+**For Discord: what does a revocable token mean for a pool?**
+The token's issuer can claw back or re-denominate their own token, and that includes the part of
+it sitting in a pool. The pool is built for it: the issuer's revocation key is fixed when the pool
+is made, every coin of that token keeps it, and the LP token stays an ordinary CAT. The Forge
+checks each revocable token's key against how it was minted before it lists, quotes or routes the
+pool. Supplying liquidity next to a revocable token means trusting its issuer.

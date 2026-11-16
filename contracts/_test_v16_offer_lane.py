@@ -201,7 +201,7 @@ def swap_case(label, pool, i_in, i_out, put_in, bps=0, ask_delta=0, fee_short=0,
     return out
 
 
-def wallet_case(label, pool, i_in, i_out, put_in, bps, ask_delta=0, expect_ok=True, salt=0x51):
+def wallet_case(label, pool, i_in, i_out, put_in, bps, ask_delta=0, expect_ok=True, salt=0x51, ask=None):
     """A WALLET-built offer (owner, 2026-10-10): Sage's createOffer, so it sits in the
     trader's own wallet, as Dexie and TibetSwap take offers. It pays the router nothing
     itself -- no payment beside the entry, no request to the router -- and asks for the
@@ -212,10 +212,20 @@ def wallet_case(label, pool, i_in, i_out, put_in, bps, ask_delta=0, expect_ok=Tr
     snap, _ = snapshot_roundtrip(pool)
     a_in, a_out = pool.asset_ids[i_in], pool.asset_ids[i_out]
     r, w = pool.state[0], pool.weights
-    honest = v16.forge_math.swap_output(r[i_in], r[i_out], put_in, pool.fee_bps, w[i_in], w[i_out])
-    payout = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
-    fee = payout * bps // 10_000
-    ask = payout - fee + ask_delta
+
+    def priced(amount):
+        honest = v16.forge_math.swap_output(r[i_in], r[i_out], amount, pool.fee_bps, w[i_in], w[i_out])
+        out_ = honest - honest * pool.protocol_fee_bps // 10_000 - honest * int(pool.state[5]) // 10_000
+        return out_, out_ * bps // 10_000
+    payout, fee = priced(put_in)
+    if ask == "half":
+        # ask exactly half of (payout - fee), so the improvement equals the ask: the input is
+        # stepped until (payout - fee) is even, or the two outputs would not collide at all
+        while (payout - fee) % 2:
+            put_in += 1
+            payout, fee = priced(put_in)
+        ask = (payout - fee) // 2
+    ask = payout - fee + ask_delta if ask is None else ask
     offer = fabricate_offer({a_in: put_in}, {a_out: ask}, salt=salt)
     payload = {"action": "swap", "offer": offer.to_bech32(), "pool": snap, "current_height": H,
                "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": bps}}
@@ -228,6 +238,21 @@ def wallet_case(label, pool, i_in, i_out, put_in, bps, ask_delta=0, expect_ok=Tr
         return None
     bundle = SpendBundle.from_json_dict(out["bundle"])
     take = payout - ask
+    if take > fee + v16.router_surplus_band(fee):
+        # In the money beyond the band (owner, 2026-10-23): a resting offer the market moved
+        # past. The router takes exactly its fee (a mojo more only where two outputs of one coin
+        # would collide), and the maker gets the improvement on top of what they signed for.
+        router = paid_to(bundle, ROUTER_PH, a_out)
+        check("  the router is paid its fee, no more (a mojo at most, to keep outputs distinct)",
+              fee <= router <= fee + 1 and paid_to(bundle, ROUTER_PH, a_in) == 0, f"{router} (fee {fee})")
+        check("  the maker is paid what they signed for plus the improvement: the whole payout less the router's take",
+              paid_to(bundle, TRADER_PH, a_out) == payout - router, f"{paid_to(bundle, TRADER_PH, a_out)} of {payout}")
+        check("  details name the wallet-built side and the router's take",
+              out["forge"]["router_fee_side"] == "output-surplus" and out["forge"]["router_fee"] == router)
+        names = [c.name() for c in bundle.additions()]
+        check("  every output is a distinct coin (consensus refuses a duplicate)", len(set(names)) == len(names),
+              f"{len(names) - len(set(names))} duplicate(s)")
+        return out
     check("  the trader is paid exactly what they signed for", paid_to(bundle, TRADER_PH, a_out) == ask, f"{paid_to(bundle, TRADER_PH, a_out)}")
     check("  the router is paid the rest of the payout, at least its fee, in the payout's asset",
           paid_to(bundle, ROUTER_PH, a_out) == take and take >= fee and paid_to(bundle, ROUTER_PH, a_in) == 0, f"{take} (fee {fee})")
@@ -237,11 +262,19 @@ def wallet_case(label, pool, i_in, i_out, put_in, bps, ask_delta=0, expect_ok=Tr
     return out
 
 
-def add_case(label, pool, pct, extra_xch=0, ask_delta=0, expect_ok=True):
+def add_case(label, pool, pct, extra_xch=0, ask_delta=0, expect_ok=True, duplicate=False):
     print(f"add on {label}: {pct}% of each reserve")
     snap, _ = snapshot_roundtrip(pool)
     deposits = [max(1, x * pct // 100) for x in pool.state[0]]
     honest = v16.forge_math.invariant_lp_mint(pool.state[0], deposits, pool.state[1], pool.fee_bps, pool.weights, version=10)
+    if duplicate:
+        # ask exactly half the mint, so the improvement equals the ask (the mint must be even:
+        # step the first CAT deposit until it is)
+        ci = next(i for i, a in enumerate(pool.asset_ids) if a is not None)
+        while honest % 2:
+            deposits[ci] += 1
+            honest = v16.forge_math.invariant_lp_mint(pool.state[0], deposits, pool.state[1], pool.fee_bps, pool.weights, version=10)
+        ask_delta = -(honest // 2)
     offered = {}
     for a, d in zip(pool.asset_ids, deposits):
         offered[a] = d + (honest if a is None else 0)
@@ -262,9 +295,26 @@ def add_case(label, pool, pct, extra_xch=0, ask_delta=0, expect_ok=True):
     minted = out["forge"]["lp_minted"]
     check("  mint equals the honest quote", minted == honest, f"{minted}")
     # A deposit is not a trade, so the router has no claim on any part of it.
-    check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, pool.lp_asset_id) == minted,
-          f"{paid_to(bundle, TRADER_PH, pool.lp_asset_id)} of {minted}")
-    check("  the router keeps nothing on a deposit", paid_to(bundle, ROUTER_PH, pool.lp_asset_id) == 0)
+    if ask_delta < 0 and duplicate:
+        # an improvement equal to the ask: a mojo moves to the router to keep the outputs distinct
+        check("  the depositor gets the mint less the one mojo that keeps outputs distinct",
+              paid_to(bundle, TRADER_PH, pool.lp_asset_id) == minted - 1 and paid_to(bundle, ROUTER_PH, pool.lp_asset_id) == 1,
+              f"{paid_to(bundle, TRADER_PH, pool.lp_asset_id)} of {minted}")
+        names = [c.name() for c in bundle.additions()]
+        check("  every output is a distinct coin (consensus refuses a duplicate)", len(set(names)) == len(names))
+    else:
+        check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, pool.lp_asset_id) == minted,
+              f"{paid_to(bundle, TRADER_PH, pool.lp_asset_id)} of {minted}")
+        check("  the router keeps nothing on a deposit", paid_to(bundle, ROUTER_PH, pool.lp_asset_id) == 0)
+    if ask_delta < 0:
+        # In the money (owner, 2026-10-23): the signed ask in its own group, the improvement
+        # in one more, hinted to the depositor; the details name it.
+        lp_outs = settlement_outputs(bundle, pool.lp_asset_id, minted)
+        check("  the signed ask is paid as signed, the improvement beside it",
+              (wrapped(pool.lp_asset_id, TRADER_PH), honest + ask_delta) in lp_outs and len(lp_outs) == (3 if duplicate else 2),
+              f"{sorted(a for _, a in lp_outs)}")
+        check("  details name the improvement", out["forge"]["surplus"] == -ask_delta - (1 if duplicate else 0)
+              and out["forge"]["requested"] == honest + ask_delta, f"{out['forge']['surplus']}")
     check("  no XCH leaves the bundle to anyone: it is all backing", paid_to(bundle, TRADER_PH) == 0 and paid_to(bundle, ROUTER_PH) == 0)
     check("  total_lp grew by the mint", int(out["pool"]["state"]["total_lp"]) == pool.state[1] + minted)
     check("  successor snapshot rebuilds", v16.snapshot_to_pool(out["pool"]).coin.name().hex() == out["forge"]["successor_coin_id"])
@@ -342,7 +392,13 @@ def main() -> int:
     # refused it ("clvm raise"). No router coin is made when the fee is nothing.
     wallet_case("pair, a CAT payout whose fee floors to 0", pair, 0, 1, 1_000_000, bps=42, salt=0x5f)
     wallet_case("pair, asking one mojo more than payout less fee", pair, 0, 1, 50_000_000, bps=42, ask_delta=1, expect_ok=False)
-    wallet_case("pair, the price moved past the band (a stale quote)", pair, 0, 1, 50_000_000, bps=42, ask_delta=-3, expect_ok=False)
+    # In the money (owner, 2026-10-23): these were refused "the price moved; quote again", so a
+    # resting offer the market moved past never filled. The maker now gets the improvement.
+    wallet_case("pair, in the money just past the band: the maker gets the improvement", pair, 0, 1, 50_000_000, bps=42, ask_delta=-3)
+    wallet_case("pair, a resting offer deep in the money (XCH out)", pair, 1, 0, 2_000, bps=100, ask_delta=-5_000_000, salt=0x5d)
+    # An ask of exactly half of (payout - fee): the improvement would equal the ask, two equal
+    # outputs of one coin, which consensus refuses (DUPLICATE_OUTPUT). A mojo moves to the router.
+    wallet_case("pair, an improvement equal to the ask (outputs kept distinct)", pair, 1, 0, 2_000, bps=100, salt=0x5e, ask="half")
     swap_case("pair, an offer that binds no group (a gift)", pair, 0, 1, 50_000_000, bind=False, expect_ok=False)
 
     print("the router's rate, inside the trader's signature (300 bps):")
@@ -360,7 +416,14 @@ def main() -> int:
     add_case("triple", triple, 3)
     add_case("vault", vault, 10)
     add_case("cats, XCH above the backing", cats, 5, extra_xch=1234, expect_ok=False)
-    add_case("pair, one LP less than the mint", pair, 5, ask_delta=-1, expect_ok=False)
+    add_case("pair, one LP more than the mint", pair, 5, ask_delta=1, expect_ok=False)
+    # In the money (owner, 2026-10-23): a deposit resting while a trade moved the pool its way
+    # was refused "quote again" (an add asking 1602442297 LP the pool would mint 1602540141 for).
+    # The depositor now gets the whole mint.
+    add_case("pair, one LP less than the mint: the depositor gets it", pair, 5, ask_delta=-1)
+    add_case("triple, a deposit deep in the money", triple, 3, ask_delta=-5_000)
+    add_case("cats, deep in the money (XCH only backing)", cats, 5, ask_delta=-700)
+    add_case("pair, an improvement equal to the ask (outputs kept distinct)", pair, 5, duplicate=True)
 
     remove_case("pair", pair, 20_000)
     remove_case("cats", cats, 5_000)

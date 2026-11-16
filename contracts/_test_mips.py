@@ -264,6 +264,59 @@ for required, count in ((0, 2), (3, 2), (-1, 2)):
         check(f"{required}-of-{count} is refused", "refused", "refused")
 
 
+# ─── CHIP-0043 memos ─────────────────────────────────────────────────────────
+# The memo a Forge lock writes must be the SDK's own bytes, so that any SDK wallet's
+# `parseMipsMemo` reads it, and its custody must be the one the lock's puzzle holds.
+
+for vector in VECTORS["custodyMemos"]:
+    label = f"{vector['required']}-of-{len(vector['keys'])} memo"
+    keys = [bytes.fromhex(k) for k in vector["keys"]]
+    memo = mips.custody_memo(vector["required"], keys)
+    check(f"{label}: byte for byte the SDK's", hexed(bytes(memo)), vector["memo"])
+    leaves = tuple(mips.member_hash(PLAIN.with_nonce(i), mips.bls_member(k)) for i, k in enumerate(keys))
+    check(f"{label}: describes the custody the puzzle holds",
+          hexed(mips.Custody(vector["required"], leaves).custody_hash()), vector["custodyHash"])
+    sdk_written = Program.from_bytes(bytes.fromhex(vector["memo"]))
+    check(f"{label}: the SDK's memo reads back to the same seats",
+          mips.parse_custody_memo(sdk_written), (vector["required"], [(i, k) for i, k in enumerate(keys)]))
+    check(f"{label}: and rebuilds the SDK's custody hash", hexed(mips.custody_memo_hash(sdk_written)), vector["custodyHash"])
+
+# A memo is a claim until its hash is checked: anything that does not describe its
+# stated members exactly is refused rather than half-read.
+TWO = mips.custody_memo(1, KEYS[:2])
+_ns, _inner = TWO.as_iter()
+_nonce, _restrictions, _kind, _body = _inner.as_iter()
+_required, _seats = _body.as_iter()
+_first, _second = _seats.as_iter()
+_f_nonce, _f_restr, _f_kind, _f_member = _first.as_iter()
+_f_ph, _f_key = _f_member.as_iter()
+
+
+def with_seat_member(member: Program) -> Program:
+    seat = Program.to([_f_nonce, _f_restr, _f_kind, member])
+    return Program.to([_ns, [_nonce, _restrictions, _kind, [_required, [seat, _second]]]])
+
+
+refusals = {
+    "a seat whose stated puzzle hash is another key's": with_seat_member(Program.to([mips.bls_member(KEYS[2]).get_tree_hash(), _f_key])),
+    "a seat whose key is not 48 bytes": with_seat_member(Program.to([_f_ph, b"" * 47])),
+    "another namespace": Program.to([b"CHIP-0042", _inner]),
+    "a threshold above the seats": Program.to([_ns, [_nonce, _restrictions, _kind, [3, _seats]]]),
+    "a threshold of zero": Program.to([_ns, [_nonce, _restrictions, _kind, [0, _seats]]]),
+    "restrictions on the custody (not a shape Forge writes)": Program.to([_ns, [_nonce, [[0, bytes(32), 0]], _kind, _body]]),
+    "a member at the top instead of an M-of-N": Program.to([_ns, [_nonce, _restrictions, 0, _f_member]]),
+    "an empty memo": Program.to(0),
+}
+for name, bad in refusals.items():
+    check(f"memo refused: {name}", mips.parse_custody_memo(bad), None)
+    check(f"memo refused (no hash): {name}", mips.custody_memo_hash(bad), None)
+try:
+    mips.custody_memo(3, KEYS[:2])
+    check("a memo cannot be written for a threshold above its seats", "written", "refused")
+except mips.MipsError:
+    check("a memo cannot be written for a threshold above its seats", "refused", "refused")
+
+
 print(f"mips: {PASSED} checks passed" + (f", {len(FAILED)} FAILED" if FAILED else ""))
 for failure in FAILED:
     print("  ✗ " + failure)

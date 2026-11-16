@@ -481,3 +481,119 @@ class Custody:
             raise MipsError("restrictions at the custody level need their own solutions")
         inner = self.m_of_n().solution(revealed)
         return Program.to((delegated_puzzle, (delegated_solution, inner)))
+
+
+# ─── CHIP-0043 memos: the custody, described on chain ───────────────────────
+#
+# A puzzle hash says nothing about who can spend it. CHIP-0043 memos are how a
+# vault says it: written beside the coin they describe, they let any wallet
+# rebuild the custody puzzle and check it against the hash. ``chia-wallet-sdk``
+# reads them (``Program.parseMipsMemo``, 0.37.0), and so does the Cloud Wallet.
+#
+# The encoding, from the SDK's ``MipsMemo``:
+#
+#     ("CHIP-0043" (nonce restrictions kind . body))
+#     kind 0, a member:  body = ((member_puzzle_hash member_memo))
+#     kind 1, M-of-N:    body = ((required (inner_puzzle_memo …)))
+#
+# Forge writes one shape: a top-level M-of-N, no restrictions, each seat a
+# plain BLS member (not fast-forward, not taproot) at nonce = its position,
+# with the key revealed. That is the SDK's
+# ``MemberMemo.bls(clvm, key, false, false, true)``.
+
+MEMO_NAMESPACE = b"CHIP-0043"
+MEMO_KIND_MEMBER = 0
+MEMO_KIND_M_OF_N = 1
+# More seats than any Forge lock can hold; a memo naming more is not one we wrote.
+MAX_MEMO_SEATS = 64
+
+
+def bls_seat_memo(nonce: int, public_key: bytes) -> Program:
+    """One seat's ``InnerPuzzleMemo``: a revealed, plain BLS member."""
+    key = bytes(public_key)
+    return Program.to([int(nonce), [], MEMO_KIND_MEMBER, [bls_member(key).get_tree_hash(), key]])
+
+
+def custody_memo(required: int, public_keys: Sequence[bytes]) -> Program:
+    """The CHIP-0043 memo for a Forge lock's custody: what the SDK's ``parseMipsMemo``
+    reads back, and whose ``innerPuzzleHash()`` is :meth:`Custody.custody_hash`."""
+    keys = [bytes(k) for k in public_keys]
+    # Validates the threshold and the seats exactly as the puzzle will.
+    MofN(int(required), tuple(member_hash(MemberConfig(nonce=i), bls_member(k)) for i, k in enumerate(keys)))
+    seats = [bls_seat_memo(i, k) for i, k in enumerate(keys)]
+    return Program.to([MEMO_NAMESPACE, [0, [], MEMO_KIND_M_OF_N, [int(required), seats]]])
+
+
+def _small_int(value: Program) -> int:
+    atom = value.as_atom()
+    if atom is None or len(atom) > 4:
+        raise MipsError("not a small integer")
+    return value.as_int()
+
+
+def _items(value: Program, limit: int) -> list[Program]:
+    out: list[Program] = []
+    while value.pair is not None:
+        out.append(value.first())
+        if len(out) > limit:
+            raise MipsError("list too long")
+        value = value.rest()
+    if value.as_atom() != b"":
+        raise MipsError("not a proper list")
+    return out
+
+
+def parse_custody_memo(memo: Program) -> tuple[int, list[tuple[int, bytes]]] | None:
+    """``(required, [(nonce, bls_key), …])`` from a memo in the shape Forge writes, or None.
+
+    None does not mean the memo is invalid: CHIP-0043 describes far more (secp and
+    passkey seats, nested thresholds, restrictions) and the SDK reads all of it.
+    This reader rebuilds only BLS M-of-N locks, and refuses everything else rather
+    than guess. Each seat's stated puzzle hash must be its key's member puzzle.
+    """
+    try:
+        top = _items(memo, 2)
+        if len(top) != 2 or top[0].as_atom() != MEMO_NAMESPACE:
+            return None
+        inner = _items(top[1], 4)
+        if len(inner) != 4 or _small_int(inner[0]) != 0 or inner[1].as_atom() != b"":
+            return None
+        if _small_int(inner[2]) != MEMO_KIND_M_OF_N:
+            return None
+        body = _items(inner[3], 2)
+        if len(body) != 2:
+            return None
+        required = _small_int(body[0])
+        seats: list[tuple[int, bytes]] = []
+        for seat in _items(body[1], MAX_MEMO_SEATS):
+            parts = _items(seat, 4)
+            if len(parts) != 4 or parts[1].as_atom() != b"" or _small_int(parts[2]) != MEMO_KIND_MEMBER:
+                return None
+            member = _items(parts[3], 2)
+            if len(member) != 2:
+                return None
+            stated, key = member[0].as_atom(), member[1].as_atom()
+            if stated is None or key is None or len(stated) != 32 or len(key) != 48:
+                return None
+            if bls_member(key).get_tree_hash() != stated:
+                return None
+            seats.append((_small_int(parts[0]), bytes(key)))
+        if not seats or not 1 <= required <= len(seats):
+            return None
+        return required, seats
+    except (MipsError, ValueError, TypeError):
+        return None
+
+
+def custody_memo_hash(memo: Program) -> bytes32 | None:
+    """The custody hash a Forge-shaped memo describes, or None if it is not one.
+    A memo is only trusted when this equals the hash on chain."""
+    parsed = parse_custody_memo(memo)
+    if parsed is None:
+        return None
+    required, seats = parsed
+    try:
+        leaves = tuple(member_hash(MemberConfig(nonce=n), bls_member(k)) for n, k in seats)
+        return Custody(required, leaves).custody_hash()
+    except MipsError:
+        return None

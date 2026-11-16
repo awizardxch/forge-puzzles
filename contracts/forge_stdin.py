@@ -44,6 +44,20 @@ from forge_split_swap import SplitBranchSpec, build_split_swap
 from forge_flow_balance import FlowLegSpec, build_flow_balance
 from forge_routed_deposit import DepositSale, build_routed_deposit
 from forge_transition import build_transition
+import forge_v18_offer as off18
+import forge_v18_route as rt18
+import forge_v18_create as cre18
+import forge_v18_driver as drv18
+# The V17 lane is OPTIONAL, for the reason the V13 lane below is: the public repository ships
+# V18 and not the frozen V17, and a dispatcher that imported V17 unconditionally would fail to
+# import there at all. A missing V17 lane is a pool this build cannot serve (`_lane` reports it).
+try:
+    import forge_v17_offer as off17
+    import forge_v17_route as rt17
+    import forge_v17_create as cre17
+    import forge_v17_driver as drv17
+except ImportError:
+    off17 = rt17 = cre17 = drv17 = None
 import forge_v16_offer as off16
 import forge_v16_route as rt16
 import forge_v16_create as cre16
@@ -59,12 +73,22 @@ import forge_v14_driver as drv14
 
 # One lane per protocol revision: (offer, route, create, driver). A request picks its lane by
 # its own protocol_version or its pool snapshots'; a bundle never mixes revisions, except a
-# route (below). V16 (protocol 17) is the live lane and the one a creation takes. V15 (16)
-# and V14 (15) are NOT retired: the owner kept each live beside its successor (2026-10-09,
+# route (below). V18 (protocol 19) is V17 plus one `register` rule (a pool may not list its own LP) (owner, 2026-11-13: V17
+# frozen, mainnet ships V18 after the audit gate); V17 (18) and V16 (17) stay live beside it. V15
+# (16) and V14 (15) are NOT retired: the owner kept each live beside its successor (2026-10-09,
 # 2026-10-07), their pools stay on chain undrained and their lanes ship everywhere, so they
 # are imported unconditionally. V13 (14) is kept only while its record is read back;
 # V11.1 (12) and V12 (13) were drained and retired.
-_LANES = {17: (off16, rt16, cre16, drv16), 16: (off15, rt15, cre15, drv15), 15: (off14, rt14, cre14, drv14)}
+#
+# Carrying a lane is NOT the same as creating on it: a request that names no revision and has
+# no snapshot to read one from (a creation) takes the NETWORK's creation revision,
+# forge_network.create_protocol() -- never max(_LANES). Adding 19 here used to make V18 the
+# default creation lane everywhere, mainnet included.
+_LANES = {19: (off18, rt18, cre18, drv18), 17: (off16, rt16, cre16, drv16),
+          16: (off15, rt15, cre15, drv15), 15: (off14, rt14, cre14, drv14)}
+if drv17 is not None:
+    _LANES[18] = (off17, rt17, cre17, drv17)
+    _LANES = dict(sorted(_LANES.items(), reverse=True))   # the same key order as before
 # The retired lane is OPTIONAL. It is only needed while V13's record is still read back,
 # and it is absent wherever the retired sources are not shipped -- the public repository
 # prunes every retired revision, so importing it unconditionally made this dispatcher fail
@@ -83,7 +107,12 @@ else:
 
 # The route actions a composer builds across revisions (forge_v16_route._drv; a route that
 # never touches a V16 pool is built by forge_v15_route, which spends V14 and V15 pools).
-_CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-in", "zap-lp"})
+_CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-in", "zap-lp",
+                                     "migrate-v16-to-v17", "migrate-v16-to-v18", "migrate-v17-to-v18"})
+
+# The migrations, each built by the lane of the revision it mints: action -> (source protocol,
+# target protocol). forge_vNN_route.migrate_vAA_to_vNN does the work.
+_MIGRATIONS = {"migrate-v16-to-v17": (17, 18), "migrate-v16-to-v18": (17, 19), "migrate-v17-to-v18": (18, 19)}
 
 
 def _lane_version(payload: dict) -> int:
@@ -98,11 +127,16 @@ def _lane_version(payload: dict) -> int:
         if payload.get("action") in _CROSS_REVISION_ACTIONS and versions <= set(_LANES):
             return max(versions)
         raise ValueError(f"a bundle cannot mix Forge revisions: {sorted(versions)}")
-    # Nothing declared and no snapshot to read it from (a creation): the newest lane
-    # this build carries. This said 13 long after V14 shipped, so a creation through
-    # api/forge-create was built by the retired V13 lane where its sources exist and
-    # refused outright where they are pruned (forge-ui) -- found 2026-10-01.
-    return versions.pop() if versions else max(_LANES)
+    # Nothing declared and no snapshot to read it from (a creation): the NETWORK's creation
+    # revision (forge_network.create_protocol: testnet 19 / V18; mainnet 19 / V18 once
+    # v18-mainnet.json is held, 17 / V16 until then). It was `max(_LANES)`, which said 13 long
+    # after V14 shipped (2026-10-01) and would have made V18 mainnet's default the day its lane
+    # landed. api/forge-create.js always declares the protocol it resolved (createProtocol), the
+    # same table.
+    if versions:
+        return versions.pop()
+    import forge_network
+    return forge_network.create_protocol()
 
 
 def _lane(payload: dict):
@@ -364,7 +398,7 @@ def _dev_fee(payload: dict[str, Any]) -> tuple[bytes32 | None, int]:
 def _pool_snapshots(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Every pool snapshot a request carries, whichever lane it names."""
     found: list[dict[str, Any]] = []
-    for key in ("pool", "swapPool", "vault", "viaPool", "sourcePool"):
+    for key in ("pool", "swapPool", "vault", "viaPool", "sourcePool", "preSalePool", "throughPool"):
         if isinstance(payload.get(key), dict):
             found.append(payload[key])
     for entry in payload.get("pools") or []:
@@ -427,7 +461,8 @@ def _settle_takes_fee(lane) -> bool:
     return "fee_bps" in inspect.signature(lane.settle).parameters
 
 
-ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out", "zap-in", "zap-lp")
+ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out", "zap-in", "zap-lp",
+               "migrate-v16-to-v17", "migrate-v16-to-v18", "migrate-v17-to-v18")
 
 
 def _snapshot_of(pool) -> dict[str, Any]:
@@ -442,7 +477,8 @@ def _lane_pool(snapshot: dict[str, Any]):
     """The snapshot says which lane rebuilds the pool; a route may mix the live revisions."""
     lane = _LANES.get(int(snapshot.get("protocol_version") or 0))
     if lane is None or not lane[0].is_pool_snapshot(snapshot):
-        raise ValueError("a route can only be built from pools of a revision this build carries (14, 15, 16)")
+        raise ValueError("a route can only be built from pools of a revision this build carries "
+                         f"(protocols {', '.join(str(v) for v in sorted(_LANES))})")
     return lane[0].snapshot_to_pool(snapshot)
 
 
@@ -459,6 +495,14 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
     the trader signed; there is no overage and no one to send it to (F3, 2026-10-07).
     """
     off, rt, cre, drv = _lane(payload)
+    # V17 (rCAT): the route composer threads each pool's H (forge_v17_route.route_hiddens), so a
+    # route may cross pools holding a revocable CAT. A composer that does not (an older lane
+    # handed an rCAT snapshot) is still refused here rather than asked to build plain coins.
+    if not hasattr(rt, "route_hiddens"):
+        for snapshot in _pool_snapshots(payload):
+            if any(set(str(h).lower().removeprefix("0x")) - {"0"} for h in snapshot.get("hidden_puzzle_hashes") or []):
+                raise ValueError("a pool holding a revocable CAT (rCAT) trades through swap, add and remove only; "
+                                 f"the {action} route cannot spend it yet")
     fee_ph = surplus_ph if fee_bps > 0 else None
     # `preview`: size the route from the offer's coins and report what it releases and the
     # fee it needs, without settling -- the exact figures an offer must carry.
@@ -498,9 +542,16 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
         start_raw = str(payload.get("startAsset") or "").strip()
         start = _bytes32(start_raw) if start_raw and start_raw.lower() not in ("txch", "xch", "0" * 64) else ZERO_32
         surplus = surplus_ph if surplus_ph is not None else specs[0][0].protocol_ph
-        result = rt.flow_balance(specs, offer, height, surplus, start, fee_bps, fee_ph, preview=preview)
+        # Dexie open offers the balance crosses beside its pools (taken whole, one bundle).
+        externals = [offer_from_bech32(o) for o in payload.get("dexieOffers") or []]
+        if externals and "externals" not in rt.flow_balance.__code__.co_varnames:
+            raise ValueError("this pool revision cannot balance through Dexie offers")
+        result = rt.flow_balance(specs, offer, height, surplus, start, fee_bps, fee_ph, preview=preview,
+                                 **({"externals": externals} if externals else {}))
         extra = {"leg_amounts": [[str(a), str(b)] for a, b in result.details["leg_amounts"]],
-                 "total_out": str(result.details["total_out"])}
+                 "total_out": str(result.details["total_out"]),
+                 **({"taken_offers": [{k: str(v) for k, v in t.items()} for t in result.details["taken_offers"]]}
+                    if result.details.get("taken_offers") else {})}
     elif action == "routed-deposit":
         target = _lane_pool(payload["pool"])
         sales = [([_lane_pool(entry) for entry in sale["pools"]], [_bytes32(str(a)) for a in sale["path"]], int(sale["amountIn"]))
@@ -530,9 +581,15 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
             raise ValueError("this pool revision has no zap-in lane")
         target = _lane_pool(payload["pool"])
         via = _lane_pool(payload["viaPool"]) if isinstance(payload.get("viaPool"), dict) else None
+        # "preSalePool": an XCH pool the offered CAT is sold on first (a CAT neither the target
+        # nor the inner pool holds); the XCH it raises then zaps in.
+        pre_sale = _lane_pool(payload["preSalePool"]) if isinstance(payload.get("preSalePool"), dict) else None
+        if pre_sale is not None and "pre_sale" not in rt.zap_in.__code__.co_varnames:
+            raise ValueError("this pool revision cannot sell a CAT before it zaps in")
         result = rt.zap_in(target, [_lane_pool(entry) for entry in payload.get("pools") or []], offer, height,
                            surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview,
-                           **mode, **({"via": via} if via is not None else {}))
+                           **mode, **({"via": via} if via is not None else {}),
+                           **({"pre_sale": pre_sale} if pre_sale is not None else {}))
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
         extra = {"target": _snapshot_of(target_after),
                  "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
@@ -563,14 +620,51 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
                  "sale_outputs": [str(a) for a in result.details["sale_outputs"]],
                  "buys": [str(a) for a in result.details["buys"]],
                  "buy_outputs": [str(a) for a in result.details["buy_outputs"]]}
+    elif action in _MIGRATIONS:
+        # An older revision's LP into its mirror on a newer one (owner 2026-11-12 for V16 -> V17;
+        # V16 -> V18 and V17 -> V18 since the V18 cut): "sourcePool" is the old pool, "pool" the
+        # mirror -- or, without "pool", the mirror is found among "pools" (target-revision
+        # snapshots). No mirror is a refusal that says so. The lane is the TARGET revision's.
+        src_proto, dst_proto = _MIGRATIONS[action]
+        src_tag, dst_tag = f"v{src_proto - 1}", f"v{dst_proto - 1}"
+        fn = getattr(rt, f"migrate_{src_tag}_to_{dst_tag}", None)
+        if fn is None or int(cre.drv.PROTOCOL_VERSION) != dst_proto:
+            raise ValueError(f"a migration into {dst_tag.upper()} is built by the {dst_tag.upper()} lane "
+                             f"(protocol {dst_proto}); name the {dst_tag.upper()} mirror")
+        source = _lane_pool(payload["sourcePool"])          # the composer refuses a source of another revision
+        if isinstance(payload.get("pool"), dict):
+            target = _lane_pool(payload["pool"])
+        else:
+            candidates = [_lane_pool(entry) for entry in payload.get("pools") or []
+                          if int(entry.get("protocol_version") or 0) == dst_proto]
+            target = cre.find_mirror(source, candidates)
+            if target is None:
+                raise ValueError(f"no {dst_tag.upper()} pool mirrors this {src_tag.upper()} pool; create it first "
+                                 f"(forge_{dst_tag}_create.mirror_config_from_{src_tag}), then migrate")
+        result = fn(source, target, offer, height, surplus_ph if surplus_ph is not None else target.protocol_ph, preview=preview)
+        target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
+        extra = {"target": _snapshot_of(target_after),
+                 "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
+                 "minted": str(result.details["minted"]), "backing": str(result.details["backing"]),
+                 "burned": str(result.details["burned"]), "removed": [str(a) for a in result.details["removed"]],
+                 "returned": {asset: str(amount) for asset, amount in result.details["returned"].items()}}
     elif action == "zap-out":
         if not hasattr(rt, "zap_out"):
             raise ValueError("this pool revision has no zap-out lane")
         pool = _lane_pool(payload["pool"])
+        # "throughPool": a pool whose LP "pool" holds; the zap out ends in that LP and burns it
+        # there too, into "assetOut" (a nested zap out, owner 2026-11-07).
+        through = _lane_pool(payload["throughPool"]) if isinstance(payload.get("throughPool"), dict) else None
+        if through is not None and "through" not in rt.zap_out.__code__.co_varnames:
+            raise ValueError("this pool revision has no nested zap out")
         result = rt.zap_out(pool, _bytes32(str(payload["assetOut"])), offer, height,
-                            surplus_ph if surplus_ph is not None else pool.protocol_ph, fee_bps, fee_ph, preview=preview, **mode)
+                            surplus_ph if surplus_ph is not None else pool.protocol_ph, fee_bps, fee_ph, preview=preview, **mode,
+                            **({"through": through} if through is not None else {}))
         extra = {"burned": str(result.details["burned"]), "removed": str(result.details["removed"]),
-                 "swapped": [[str(a), str(b)] for a, b in result.details["swapped"]]}
+                 "swapped": [[str(a), str(b)] for a, b in result.details["swapped"]],
+                 **({"inner_burned": str(result.details["inner_burned"]),
+                     "inner_swapped": [[str(a), str(b)] for a, b in result.details["inner_swapped"]]}
+                    if "inner_burned" in result.details else {})}
     else:
         raise ValueError(f"unknown route lane {action!r}")
     if preview:
@@ -600,17 +694,32 @@ def _probe_asset(raw: Any) -> bytes32 | None:
     return None if text in ("", "txch", "xch", "0" * 64) else _bytes32(text)
 
 
-def _probe_offer(probe: dict[str, Any]) -> Offer:
+def _snapshot_hiddens(payload: dict[str, Any]) -> dict:
+    """V17 (rCAT): {asset: H} for every non-zero hidden puzzle hash the request's pool snapshots
+    name (their configs' H, never a coin's)."""
+    out: dict = {}
+    for snapshot in _pool_snapshots(payload):
+        for raw_a, raw_h in zip(snapshot.get("asset_ids") or [], snapshot.get("hidden_puzzle_hashes") or []):
+            text = str(raw_h or "").lower().removeprefix("0x")
+            if set(text) - {"0"}:
+                asset = _probe_asset(raw_a)
+                if asset is not None:
+                    out[asset] = _bytes32(text)
+    return out
+
+
+def _probe_offer(probe: dict[str, Any], hiddens: dict | None = None) -> Offer:
     """A stand-in offer for a preview: keyless `(1)` coins with fabricated parents creating
     the settlements of `offered` (asset -> amount) and asking one unit of each `requested`
     asset. It is never validated or pushed; the composer only reads the settlement amounts
-    and the requested assets to size the route."""
+    and the requested assets to size the route. An offered rCAT (`hiddens`: asset -> H from
+    the pools' configs) settles under the revocation layer, where the trader's real coin would."""
     from chia.types.blockchain_format.program import Program
     from chia.types.coin_spend import make_spend
     from chia.wallet.cat_wallet.cat_utils import SpendableCAT, unsigned_spend_bundle_for_spendable_cats
     from chia.wallet.conditions import CreateCoin
     from chia.wallet.puzzle_drivers import PuzzleInfo
-    from chia.wallet.trading.offer import OFFER_MOD_HASH
+    from chia.wallet.trading.offer import OFFER_MOD, OFFER_MOD_HASH
     from chia_rs import SpendBundle
 
     identity = Program.to(1)
@@ -622,7 +731,11 @@ def _probe_offer(probe: dict[str, Any]) -> Offer:
         if amount <= 0:
             raise ValueError("a probe offers positive amounts only")
         grand = bytes32(bytes([0x50 + i]) * 32)
-        conditions = Program.to([[51, OFFER_MOD_HASH, amount]])
+        settle_inner_ph = OFFER_MOD_HASH
+        if asset is not None and (hiddens or {}).get(asset) is not None:
+            _layer_drv = drv17 if drv17 is not None else drv18   # the layer is byte-identical in both builds
+            settle_inner_ph = _layer_drv.layered(hiddens[asset], OFFER_MOD).get_tree_hash()
+        conditions = Program.to([[51, settle_inner_ph, amount]])
         if asset is None:
             coin = Coin(grand, identity_hash, uint64(amount))
             spends.append(make_spend(coin, identity, conditions))
@@ -660,6 +773,12 @@ def _lane_registry(record: dict[str, Any], drv):
     extra = {}
     if record.get("protocol_ph"):
         extra["protocol_ph"] = _bytes32(record["protocol_ph"])
+    # V17 (pinned dev fee): the registry pins the dev fee rate as a constant; a record launched with a rate
+    # other than the driver's default rebuilds only with it.
+    if record.get("protocol_fee_bps") is not None:
+        import inspect
+        if "protocol_fee_bps" in inspect.signature(drv.make_registry).parameters:
+            extra["protocol_fee_bps"] = int(record["protocol_fee_bps"])
     reg = drv.make_registry(creation_fee=int(record["creation_fee"]), treasury_ph=_bytes32(record["treasury_ph"]),
                             launcher_parent=_bytes32(record["launcher_parent"]), state=list(record["state"]), **extra)
     coin = _coin(record["coin"])
@@ -669,6 +788,10 @@ def _lane_registry(record: dict[str, Any], drv):
     return _replace(reg, coin=coin, lineage=lineage)
 
 
+# Coins of one CAT a creation spends at most, in one ring (the first creates the reserve).
+MAX_CREATOR_CAT_COINS = 10
+
+
 def _creator_coins(payload: dict[str, Any], cre):
     """The creator's coins with their own puzzle reveals: {xch: {coin, puzzle_reveal}, cats: [{asset_id, coin, inner_puzzle, lineage_proof}]}.
 
@@ -676,16 +799,91 @@ def _creator_coins(payload: dict[str, Any], cre):
     exist, so every prepare-create through this dispatcher raised NameError (found
     2026-10-01, the first time a creation ran through api/forge-create end to end)."""
     from chia.types.blockchain_format.program import Program as _P
+    from chia.wallet.cat_wallet.cat_utils import match_cat_puzzle
     from chia.wallet.lineage_proof import LineageProof
+    from chia.wallet.uncurried_puzzle import uncurry_puzzle
     from chia_rs.sized_ints import uint64 as _u64
+
+    def program(raw: Any) -> "_P":
+        return _P.from_bytes(bytes.fromhex(str(raw).removeprefix("0x")))
+
     xch_in = payload["creator"]["xch"]
-    xch = cre.CreatorXch(_coin(xch_in["coin"]), _P.from_bytes(bytes.fromhex(str(xch_in["puzzle_reveal"]).removeprefix("0x"))))
+    xch_coin, xch_puzzle = _coin(xch_in["coin"]), program(xch_in["puzzle_reveal"])
+    # A coin the wallet named comes with its puzzle; one that does not hash to the coin is
+    # refused here, by name, rather than as a failed bundle later.
+    if xch_puzzle.get_tree_hash() != xch_coin.puzzle_hash:
+        raise ValueError("the creator's XCH coin's puzzle does not hash to its puzzle hash")
+    xch = cre.CreatorXch(xch_coin, xch_puzzle)
+    # V17 (rCAT, CHIP-0038): a creator coin of a revocable CAT is CAT(asset, rev(H, p2)). Only
+    # the V17 lane can spend one (through the layer's owner path) and fund a layered reserve.
+    rcat_lane = "hidden" in getattr(cre.CreatorCat, "__dataclass_fields__", {})
+    # The CONFIG names each asset's H; a creator coin that does not name its own takes it (the
+    # router sets it from the config), and one naming another H is refused by the plan.
+    cfg = payload.get("config") or {}
+    config_hidden: dict = {}
+    for raw_a, raw_h in zip(cfg.get("asset_ids") or [], cfg.get("hidden_puzzle_hashes") or []):
+        if str(raw_a).lower() not in ("txch", "xch", "0" * 64, ""):
+            config_hidden[bytes(_bytes32(str(raw_a)))] = _bytes32(str(raw_h))
+    drv = getattr(cre, "drv", None)
+
+    def is_revocation_layer(puzzle: "_P") -> bool:
+        layer = getattr(drv, "REVOCATION_LAYER", None)
+        if layer is None:
+            return False
+        try:
+            mod, _args = puzzle.uncurry()
+        except Exception:  # noqa: BLE001
+            return False
+        return mod.get_tree_hash() == layer.get_tree_hash()
+
+    def cat_coin(asset, c):
+        coin = _coin(c["coin"])
+        lp = c["lineage_proof"]
+        hidden_raw = str(c.get("hidden_puzzle_hash") or "").strip()
+        hidden = _bytes32(hidden_raw) if hidden_raw else config_hidden.get(bytes(asset), ZERO_32)
+        if hidden != ZERO_32:
+            if not rcat_lane:
+                raise ValueError(f"protocol {drv.PROTOCOL_VERSION} pools cannot hold a revocable CAT; create it on V17")
+            # The p2 puzzle UNDER the revocation layer: the layer curries only its hash, so a full
+            # puzzle reveal cannot be unwrapped to it. It must rebuild this coin exactly.
+            if not c.get("inner_puzzle"):
+                raise ValueError(f"the creator's revocable-CAT coin of {asset.hex()[:12]} needs its inner_puzzle "
+                                 f"(the p2 puzzle under the revocation layer)")
+            inner = program(c["inner_puzzle"])
+            full_ph = construct_cat_puzzle(CAT_MOD, asset, drv.layered(hidden, inner)).get_tree_hash()
+            if full_ph != coin.puzzle_hash:
+                raise ValueError(f"the creator's coin of {asset.hex()[:12]} is not CAT(asset, rev(H, inner)) at its puzzle hash")
+        elif c.get("inner_puzzle"):
+            inner = program(c["inner_puzzle"])
+        else:
+            # The wallet's own answer (chip0002_getAssetCoins) carries a CAT's FULL puzzle: the
+            # CAT layer is unwrapped here, and must be this asset's and hash to the coin.
+            full = program(c["puzzle_reveal"])
+            matched = match_cat_puzzle(uncurry_puzzle(full))
+            if matched is None:
+                raise ValueError(f"the creator's coin of {asset.hex()[:12]} is not a CAT")
+            _mod_hash, tail_hash, inner = matched
+            if bytes(tail_hash.as_atom()) != bytes(asset) or full.get_tree_hash() != coin.puzzle_hash:
+                raise ValueError(f"the creator's coin of {asset.hex()[:12]} is not a CAT of that asset at its puzzle hash")
+            if is_revocation_layer(inner):
+                # spent as a plain p2 it fails on chain; say why here instead
+                raise ValueError(f"the creator's coin of {asset.hex()[:12]} is a revocable CAT: name its hidden_puzzle_hash "
+                                 f"and its inner_puzzle (the p2 puzzle under the revocation layer)")
+        return coin, inner, LineageProof(_bytes32(lp["parent_name"]), _bytes32(lp["inner_puzzle_hash"]), _u64(int(lp["amount"]))), hidden
+
     cats = {}
     for c in payload["creator"].get("cats", []):
         asset = _bytes32(str(c["asset_id"]))
-        lp = c["lineage_proof"]
-        cats[asset] = cre.CreatorCat(asset, _coin(c["coin"]), _P.from_bytes(bytes.fromhex(str(c["inner_puzzle"]).removeprefix("0x"))),
-                                      LineageProof(_bytes32(lp["parent_name"]), _bytes32(lp["inner_puzzle_hash"]), _u64(int(lp["amount"]))))
+        coin, inner, lineage, hidden = cat_coin(asset, c)
+        # More coins of the CAT when no single one holds the reserve: one ring (forge_v16_create.CreatorCat.extra).
+        extra_full = [cat_coin(asset, e) for e in (c.get("extra") or [])[:MAX_CREATOR_CAT_COINS - 1]]
+        if any(x[3] != hidden for x in extra_full):
+            raise ValueError(f"the creator's coins of {asset.hex()[:12]} name more than one hidden puzzle hash")
+        extra = tuple(x[:3] for x in extra_full)
+        if len({x[0].name() for x in ((coin, inner, lineage), *extra)}) != 1 + len(extra):
+            raise ValueError(f"the creator's coins of {asset.hex()[:12]} name one coin twice")
+        kw = {"hidden": hidden} if rcat_lane else {}
+        cats[asset] = cre.CreatorCat(asset, coin, inner, lineage, extra, **kw) if (extra or kw) else cre.CreatorCat(asset, coin, inner, lineage)
     return xch, cats
 
 
@@ -696,25 +894,122 @@ def _creation_config(payload: dict[str, Any], cre) -> "cre.CreationConfig":
     weights = [int(w) for w in cfg.get("weights") or [1] * len(assets)]
     total_lp = int(cfg.get("total_lp") or (min(reserves) * int(cfg.get("lp_ratio") or 1)))
     fee_bps = int(cfg.get("fee_bps", 30))
-    # a name or symbol left empty is derived the way every pool's default is
-    import forge_v16_index as _idx      # the LIVE lane: this named V13's while V14 shipped
+    # a name or symbol left empty is derived the way every pool's default is, by the index of
+    # the lane building it (this named V13's while V14 shipped, then V16's while V17 shipped)
+    import importlib
+    _rev = cre.__name__.removeprefix("forge_").removesuffix("_create")        # "v17", "v16", ...
+    _idx = importlib.import_module(f"forge_{_rev}_index")
     canonical = cre.canonical(cre.CreationConfig(assets, reserves, weights, fee_bps, 0, ZERO_32, total_lp))
     hex_ids = [("00" * 32) if a is None else a.hex() for a in canonical.asset_ids]
     state = {"pools": []}
     try:
         import json as _json
         import forge_network as _net
-        _default = _net.record_path("v16")
+        _default = _net.record_path(_rev)
         state = _json.loads(Path(payload.get("record_path") or _default).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- names of nested LP assets fall back to their ids
         pass
     name = str(cfg.get("name") or "") or _idx.emoji_name(hex_ids, canonical.weights, fee_bps, state)
     symbol = str(cfg.get("symbol") or "") or _idx.pool_symbol(hex_ids, canonical.weights, state)
     dao_raw = str(cfg.get("dao_puzzle_hash") or "").strip()
+    extra: dict[str, Any] = {}
+    hiddens_raw = cfg.get("hidden_puzzle_hashes")
+    if hiddens_raw is not None:
+        # V17 (rCAT, CHIP-0038): one hidden puzzle hash per asset, in the order of `asset_ids`,
+        # zero for a plain asset. Only the V17 lane has the field; an older lane refuses an rCAT.
+        hiddens = [_bytes32(str(h)) for h in hiddens_raw]
+        if len(hiddens) != len(assets):
+            raise ValueError("hidden_puzzle_hashes names one hash per asset (zero for a plain asset)")
+        if "hidden_puzzle_hashes" in getattr(cre.CreationConfig, "__dataclass_fields__", {}):
+            extra["hidden_puzzle_hashes"] = hiddens
+        elif any(h != ZERO_32 for h in hiddens):
+            raise ValueError(f"protocol {cre.drv.PROTOCOL_VERSION} pools cannot hold a revocable CAT; create it on V17")
     return cre.CreationConfig(assets, reserves, weights, fee_bps, int(cfg.get("protocol_fee_bps", 5)),
                                _bytes32(str(cfg["protocol_puzzle_hash"])), total_lp, name, symbol,
                                dao_ph=_bytes32(dao_raw) if dao_raw and set(dao_raw.removeprefix("0x")) != {"0"} else ZERO_32,
-                               dao_fee_bps=int(cfg.get("dao_fee_bps") or 0))
+                               dao_fee_bps=int(cfg.get("dao_fee_bps") or 0), **extra)
+
+
+def _v16_pool_named(launcher_hex: str, payload: dict[str, Any]):
+    """The V16 pool a mirror names (`config.from_pool`, a launcher id): from `config.from_pool_snapshot`
+    when the caller sends it (proved against its coin), else from the V16 registry record this router
+    holds (`v16_record_path`, default the network's v16 record). Refused when neither has it."""
+    import json as _json
+    import forge_network as _net
+    import forge_v16_index as idx16
+    snap = (payload.get("config") or {}).get("from_pool_snapshot")
+    if isinstance(snap, dict):
+        pool = off16.snapshot_to_pool(snap)
+    else:
+        path = Path(payload.get("v16_record_path") or _net.record_path("v16"))
+        try:
+            record = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"from_pool names a V16 pool, and this router holds no V16 record to read it from ({path.name})") from exc
+        entry = next((p for p in record.get("pools") or [] if str(p.get("launcher_id", "")).lower() == launcher_hex), None)
+        if entry is None:
+            raise ValueError(f"from_pool {launcher_hex[:12]}... is not a V16 pool this router holds")
+        pool = idx16.pool_from_record(entry)
+    if pool.launcher_id.hex() != launcher_hex:
+        raise ValueError("from_pool_snapshot is not the pool from_pool names")
+    return pool
+
+
+def _mirror_source_named(launcher_hex: str, payload: dict[str, Any]):
+    """The V16 or V17 pool a V18 mirror names (`config.from_pool`): from `config.from_pool_snapshot`
+    when the caller sends it (its own lane proves it against its coin; protocol 17 or 18 only),
+    else from the V16 record this router holds (`v16_record_path`), then the V17 one
+    (`v17_record_path`). Refused when none has it. The V17 lane keeps `_v16_pool_named`."""
+    import json as _json
+    import forge_network as _net
+    snap = (payload.get("config") or {}).get("from_pool_snapshot")
+    if isinstance(snap, dict):
+        proto = int(snap.get("protocol_version") or 0)
+        if proto not in (17, 18):
+            raise ValueError(f"from_pool_snapshot is a protocol-{proto} pool; a V18 mirror mirrors a V16 (17) or V17 (18) pool")
+        pool = _LANES[proto][0].snapshot_to_pool(snap)
+    else:
+        import forge_v16_index as idx16
+        try:
+            import forge_v17_index as idx17
+        except ImportError:   # a tree without V17 reads the V16 record only
+            idx17 = None
+        pool, tried, held = None, [], 0
+        for tag, idx in (("v16", idx16), ("v17", idx17)):
+            if idx is None:
+                continue
+            path = Path(payload.get(f"{tag}_record_path") or _net.record_path(tag))
+            tried.append(path.name)
+            try:
+                record = _json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 -- a router may hold only one of the two records
+                continue
+            held += 1
+            entry = next((p for p in record.get("pools") or [] if str(p.get("launcher_id", "")).lower() == launcher_hex), None)
+            if entry is not None:
+                pool = idx.pool_from_record(entry)
+                break
+        if pool is None and not held:
+            raise ValueError(f"from_pool names a V16 or V17 pool, and this router holds no V16 record and no V17 record "
+                             f"to read it from ({', '.join(tried)})")
+        if pool is None:
+            raise ValueError(f"from_pool {launcher_hex[:12]}... is not a V16 or V17 pool this router holds ({', '.join(tried)})")
+    if pool.launcher_id.hex() != launcher_hex:
+        raise ValueError("from_pool_snapshot is not the pool from_pool names")
+    return pool
+
+
+def _coin_spend_json(cs: dict[str, Any]) -> CoinSpend:
+    """A CoinSpend from JSON, with or without the 0x prefixes Sage leaves off."""
+    def _hex0x(v: Any) -> str:
+        text = str(v)
+        return text if text.startswith("0x") else "0x" + text
+    coin = cs["coin"]
+    return CoinSpend.from_json_dict({
+        "coin": {"parent_coin_info": _hex0x(coin["parent_coin_info"]), "puzzle_hash": _hex0x(coin["puzzle_hash"]),
+                 "amount": int(coin["amount"])},
+        "puzzle_reveal": _hex0x(cs["puzzle_reveal"]), "solution": _hex0x(cs["solution"]),
+    })
 
 
 def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -739,9 +1034,75 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     proof_keys = [bytes.fromhex(str(k).lower().removeprefix("0x")) for k in (payload["creator"].get("gate_proof_keys") or [])]
     if any(len(k) != 48 for k in proof_keys) or len(proof_keys) > 4:
         raise ValueError("gate_proof_keys are 1 to 4 G1 public keys of 48 bytes")
-    plan = cre.plan(registry, payload["registry"]["slots"], _creation_config(payload, cre), xch, cats,
-                     _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0),
-                     **({"gate_proof_keys": tuple(proof_keys)} if proof_keys else {}))
+    knobs: dict[str, Any] = {"gate_proof_keys": tuple(proof_keys)} if proof_keys else {}
+    # V17 (DAO consent): a pool that names a DAO is listed only with that DAO's consent -- the
+    # spend(s) of a coin at the DAO address sending forge_v17_create.dao_consent_condition. They
+    # are the caller's (the DAO's wallet or lock signs them); the lane only carries them.
+    consent = [_coin_spend_json(cs) for cs in payload.get("dao_consent_spends") or []]
+    if consent:
+        import inspect
+        if "dao_consent_spends" not in inspect.signature(cre.plan).parameters:
+            raise ValueError(f"protocol {drv.PROTOCOL_VERSION} creations take no DAO consent spends")
+        knobs["dao_consent_spends"] = tuple(consent)
+    # The same consent built INSIDE the plan (the condition names the launcher id, which only
+    # exists there): `creator.dao_consent` is {coin, puzzle_reveal} of a coin at the DAO address,
+    # or {from_creator_xch: true} when the paying coin is at it.
+    raw_consent = payload["creator"].get("dao_consent")
+    if isinstance(raw_consent, dict) and raw_consent:
+        if not hasattr(cre, "DaoConsentCoin"):
+            raise ValueError(f"protocol {drv.PROTOCOL_VERSION} creations take no DAO consent")
+        if raw_consent.get("from_creator_xch") is True:
+            knobs["dao_consent"] = cre.FROM_CREATOR_XCH
+        else:
+            from chia.types.blockchain_format.program import Program as _P
+            knobs["dao_consent"] = cre.DaoConsentCoin(
+                _coin(raw_consent["coin"]), _P.from_bytes(bytes.fromhex(str(raw_consent["puzzle_reveal"]).removeprefix("0x"))))
+    config = _creation_config(payload, cre)
+    # V17 (rCAT issuer binding): `creator.issuer_attestations` is OPTIONAL (owner decision
+    # 2026-11-12) -- at most one entry per revocable asset; an rCAT without one registers
+    # unattested (the router/site gate checks its H against the mint; result `rcat_assets`
+    # says which are attested), and a plain asset never takes one:
+    #   {asset_id | index, launcher_id, nonce, inner_puzzle_hash, spend?}
+    # `index` counts in `config.asset_ids` as sent (like hidden_puzzle_hashes); `nonce` is hex
+    # (may be empty); `spend` is the issuer singleton's CoinSpend JSON, signed by the ISSUER (its
+    # signature comes as the top-level `issuer_signature` on create). Without `spend` the plan
+    # returns the condition each issuer must send (issuer_attestations in the result, supplied
+    # attestations only); create refuses until every SUPPLIED attestation's spend is in. See forge_v17_create.IssuerAttestation.
+    raw_attest = payload["creator"].get("issuer_attestations") or []
+    if raw_attest:
+        if not hasattr(cre, "IssuerAttestation"):
+            raise ValueError(f"protocol {drv.PROTOCOL_VERSION} creations take no issuer attestations (no rCAT)")
+        if not isinstance(raw_attest, list) or len(raw_attest) > 10:
+            raise ValueError("creator.issuer_attestations is a list of at most one entry per asset")
+        sent_assets = (payload.get("config") or {}).get("asset_ids") or []
+        atts = []
+        for a in raw_attest:
+            if not isinstance(a, dict):
+                raise ValueError("each issuer attestation is {asset_id | index, launcher_id, nonce, inner_puzzle_hash, spend?}")
+            if a.get("asset_id"):
+                asset = _bytes32(str(a["asset_id"]))
+            elif isinstance(a.get("index"), int) and 0 <= a["index"] < len(sent_assets):
+                asset = _bytes32(str(sent_assets[a["index"]]))
+            else:
+                raise ValueError("an issuer attestation names its asset by asset_id or by index into config.asset_ids")
+            try:
+                nonce = bytes.fromhex(str(a.get("nonce") or "").lower().removeprefix("0x"))
+                launcher, inner_ph = _bytes32(str(a["launcher_id"])), _bytes32(str(a["inner_puzzle_hash"]))
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"the issuer attestation for {asset.hex()[:12]} needs launcher_id, nonce (hex) and "
+                                 f"inner_puzzle_hash: {exc}") from exc
+            spend = _coin_spend_json(a["spend"]) if isinstance(a.get("spend"), dict) else None
+            atts.append(cre.IssuerAttestation(asset, launcher, nonce, inner_ph, spend))
+        knobs["issuer_attestations"] = tuple(atts)
+    from_pool =str((payload.get("config") or {}).get("from_pool") or "").strip().lower().removeprefix("0x")
+    if from_pool:
+        # A v2 mirror of a v1 market (owner, 2026-11-12): the config must BE that V16 pool's market.
+        if not hasattr(cre, "check_mirror"):
+            raise ValueError(f"protocol {drv.PROTOCOL_VERSION} has no mirror of a V16 pool; create it on V17")
+        named = _mirror_source_named if int(drv.PROTOCOL_VERSION) >= 19 else _v16_pool_named
+        cre.check_mirror(config, named(from_pool, payload))
+    plan = cre.plan(registry, payload["registry"]["slots"], config, xch, cats,
+                     _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0), **knobs)
     out = {"success": True, "action": action, **cre.plan_json(plan)}
     if action == "prepare-create":
         # The mempool cost of the whole creation, measured on the unsigned bundle (the
@@ -750,8 +1111,14 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
         # creation costs 337M+ (testnet, two assets) -- Standard landed under the node's
         # 5 mojos/cost floor on the first mainnet pair (2026-10-09).
         from chia_rs import SpendBundle as _SB
-        conds, _adds = drv.validate(_SB([*plan.creator_spends, *plan.router_spends], G2Element()))
-        out["cost"] = int(conds.cost)
+        if len(getattr(plan, "issuer_spends", ())) != getattr(plan, "issuer_needed", 0):
+            # V17 (rCAT): `register` receives a supplied attestation's message, so the bundle
+            # cannot run until that issuer's spend is in (an unattested rCAT never gets here). No cost yet; the result names what each issuer sends.
+            out["issuer_attestations_pending"] = True
+        else:
+            conds, _adds = drv.validate(_SB([*plan.creator_spends, *getattr(plan, "issuer_spends", ()), *plan.router_spends],
+                                            G2Element()))
+            out["cost"] = int(conds.cost)
     if action == "create":
         def _hex0x(v: Any) -> str:
             text = str(v)
@@ -767,7 +1134,14 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             })
         signed = [_spend(cs) for cs in payload.get("signed_creator_spends") or []] or None
         signature = G2Element.from_bytes(bytes.fromhex(str(payload["aggregated_signature"]).removeprefix("0x")))
-        bundle = cre.finalize(plan, signature, signed)
+        issuer_sig_raw = str(payload.get("issuer_signature") or "").strip()
+        if issuer_sig_raw:
+            if not hasattr(cre, "IssuerAttestation"):
+                raise ValueError(f"protocol {drv.PROTOCOL_VERSION} creations take no issuer signature (no rCAT)")
+            issuer_sig = G2Element.from_bytes(bytes.fromhex(issuer_sig_raw.removeprefix("0x")))
+            bundle = cre.finalize(plan, signature, signed, issuer_signature=issuer_sig)
+        else:
+            bundle = cre.finalize(plan, signature, signed)
         out.update({"transaction_id": bundle.name().hex(), "bundle": bundle.to_json_dict(),
                     "record_patch": cre.record_patch(plan, payload["registry"])})
     return out
@@ -781,7 +1155,7 @@ def build(payload: dict[str, Any]) -> dict[str, Any]:
         # A preview sized from amounts alone: a probe offer stands in for the trader's, so
         # a page can ask what a route releases -- and what it must therefore ask for
         # exactly -- before the wallet has built anything (F3, 2026-10-07).
-        offer = _probe_offer(payload["probe"])
+        offer = _probe_offer(payload["probe"], _snapshot_hiddens(payload))
     else:
         offer = offer_from_bech32(payload["offer"])
     # The action-layer revisions (14 = V13, 15 = V14) take the versioned lane; _lane() picks which.

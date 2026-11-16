@@ -1,5 +1,5 @@
 {
-  "built_at": "2026-11-14T05:37:13+00:00",
+  "built_at": "2026-11-16T02:45:16+00:00",
   "rue": "0.8.4",
   "outputs": {
     "action.rue.hex": {
@@ -59,13 +59,13 @@
     "forge_action_rebase.rue.hex": {
       "tree_hash": "2479dfab10ef6f2b209f9a133c2a9f98256507ac91ce9d23f0888c19fccfff09",
       "source": "puzzles/forge_action_rebase.rue",
-      "source_sha256": "87ab449f4b71b801304c2ebe3a4e974f4887d1dfbcabe84df2ccc9b730142585",
+      "source_sha256": "76462cb8f2a177458de95589071b1f58de10efb4397805e7b1a39e8d64b91561",
       "test_only": false
     },
     "forge_action_refund.rue.hex": {
       "tree_hash": "a80974593d68104932b72370571ff1ba0a432db096936f4b47c7e958bbb152ea",
       "source": "puzzles/forge_action_refund.rue",
-      "source_sha256": "88bba363b81a45942198c43faf0ec4ce87f6f09baeb2aae4ce09dd7922de02ee",
+      "source_sha256": "cf3b332242eed2fbe81fa69c0a6faabdd6834e60d34ecaae5c196abdb51bd5ae",
       "test_only": false
     },
     "forge_action_remove.rue.hex": {
@@ -77,7 +77,7 @@
     "forge_action_swap.rue.hex": {
       "tree_hash": "31f7e3d18635f2757fda518a0f5b1e542d0e39edd77faa8e543df6a8e11d1181",
       "source": "puzzles/forge_action_swap.rue",
-      "source_sha256": "72c0a7841606318f55b63149a547219c3bee81933327f744770608d2a5997351",
+      "source_sha256": "d18965c4f8d2d7a2307e2f0825ad3691c9dc59ff1f4c911dd40e85d81d0058b0",
       "test_only": false
     },
     "forge_lp_cat_tail.rue.hex": {
@@ -89,7 +89,7 @@
     "forge_multi_reserve_finalizer.rue.hex": {
       "tree_hash": "88bdfedbaf885c7febeb30fcc692c968b635190a4a6a9d98796b5fe886b0d9c9",
       "source": "puzzles/forge_multi_reserve_finalizer.rue",
-      "source_sha256": "bbf5d52c57f37121c5b784dae2a3e3fcfebf42511937902d084d3062eb530650",
+      "source_sha256": "45bbb9df09cef0d6505dfac28b08bbbd08ece322088d1e57cbef98a3b2a54991",
       "test_only": false
     },
     "forge_registry_init.rue.hex": {
@@ -101,7 +101,7 @@
     "forge_registry_register.rue.hex": {
       "tree_hash": "84a712b27bb613f3e52071bb950e39140942d7c9f160a6d36924d9b1c9f59e03",
       "source": "puzzles/forge_registry_register.rue",
-      "source_sha256": "ae8a3c17316e02643182bf2bc3f0f97aae64857c20c2fac4a4794a1ba5d221e5",
+      "source_sha256": "bfe82d886266f97ad99817f0925b7cd8819fd623ba56f9aaa28f321918b1a980",
       "test_only": false
     },
     "forge_registry_set_fee.rue.hex": {
@@ -150,67 +150,67 @@
       "tree_hash": "e074d84843d8b3a0035cf8adffc08ef4ba8877e4ed850c40e425f631563f40d0",
       "source": "puzzles/forge_curve.rue",
       "export": "exact_swap_output",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.exact_invariant_lp_mint.rue.hex": {
       "tree_hash": "6f2dfd3cfc5f635f293eea5ad0faab1fdea9b40428f407eccdea078c6515899a",
       "source": "puzzles/forge_curve.rue",
       "export": "exact_invariant_lp_mint",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.exact_withdrawal.rue.hex": {
       "tree_hash": "5c9645a1e40771749dfd231f74921079f7fc059a3634c28bda30459af01b5b42",
       "source": "puzzles/forge_curve.rue",
       "export": "exact_withdrawal",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.effective_product.rue.hex": {
       "tree_hash": "7f3b83596b0ada52ce4ec336a8d1eb32f61b0dc4bdd856f2a97a2d3042280c4b",
       "source": "puzzles/forge_curve.rue",
       "export": "effective_product",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.valid_protocol_fees.rue.hex": {
       "tree_hash": "aefea5c1c71609635f6e23ed3fd97eb347ddf5c793a6333cf52e81dccd2c673f",
       "source": "puzzles/forge_curve.rue",
       "export": "valid_protocol_fees",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.protocol_fee_owed.rue.hex": {
       "tree_hash": "b3ff2471c380601c3fb8f155ad4f02eafe1ff1dc293e0c122e93188d388f7810",
       "source": "puzzles/forge_curve.rue",
       "export": "protocol_fee_owed",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.pow_int.rue.hex": {
       "tree_hash": "747f1795b83885f5f08bcf428ef1895d5789a24418053a1eaa4440eea3593b72",
       "source": "puzzles/forge_curve.rue",
       "export": "pow_int",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.sum_weights.rue.hex": {
       "tree_hash": "57097e9b67142dbfa4131a6e623dab5e3929a722d4b58afc97e0d4e25d4385eb",
       "source": "puzzles/forge_curve.rue",
       "export": "sum_weights",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.product_of.rue.hex": {
       "tree_hash": "1663a5c2fb77e6035d3a79908ff400340033a384b28e19bad1ccb0fc674ff242",
       "source": "puzzles/forge_curve.rue",
       "export": "product_of",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.min_deposit_ratio.rue.hex": {
       "tree_hash": "76da502cac646755a36cadc40968a82f338195165af897b5c72c87ce9485df25",
       "source": "puzzles/forge_curve.rue",
       "export": "min_deposit_ratio",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "forge_curve.vault_fee_bps.rue.hex": {
       "tree_hash": "608c2c9830c422effc3f658459aed90508d9991269b7521bbaa4e3075d018c69",
       "source": "puzzles/forge_curve.rue",
       "export": "vault_fee_bps",
-      "source_sha256": "728ab30254a2ae758aef11270ea5b268468dda90de1aa8ac0f5055105f7aa9f0"
+      "source_sha256": "0a5530a439b2ab1c121de77163c376eae2ed186c07f7575c5201b52161aee201"
     },
     "v10_probe.exact_swap_output.rue.hex": {
       "tree_hash": "e074d84843d8b3a0035cf8adffc08ef4ba8877e4ed850c40e425f631563f40d0",

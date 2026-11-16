@@ -39,6 +39,7 @@ import hashlib
 import itertools
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -189,6 +190,15 @@ def spend_to_json(spend: CoinSpend) -> dict[str, Any]:
 _REPORTED_INVALID_FAILOVERS: set[str] = set()
 
 
+def hedge_after_s() -> float:
+    """How long a node read waits before it is asked a second time; 0 turns hedging off."""
+    try:
+        ms = float(os.environ.get("FORGE_NODE_HEDGE_MS", "1500"))
+    except ValueError:
+        ms = 1500.0
+    return max(0.0, ms) / 1000
+
+
 def failover_node_urls(raw: str | None = None) -> list[str]:
     """The operator's failover nodes for the lock tools: MULTISIG_NODE_FAILOVER_URLS.
 
@@ -253,6 +263,27 @@ def _push_accepted(body: Any) -> bool:
     return (body.get("success") is True and status == "SUCCESS") or "ALREADY_INCLUDING_TRANSACTION" in str(body.get("error") or "")
 
 
+
+# Node calls made by this run, for the Server-Timing a route reports (owner,
+# 2026-10-24: "add the timing header too"). Summed across threads, so with
+# requests in flight side by side node_ms can exceed the wall time.
+_NODE_STATS_LOCK = threading.Lock()
+NODE_STATS: dict[str, float] = {"calls": 0, "ms": 0.0}
+# One entry per call, newest kept: its route, time, how many attempts it took (retries
+# and failover nodes included) and which host gave the last answer. Whether a slow
+# read is one slow node or a node refusing and being asked again (owner, 2026-10-24:
+# "add the per-call breakdown too").
+MAX_NODE_LOG = 40
+NODE_LOG: list[dict[str, Any]] = []
+_CALL = threading.local()
+
+
+def run_timing(started: float) -> dict[str, Any]:
+    """This command's wall time and its node calls, in milliseconds."""
+    with _NODE_STATS_LOCK:
+        calls, node_ms, log = int(NODE_STATS["calls"]), NODE_STATS["ms"], list(NODE_LOG)
+    return {"command_ms": round((time.monotonic() - started) * 1000), "node_calls": calls, "node_ms": round(node_ms), "node_log": log}
+
 class Node:
     """Thin coinset/full-node REST client. Tests replace ``rpc`` outright.
 
@@ -279,12 +310,30 @@ class Node:
     RETRY_PAUSE_S = 0.6
 
     def rpc(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        _CALL.info = info = {"attempts": 0, "host": _node_host(self.node_url), "hedged": False}
+        ok = False
+        try:
+            body = self._rpc_inner(route, payload)
+            ok = True
+            return body
+        finally:
+            _CALL.info = None
+            ms = (time.monotonic() - started) * 1000
+            with _NODE_STATS_LOCK:
+                NODE_STATS["calls"] += 1
+                NODE_STATS["ms"] += ms
+                NODE_LOG.append({"route": route, "ms": round(ms), "attempts": info["attempts"], "host": info["host"], "ok": ok,
+                                 "hedged": info["hedged"]})
+                del NODE_LOG[:-MAX_NODE_LOG]
+
+    def _rpc_inner(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
         if route == "push_tx":
             return self._push(payload)
         attempts = 1 + self.READ_RETRIES
         for attempt in range(attempts):
             try:
-                return self._rpc_once(route, payload)
+                return self._rpc_hedged(route, payload)
             except _Transient as exc:
                 if attempt + 1 >= attempts:
                     # This node still has not answered: each failover node, once. A 4xx
@@ -344,7 +393,57 @@ class Node:
     def _rpc_once(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._rpc_at(self.node_url, route, payload, self.timeout)
 
+    def _rpc_hedged(self, route: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """One read, asked a second time if the first has not answered by the hedge delay.
+
+        From the router, coinset answered most reads in 0.1-0.4 s and about one in five
+        in 2-20 s, on the first try every time, so a retry never fired and the read just
+        waited (owner, 2026-10-24: "add the hedged reads too"). A read changes nothing,
+        so it is asked again -- the first failover node, else this node once more -- and
+        the first answer wins. A 4xx is the node's answer and is raised at once. The
+        requests run on daemon threads: the one left behind can never hold the process
+        open after the answer is in.
+        """
+        delay = hedge_after_s()
+        if delay <= 0:
+            return self._rpc_once(route, payload)
+        info = getattr(_CALL, "info", None)
+        answers: queue.Queue = queue.Queue()
+
+        def ask(url: str) -> None:
+            _CALL.info = info                                  # count this attempt on the caller's call
+            try:
+                answers.put((url, True, self._rpc_at(url, route, payload, self.timeout)))
+            except BaseException as exc:                       # noqa: BLE001 -- handed to the caller
+                answers.put((url, False, exc))
+
+        threading.Thread(target=ask, args=(self.node_url,), daemon=True).start()
+        asked, failure = 1, None
+        try:
+            first = answers.get(timeout=delay)
+        except queue.Empty:
+            hedge_url = self.failover_urls[0] if self.failover_urls else self.node_url
+            threading.Thread(target=ask, args=(hedge_url,), daemon=True).start()
+            asked += 1
+            if info is not None:
+                info["hedged"] = True
+            first = answers.get()
+        for done in range(asked):
+            url, ok, value = first if done == 0 else answers.get()
+            if ok:
+                if info is not None:
+                    info["host"] = _node_host(url)             # who answered, not who was asked last
+                return value
+            if not isinstance(value, _Transient):
+                raise value                                    # a 4xx is an answer
+            failure = value
+        raise failure                                          # every request was refused: retry as before
+
     def _rpc_at(self, node_url: str, route: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        info = getattr(_CALL, "info", None)
+        if info is not None:                                   # every attempt, failover nodes included
+            info["attempts"] += 1
+            info["host"] = _node_host(node_url)
         request = urllib.request.Request(
             f"{node_url}/{route}",
             data=json.dumps(payload).encode(),
@@ -435,6 +534,21 @@ class Node:
 
 def record_coin(record: dict[str, Any]) -> Coin:
     return coin_from_json(record.get("coin"))
+
+
+def records_by_names(node: Node, ids: list[bytes32]) -> dict[bytes32, dict[str, Any]]:
+    """Coin records for many ids in one call per 100, spent ones included."""
+    out: dict[bytes32, dict[str, Any]] = {}
+    unique = list(dict.fromkeys(ids))
+    for start in range(0, len(unique), 100):
+        body = node.rpc("get_coin_records_by_names", {
+            "names": ["0x" + coin_id.hex() for coin_id in unique[start:start + 100]],
+            "include_spent_coins": True,
+        })
+        for record in body.get("coin_records") or []:
+            if isinstance(record, dict):
+                out[record_coin(record).name()] = record
+    return out
 
 
 # ─── The safe ────────────────────────────────────────────────────────────────
@@ -1161,6 +1275,7 @@ def cmd_derive(payload: dict[str, Any], _node_factory: Callable[[str], Node]) ->
 
 
 def cmd_balance(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> dict[str, Any]:
+    started = time.monotonic()
     network = str(payload.get("network") or "testnet11")
     config = network_config(network)
     node = node_factory(str(payload.get("node_url") or config["node_url"]))
@@ -1198,6 +1313,7 @@ def cmd_balance(payload: dict[str, Any], node_factory: Callable[[str], Node]) ->
 
     return {
         "success": True,
+        "timing": run_timing(started),
         "network": network,
         "puzzle_hash": safe_ph.hex(),
         "address": encode_puzzle_hash(safe_ph, config["hrp"]),
@@ -1431,16 +1547,10 @@ def cmd_assemble(payload: dict[str, Any], node_factory: Callable[[str], Node]) -
     return result
 
 
-def cmd_status(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> dict[str, Any]:
-    network = str(payload.get("network") or "testnet11")
-    config = network_config(network)
-    node = node_factory(str(payload.get("node_url") or config["node_url"]))
-    coin_ids = [hex32(c, "coin_id") for c in payload.get("coin_ids") or []]
-    if not coin_ids:
-        raise MultisigError("no coin ids to check")
+def _coins_status(coin_ids: list[bytes32], records: dict[bytes32, dict[str, Any]]) -> dict[str, Any]:
     coins = []
     for coin_id in coin_ids:
-        record = node.coin_record(coin_id)
+        record = records.get(coin_id)
         coins.append({
             "coin_id": coin_id.hex(),
             "found": record is not None,
@@ -1448,11 +1558,39 @@ def cmd_status(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> 
             "spent_block_index": int((record or {}).get("spent_block_index") or 0),
         })
     return {
-        "success": True,
         "coins": coins,
         "all_spent": all(c["spent"] for c in coins),
         "any_spent": any(c["spent"] for c in coins),
     }
+
+
+def coins_status(node: Node, payload: dict[str, Any]) -> dict[str, Any]:
+    """Whether each coin exists and is spent, read in one call per 100 coins.
+
+    `coin_ids` asks about one set. `groups` ({key: [coin ids]}) asks about many at once
+    -- every live proposal of a lock, and the settlement coins of its offers -- and
+    answers each group as `coin_ids` would; the lock refresh used to spawn this tool,
+    and read each coin, once per proposal.
+    """
+    groups = payload.get("groups")
+    if groups is not None:
+        if not isinstance(groups, dict) or not groups:
+            raise MultisigError("no coin ids to check")
+        parsed = {str(key): [hex32(c, "coin_id") for c in ids or []] for key, ids in groups.items()}
+        if any(not ids for ids in parsed.values()):
+            raise MultisigError("a group has no coin ids to check")
+        records = records_by_names(node, [coin_id for ids in parsed.values() for coin_id in ids])
+        return {"success": True, "groups": {key: _coins_status(ids, records) for key, ids in parsed.items()}}
+    coin_ids = [hex32(c, "coin_id") for c in payload.get("coin_ids") or []]
+    if not coin_ids:
+        raise MultisigError("no coin ids to check")
+    return {"success": True, **_coins_status(coin_ids, records_by_names(node, coin_ids))}
+
+
+def cmd_status(payload: dict[str, Any], node_factory: Callable[[str], Node]) -> dict[str, Any]:
+    network = str(payload.get("network") or "testnet11")
+    config = network_config(network)
+    return coins_status(node_factory(str(payload.get("node_url") or config["node_url"])), payload)
 
 
 COMMANDS: dict[str, Callable[[dict[str, Any], Callable[[str], Node]], dict[str, Any]]] = {
