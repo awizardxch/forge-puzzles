@@ -41,7 +41,25 @@ LIVE_SECONDARY = ("V14 and V15 are not retired: the owner kept each live beside 
                   "(2026-10-07, 2026-10-09). Their pools stay on chain undrained, their lanes ship in "
                   "every slice and are imported unconditionally; a creation takes the newest lane")
 
+LIVE_V16 = ("V16 (protocol 17) is not retired: the owner keeps it served beside V17 (protocol 18) "
+            "(2026-11-11). Its pools stay on chain undrained and its lane ships beside V17's")
+LIVE_V17 = ("V17 (protocol 18) is not retired: the owner froze it on 2026-11-13 and keeps it served beside "
+            "V18 (protocol 19), which differs only in `register` (a pool may not list its own LP). Its pools stay on chain and its "
+            "lane ships beside V18's; each pool is spent by its own revision's lane")
+SAME_BUILD = ("version-agnostic in effect: the helper it uses (p2 solution, validate, the action layer, "
+              "LP_MINT_INNER, the node reader) is byte-identical in V16 and V17")
+
 ARGUED: dict[tuple[str, str], str] = {
+    ("forge_pool_admin.py", "forge_v17_driver"): LIVE_V17,
+    ("forge_pool_admin.py", "forge_v17_offer"): LIVE_V17,
+    ("forge_stdin.py", "forge_v17_create"): LIVE_V17,
+    ("forge_stdin.py", "forge_v17_driver"): LIVE_V17,
+    ("forge_stdin.py", "forge_v17_offer"): LIVE_V17,
+    ("forge_stdin.py", "forge_v17_route"): LIVE_V17,
+    ("forge_stdin.py", "forge_v16_offer"): LIVE_V16,
+    ("forge_stdin.py", "forge_v16_route"): LIVE_V16,
+    ("forge_stdin.py", "forge_v16_create"): LIVE_V16,
+    ("forge_stdin.py", "forge_v16_driver"): LIVE_V16,
     ("forge_stdin.py", "forge_v15_offer"): LIVE_SECONDARY,
     ("forge_stdin.py", "forge_v15_route"): LIVE_SECONDARY,
     ("forge_stdin.py", "forge_v15_create"): LIVE_SECONDARY,
@@ -50,25 +68,77 @@ ARGUED: dict[tuple[str, str], str] = {
     ("forge_stdin.py", "forge_v14_route"): LIVE_SECONDARY,
     ("forge_stdin.py", "forge_v14_create"): LIVE_SECONDARY,
     ("forge_stdin.py", "forge_v14_driver"): LIVE_SECONDARY,
-    ("forge_v16_route.py", "forge_v15_driver"): LIVE_SECONDARY + "; the composer spends a V15 pool on a route with its own driver",
-    ("forge_v16_route.py", "forge_v14_driver"): LIVE_SECONDARY + "; the composer spends a V14 pool on a route with its own driver",
-    ("_test_v16_route_lane.py", "_v14_testkit"): LIVE_SECONDARY + "; the mixed-revision route case builds a V14 pool",
-    ("_test_v16_route_lane.py", "forge_v14_offer"): LIVE_SECONDARY + "; its snapshot is the V14 lane's",
+    ("forge_v18_route.py", "forge_v17_driver"): LIVE_V17 + "; the composer spends a V17 pool on a route with its own driver "
+                                                "(and the V17 leg of migrate-v17-to-v18)",
+    ("forge_v18_route.py", "forge_v16_driver"): LIVE_V16 + "; the composer spends a V16 pool on a route with its own driver "
+                                                "(and the V16 leg of migrate-v16-to-v18)",
+    ("forge_v18_create.py", "forge_v17_offer"): LIVE_V17 + "; mirror_config_from_v17 reads a V17 snapshot with its own lane",
+    ("forge_stdin.py", "forge_v17_index"): LIVE_V17 + "; config.from_pool reads the V17 pool a V18 mirror names from the V17 record",
+    ("_test_v18_route_lane.py", "forge_v16_driver"): LIVE_V16 + "; the V16 -> V17 -> V18 route case builds a V16 pool",
+    ("_test_v18_route_lane.py", "forge_v16_offer"): LIVE_V16 + "; its snapshot is the V16 lane's",
+    ("_test_v18_route_lane.py", "forge_v17_driver"): LIVE_V17 + "; the V16 -> V17 -> V18 route case builds a V17 pool",
+    ("_test_v18_route_lane.py", "forge_v17_offer"): LIVE_V17 + "; its snapshot is the V17 lane's",
+    ("_test_v18_migrate.py", "forge_v17_driver"): LIVE_V17 + "; the V17 -> V18 migration burns V17 LP",
+    ("_test_v18_migrate.py", "forge_v17_offer"): LIVE_V17 + "; the V17 -> V18 migration burns V17 LP",
+    ("_test_v18_create_rcat.py", "forge_v17_driver"): LIVE_V17 + "; a V18 mirror is checked against a V17 pool",
+    ("_test_v18_create_rcat.py", "forge_v17_offer"): LIVE_V17 + "; a V18 mirror is checked against a V17 pool's snapshot",
+    ("forge_v18_route.py", "forge_v15_driver"): LIVE_SECONDARY + "; the composer spends a V15 pool on a route with its own driver",
+    ("forge_v18_route.py", "forge_v14_driver"): LIVE_SECONDARY + "; the composer spends a V14 pool on a route with its own driver",
+    ("forge_v18_create.py", "forge_v16_offer"): LIVE_V16 + "; mirror_config_from_v16 reads a V16 snapshot with its own lane",
+    ("forge_pool_admin.py", "forge_v16_driver"): LIVE_V16 + "; collect and dao_fee serve both revisions, each with its own driver",
+    ("forge_pool_admin.py", "forge_v16_offer"): LIVE_V16 + "; its snapshots are the V16 lane's",
+    ("forge_registry_record.py", "forge_v16_driver"): LIVE_V16 + "; a record is checked with its own revision's driver (V16 by default)",
+    ("forge_recover.py", "forge_v16_driver"): LIVE_V16 + "; it rebuilds a V16, V17 or V18 registry and its pools from chain, "
+                                              "each with its own revision's driver (picked by which rebuild is the eve); "
+                                              "each revision's offer, index and resync lanes are imported by tag (Revision._lane)",
+    ("forge_recover.py", "forge_v17_driver"): LIVE_V17 + "; the same chain rebuild reads V17 registries (testnet's, kept as "
+                                              "provenance) beside V18's",
+    ("_test_recover_v18.py", "forge_v16_driver"): LIVE_V16 + "; the recovery suite proves a V16 registry still comes "
+                                                  "back as V16 beside V18 (init is shared, so the rebuild decides)",
+    ("_test_recover_v18.py", "forge_v17_driver"): LIVE_V17 + "; the recovery suite proves a V17 registry comes back as V17, "
+                                                  "not V18 (the two share init and the pool shape; register tells them apart)",
+    ("_test_rcat_issuer_custody.py", "forge_v17_driver"): LIVE_V17 + "; the custody suite validates a rebase on a V17 rCAT pool "
+                                                          "(the testnet rCAT matrix is V17's); the guards it tests are revision-agnostic",
+    ("_test_v18_rcat_routes.py", "_v14_testkit"): LIVE_SECONDARY + "; the routed-rCAT suite crosses a V14 leg, which must stay plain",
+    ("_test_v18_rcat_routes.py", "forge_v14_offer"): LIVE_SECONDARY + "; its V14 snapshot is the V14 lane's",
+    ("_test_pool_admin.py", "_v16_testkit"): LIVE_V16 + "; the pool-admin suite builds V16 pools",
+    ("_test_pool_admin.py", "forge_v16_driver"): LIVE_V16 + "; the pool-admin suite builds V16 pools",
+    ("_test_pool_admin.py", "forge_v16_offer"): LIVE_V16 + "; the pool-admin suite builds V16 pools",
+    ("_test_coin_combine.py", "forge_v16_driver"): SAME_BUILD,
+    ("_test_keeper_key.py", "forge_v16_driver"): SAME_BUILD,
+    ("_test_offer_take.py", "_test_v16_dexie_split"): LIVE_V16 + "; it takes V16 offers",
+    ("_test_offer_take.py", "_test_v16_offer_lane"): LIVE_V16 + "; it takes V16 offers",
+    ("_test_registry_record.py", "forge_v16_driver"): LIVE_V16 + "; it checks V16 registry records (the default revision)",
+    ("_test_registry_record.py", "forge_v16_index"): LIVE_V16 + "; it checks V16 registry records (the default revision)",
+    ("_test_registry_rollover.py", "_test_v16_create"): LIVE_V16 + "; it rolls a V16 registry over",
+    ("_test_registry_rollover.py", "forge_v16_create"): LIVE_V16 + "; it rolls a V16 registry over",
+    ("_test_registry_rollover.py", "forge_v16_driver"): LIVE_V16 + "; it rolls a V16 registry over",
+    ("_test_registry_rollover.py", "forge_v16_index"): LIVE_V16 + "; it rolls a V16 registry over",
+    ("_test_split_shares.py", "forge_v16_offer"): LIVE_V16 + "; it splits V16 offers",
+    ("_test_split_shares.py", "forge_v16_route"): LIVE_V16 + "; it splits V16 offers",
+    ("_test_surplus_refund_binding.py", "forge_v16_offer"): LIVE_V16 + "; it binds V16 surplus refunds",
+    ("_test_v18_route_lane.py", "_v14_testkit"): LIVE_SECONDARY + "; the mixed-revision route case builds a V14 pool",
+    ("_test_v18_route_lane.py", "forge_v14_offer"): LIVE_SECONDARY + "; its snapshot is the V14 lane's",
+    ("_test_v18_migrate.py", "forge_v16_driver"): LIVE_V16 + "; the migration burns V16 LP",
+    ("_test_v18_create_rcat.py", "forge_v16_driver"): LIVE_V16 + "; a v2 mirror is checked against a V16 pool",
+    ("_test_v18_create_rcat.py", "forge_v16_offer"): LIVE_V16 + "; a v2 mirror is checked against a V16 pool's snapshot",
+    ("forge_stdin.py", "forge_v16_index"): LIVE_V16 + "; config.from_pool reads the V16 pool a mirror names from the V16 record",
+    ("_test_v18_migrate.py", "forge_v16_offer"): LIVE_V16 + "; the migration burns V16 LP",
     ("forge_stdin.py", "forge_v13_offer"):
         "the retired lane is optional and guarded by try/ImportError; it serves pools "
         "whose record is still read back, and its absence is reported by _lane",
     ("forge_stdin.py", "forge_v13_route"): "same optional lane",
     ("forge_stdin.py", "forge_v13_create"): "same optional lane",
     ("forge_stdin.py", "forge_v13_driver"): "same optional lane",
-    ("_test_v16_chip0062_audit.py", "_v11_testkit"):
+    ("_test_v18_chip0062_audit.py", "_v11_testkit"):
         "the CHIP-0062 audit read contracts/v11, so every finding is built against V11 "
         "first: a finding that cannot be demonstrated where the auditors found it is as "
         "much a failure as one V14 still allows",
-    ("_test_v16_consensus_timelocks.py", "_v11_testkit"):
-        "the before/after control: it proves V11 asserted no birth height where V16 "
+    ("_test_v18_consensus_timelocks.py", "_v11_testkit"):
+        "the before/after control: it proves V11 asserted no birth height where V17 "
         "does, which cannot be shown without building a V11 pool",
-    ("_test_v16_before_after.py", "_v13_testkit"):
-        "the before/after control: every V14 change, carried into V15 and V16, is run against the V13 build too",
+    ("_test_v18_before_after.py", "_v13_testkit"):
+        "the before/after control: every V14 change, carried into V15, V16 and V17, is run against the V13 build too",
 }
 
 IMPORT = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)

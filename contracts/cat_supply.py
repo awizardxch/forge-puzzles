@@ -15,17 +15,26 @@ supply is reported unknown rather than guessed.
 
 Burned. Supply sent to the burn address (puzzle hash 0x...dead) is out of
 circulation for good; its unspent CAT coins are found by their puzzle hash, which
-needs no walk.
+needs no walk. Many assets' burn addresses are read in one call.
+
+Node calls that do not wait on each other are made side by side: a parent's record
+and its spend (it was spent in the block that created its child, so the child's
+confirmed height names it), and every eve candidate's reveal. Only raw JSON crosses
+threads; chia's Program panics on a thread that did not make it, so every reveal is
+parsed on the calling thread.
 
 stdin:  JSON {asset_id, start (a coin id of this CAT), budget?, node_url?}, or
-        {asset_id, burned_only: true} to re-read the burn address alone
+        {asset_id, burned_only: true} to re-read the burn address alone, or
+        {asset_ids: [...], burned_only: true} to re-read many burn addresses at once
 stdout: JSON {success, status: "found"|"budget"|"unsupported", next?, walked,
-              minted?, burned?, issuance_coin?, eve_coins?, unspent_siblings?}
+              minted?, burned?, issuance_coin?, eve_coins?, unspent_siblings?};
+        for asset_ids, {success, status: "burned", burned: {asset_id: amount}}
 """
 from __future__ import annotations
 
 import json
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +47,7 @@ from chia.wallet.uncurried_puzzle import uncurry_puzzle  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 
 import forge_network as _forge_network  # noqa: E402
-from forge_v16_price_history import Rpc, _strip, node_rpc  # noqa: E402
+from forge_v18_price_history import Rpc, _strip, node_rpc  # noqa: E402
 from wallet_holdings import cat_puzzle_hash  # noqa: E402
 
 DEFAULT_NODE = _forge_network.node_url()
@@ -49,6 +58,10 @@ BURN_PUZZLE_HASH = bytes32.fromhex("0" * 60 + "dead")
 # ZERO_32) and where the site's "Burn LP Coin" sent the seed before 2026-10-09; V16 pays
 # both to 0x...dead. Neither has a known preimage, so both count as burned.
 BURN_PUZZLE_HASHES = (BURN_PUZZLE_HASH, bytes32(b"\x00" * 32))
+# Puzzle hashes asked about in one get_coin_records_by_puzzle_hashes call.
+HASHES_PER_CALL = 100
+# Reveals read at once when checking an issuance's children.
+REVEAL_WORKERS = 8
 
 
 class SupplyError(Exception):
@@ -67,10 +80,15 @@ def coin_record(rpc: Rpc, coin_id: str) -> dict:
     return _ok(rpc("get_coin_record_by_name", {"name": "0x" + coin_id}), f"coin {coin_id[:12]}")["coin_record"]
 
 
-def reveal_of(rpc: Rpc, coin_id: str, spent_height: int) -> Program:
+def reveal_json(rpc: Rpc, coin_id: str, spent_height: int) -> str:
+    """A spend's puzzle reveal as hex: safe to fetch on any thread."""
     answer = _ok(rpc("get_puzzle_and_solution", {"coin_id": "0x" + coin_id, "height": spent_height}),
                  f"puzzle of {coin_id[:12]}")
-    return Program.fromhex(_strip(answer["coin_solution"]["puzzle_reveal"]))
+    return _strip(answer["coin_solution"]["puzzle_reveal"])
+
+
+def reveal_of(rpc: Rpc, coin_id: str, spent_height: int) -> Program:
+    return Program.fromhex(reveal_json(rpc, coin_id, spent_height))
 
 
 def cat_asset(reveal: Program) -> str | None:
@@ -82,11 +100,26 @@ def cat_asset(reveal: Program) -> str | None:
     return _strip(bytes(tail_hash.as_atom()).hex())
 
 
-def is_this_cat(rpc: Rpc, record: dict, asset_id: str) -> bool:
+def is_this_cat(rpc: Rpc, record: dict, asset_id: str, early: tuple[int, Future] | None = None) -> bool:
+    """Whether a spent coin was this CAT, by its reveal.
+
+    `early` is (height, read) for a reveal already asked for, at a height named before
+    the record arrived. It is used only when the record confirms that height, and read
+    again here when it failed.
+    """
     if not record.get("spent"):
         return False
     coin_id = _coin_id(record)
-    return cat_asset(reveal_of(rpc, coin_id, int(record["spent_block_index"]))) == asset_id
+    spent_height = int(record["spent_block_index"])
+    reveal_hex = None
+    if early is not None and early[0] == spent_height:
+        try:
+            reveal_hex = early[1].result()
+        except Exception:  # noqa: BLE001 -- read again below, where a failure is raised
+            reveal_hex = None
+    if reveal_hex is None:
+        reveal_hex = reveal_json(rpc, coin_id, spent_height)
+    return cat_asset(Program.fromhex(reveal_hex)) == asset_id
 
 
 def _coin_id(record: dict) -> str:
@@ -96,17 +129,38 @@ def _coin_id(record: dict) -> str:
                       int(coin["amount"])).name()).hex()
 
 
+def burned_many(rpc: Rpc, asset_ids: list[str]) -> dict[str, int]:
+    """Each asset's unspent coins at every burn address: one call per HASHES_PER_CALL hashes."""
+    owner: dict[str, str] = {}
+    for asset_id in dict.fromkeys(asset_ids):
+        for burn in BURN_PUZZLE_HASHES:
+            owner[bytes(cat_puzzle_hash(bytes32.fromhex(asset_id), burn)).hex()] = asset_id
+    totals = {asset_id: 0 for asset_id in asset_ids}
+    hashes = list(owner)
+    for start in range(0, len(hashes), HASHES_PER_CALL):
+        answer = _ok(rpc("get_coin_records_by_puzzle_hashes",
+                         {"puzzle_hashes": ["0x" + h for h in hashes[start:start + HASHES_PER_CALL]],
+                          "include_spent_coins": False}), "burn addresses")
+        for record in answer.get("coin_records") or []:
+            asset_id = owner.get(_strip(record["coin"]["puzzle_hash"]))
+            if asset_id is not None:
+                totals[asset_id] += int(record["coin"]["amount"])
+    return totals
+
+
 def burned(rpc: Rpc, asset_id: str) -> int:
-    total = 0
-    for burn in BURN_PUZZLE_HASHES:
-        puzzle_hash = cat_puzzle_hash(bytes32.fromhex(asset_id), burn)
-        answer = _ok(rpc("get_coin_records_by_puzzle_hash",
-                         {"puzzle_hash": "0x" + bytes(puzzle_hash).hex(), "include_spent_coins": False}), "burn address")
-        total += sum(int(record["coin"]["amount"]) for record in answer.get("coin_records") or [])
-    return total
+    return burned_many(rpc, [asset_id])[asset_id]
 
 
 def supply(payload: dict[str, Any], rpc: Rpc | None = None) -> dict[str, Any]:
+    if payload.get("burned_only") and payload.get("asset_ids") is not None:
+        # The periodic refresh: every asset's burn addresses, one spawn and one call.
+        asset_ids = [_strip(a) for a in payload.get("asset_ids") or []]
+        if not asset_ids or any(len(a) != 64 for a in asset_ids):
+            raise SupplyError("asset_ids must be a list of 32-byte hex ids", "BAD_INPUT")
+        rpc = rpc or node_rpc(str(payload.get("node_url") or DEFAULT_NODE))
+        return {"success": True, "status": "burned",
+                "burned": {asset_id: str(amount) for asset_id, amount in burned_many(rpc, asset_ids).items()}}
     asset_id = _strip(payload.get("asset_id"))
     if len(asset_id) != 64:
         raise SupplyError("asset_id must be 32 bytes of hex", "BAD_INPUT")
@@ -119,6 +173,11 @@ def supply(payload: dict[str, Any], rpc: Rpc | None = None) -> dict[str, Any]:
         raise SupplyError("start must be 32 bytes of hex", "BAD_INPUT")
     budget = max(1, min(int(payload.get("budget") or 40), MAX_BUDGET))
 
+    with ThreadPoolExecutor(max_workers=REVEAL_WORKERS) as pool:
+        return _walk_to_issuance(rpc, pool, asset_id, start, budget)
+
+
+def _walk_to_issuance(rpc: Rpc, pool: ThreadPoolExecutor, asset_id: str, start: str, budget: int) -> dict[str, Any]:
     # Walk parents until one is not this CAT: that one is the issuance coin.
     coin_id = start
     record = coin_record(rpc, coin_id)
@@ -127,9 +186,14 @@ def supply(payload: dict[str, Any], rpc: Rpc | None = None) -> dict[str, Any]:
         if walked >= budget:
             return {"success": True, "status": "budget", "next": coin_id, "walked": walked}
         parent_id = _strip(record["coin"]["parent_coin_info"])
-        parent = coin_record(rpc, parent_id)
+        # The parent was spent in the block that created this coin: its reveal is asked
+        # for at that height while its record is read, not after.
+        guess = int(record.get("confirmed_block_index") or 0)
+        parent_read = pool.submit(coin_record, rpc, parent_id)
+        early = (guess, pool.submit(reveal_json, rpc, parent_id, guess)) if guess > 0 else None
+        parent = parent_read.result()
         walked += 1
-        if not is_this_cat(rpc, parent, asset_id):
+        if not is_this_cat(rpc, parent, asset_id, early):
             break
         coin_id, record = parent_id, parent
 
@@ -144,13 +208,17 @@ def supply(payload: dict[str, Any], rpc: Rpc | None = None) -> dict[str, Any]:
     minted = 0
     eves: list[str] = []
     unspent: list[str] = []
+    # Every spent child's reveal at once; each is still judged here, in order.
+    reveals = {_coin_id(child): (int(child["spent_block_index"]),
+                                 pool.submit(reveal_json, rpc, _coin_id(child), int(child["spent_block_index"])))
+               for child in children if child.get("spent")}
     for child in children:
         child_id = _coin_id(child)
         if not child.get("spent"):
             # An unspent sibling cannot show its puzzle: it is change, or an eve never moved.
             unspent.append(child_id)
             continue
-        if is_this_cat(rpc, child, asset_id):
+        if is_this_cat(rpc, child, asset_id, reveals[child_id]):
             minted += int(child["coin"]["amount"])
             eves.append(child_id)
     if minted == 0:

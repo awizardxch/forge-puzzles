@@ -67,3 +67,12 @@ def verify(root: bytes, leaf: bytes, proof: MerkleProof) -> bool:
 # V11.1 adds the sixth leaf; the registry's six_leaf_root hard-codes this order.
 LEAF_ORDER = ("forge_action_swap", "forge_action_add", "forge_action_remove",
               "forge_action_observe", "forge_action_collect", "forge_action_dao_fee")
+
+# V17 (protocol 18, rCAT): eight leaves -- the six above, then the issuer's `rebase` and anyone's
+# `refund`. Both refuse a plain asset, so they are inert in a pool without an rCAT. A NEW name
+# rather than a change to LEAF_ORDER: V11 to V16 share that constant and stay exactly as deployed.
+V17_LEAF_ORDER = (*LEAF_ORDER, "forge_action_rebase", "forge_action_refund")
+
+# V18 (protocol 19): the same eight leaves in the same order -- V18 changes only the
+# registry's `register` leaf. Its own name so V18 never reads a V17 constant.
+V18_LEAF_ORDER = V17_LEAF_ORDER

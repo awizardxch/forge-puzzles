@@ -137,6 +137,38 @@ def main() -> int:
                       state=kit.forge_state(reserves, 9_000_000, [0, 0], last_height=H - 10, dao_fee_bps=100, dao_owed=[0, 0]))),
         "height": H}, "NOTHING_OWED")
 
+    # Collect all (owner, 2026-10-24: "collects all the fees for all the pools in 1 transaction
+    # we sign"): every pool's collect in one bundle, one payer for the whole network fee.
+    print("collect-all: several pools in one bundle, one coin pays the fee, one signature")
+    pools = [pool] + [kit.make_pool([None, CAT], reserves, total_lp=9_000_000, fees=fees, leaves="forge", salt=0x74 + i,
+                                    protocol_ph=PROTOCOL_PH, dao_ph=dao_ph, state=state) for i in range(2)]
+    snaps = [off.pool_to_snapshot(p) for p in pools]
+    all_free = admin.build({"kind": "collect-all", "pools": snaps, "height": H})
+    ok, why = mempool_valid(all_free["bundle"])
+    check("with no network fee: three pools, no wallet, one whole bundle", not all_free["payer_spends"] and ok
+          and len(all_free["successors"]) == 3, why)
+    check("every successor owes nothing", all(s["state"]["fees_owed"] == ["0", "0"] and s["state"]["dao_owed"] == ["0", "0"]
+                                              for s in all_free["successors"]))
+    paid = outputs(all_free["bundle"])
+    check("each pool pays its own recipients what it owed: three dev payouts and three DAO payouts",
+          sum(1 for ph, a in paid if ph == PROTOCOL_PH.hex() and a == fees[0]) == 3
+          and sum(1 for ph, a in paid if ph == dao_ph.hex() and a == dao_owed[0]) == 3)
+    prepared_all = admin.build({"kind": "collect-all", "pools": snaps, "height": H, "payer": payer, "network_fee": fee})
+    check("with a fee: one payer spend to sign for all three", len(prepared_all["payer_spends"]) == 1 and "bundle" not in prepared_all)
+    signed_all = admin.build({"kind": "collect-all", "pools": snaps, "height": H, "payer": payer, "network_fee": fee,
+                              "aggregated_signature": sign(dev_sk, prepared_all["payer_spends"])})
+    ok, why = mempool_valid(signed_all["bundle"])
+    check("signed once, the three-pool bundle passes validate_clvm_and_signature", ok, why)
+    check("the payer's change goes back to it less exactly the one fee",
+          (payer["coin"]["puzzle_hash"], 4_000_000_000 - fee) in outputs(signed_all["bundle"]))
+    check("prepare and submit build the same transaction", signed_all["successor_coin_ids"] == prepared_all["successor_coin_ids"])
+    owes_nothing = off.pool_to_snapshot(kit.make_pool([None, CAT], reserves, total_lp=9_000_000, leaves="forge", salt=0x77,
+                                                      protocol_ph=PROTOCOL_PH, dao_ph=dao_ph,
+                                                      state=kit.forge_state(reserves, 9_000_000, [0, 0], last_height=H - 10, dao_fee_bps=100, dao_owed=[0, 0])))
+    refused("a pool owing nothing in the list is refused", {"kind": "collect-all", "pools": [snaps[0], owes_nothing], "height": H}, "NOTHING_OWED")
+    refused("a pool named twice is refused", {"kind": "collect-all", "pools": [snaps[0], snaps[0]], "height": H}, "BAD_REQUEST")
+    refused("a fee with no paying coin is refused", {"kind": "collect-all", "pools": snaps, "height": H, "network_fee": fee}, "BAD_REQUEST")
+
     print("dao-fee: down only, and only from the DAO recipient")
     dao_payer = coin_at(dao_puzzle, 2_000_000_000, 0x92)
     lowered = admin.build({"kind": "dao-fee", "pool": snapshot, "height": H, "new_bps": 50, "payer": dao_payer, "network_fee": fee})

@@ -20,7 +20,7 @@ is when that current state began.
 stdin:  JSON {launcher_id, segments: [{start, budget}], known: [coin ids], node_url?}
 stdout: JSON {success, points: [...], segments: [{start, walked, reached, next}], tip}
         point = {coin_id, parent, height, timestamp, spent_height, reserves, total_lp,
-                 oracle: {last_height, cums, last_spot}}
+                 oracle: {last_height, cums, last_spot}, fees_owed, dao_owed}
         reached = "genesis" | "known" | "budget"
 """
 from __future__ import annotations
@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -40,7 +41,7 @@ import forge_v14_driver as drv  # noqa: E402
 import forge_network as _forge_network  # noqa: E402
 
 DEFAULT_NODE = _forge_network.node_url()
-# Spends one request may walk. Two node calls each; a pool's whole history is tens of
+# Spends one request may walk. Two node calls each, made side by side; a pool's whole history is tens of
 # spends, so a first fill finishes in one or two requests and later ones walk a handful.
 MAX_BUDGET = 200
 
@@ -90,11 +91,22 @@ def state_from_reveal(reveal: Program, launcher_id: bytes) -> list:
     return drv.state_to_list(curried[2])
 
 
+def _spend_of(rpc: Rpc, coin_id: str, height: int) -> dict:
+    return rpc("get_puzzle_and_solution", {"coin_id": "0x" + coin_id, "height": height})["coin_solution"]
+
+
 def walk(rpc: Rpc, launcher_id: str, start: str, known: set[str], budget: int) -> dict:
     """Walk back from `start` until the launcher, a known coin, or the budget.
 
     Returns {points, walked, reached, next, tip}. `points` are newest first; `next` is
     the coin to resume from when the budget ran out.
+
+    A coin's parent was spent in the block that created the coin, so the parent's spent
+    height is the coin's confirmed height (574 of 574 mainnet pool coins, 2026-10-24).
+    Each coin's record and its spend are therefore read side by side, one round trip a
+    step where two used to wait on each other. The record still decides: a spend read at
+    a height the record does not confirm is read again at its own. Only raw JSON crosses
+    threads; every reveal is parsed here, on the calling thread.
     """
     launcher = _strip(launcher_id)
     launcher_bytes = bytes.fromhex(launcher)
@@ -102,46 +114,65 @@ def walk(rpc: Rpc, launcher_id: str, start: str, known: set[str], budget: int) -
     points: list[dict] = []
     tip: dict | None = None
     walked = 0
-    while True:
-        if coin_id == launcher:
-            return {"points": points, "walked": walked, "reached": "genesis", "next": None, "tip": tip}
-        if coin_id in known:
-            return {"points": points, "walked": walked, "reached": "known", "next": None, "tip": tip}
-        if walked >= budget:
-            return {"points": points, "walked": walked, "reached": "budget", "next": coin_id, "tip": tip}
-        record = (rpc("get_coin_record_by_name", {"name": "0x" + coin_id}) or {}).get("coin_record")
-        if not record:
-            raise HistoryError(f"pool coin {coin_id[:12]} is unknown to the node", "COIN_UNKNOWN")
-        parent = _strip(record["coin"]["parent_coin_info"])
-        height = int(record.get("confirmed_block_index") or 0)
-        timestamp = int(record.get("timestamp") or 0)
-        if not record.get("spent"):
-            # Only the tip can be unspent, and its state is the caller's snapshot.
-            if points:
-                raise HistoryError("an unspent coin below the tip", "LINEAGE_BROKEN")
-            tip = {"coin_id": coin_id, "height": height, "timestamp": timestamp}
-        else:
-            spent_height = int(record["spent_block_index"])
-            spend = rpc("get_puzzle_and_solution", {"coin_id": "0x" + coin_id, "height": spent_height})["coin_solution"]
-            reveal = Program.from_bytes(bytes.fromhex(_strip(spend["puzzle_reveal"])))
-            if reveal.get_tree_hash().hex() != _strip(record["coin"]["puzzle_hash"]):
-                raise HistoryError("a reveal does not hash to its coin's puzzle", "REVEAL_MISMATCH")
-            state = state_from_reveal(reveal, launcher_bytes)
-            if tip is None and not points:
-                tip = {"coin_id": coin_id, "height": height, "timestamp": timestamp, "spent": True}
-            last_height, cums, last_spot = state[3]
-            points.append({
-                "coin_id": coin_id, "parent": parent, "height": height, "timestamp": timestamp,
-                "spent_height": spent_height,
-                "reserves": [str(int(r)) for r in state[0]], "total_lp": str(int(state[1])),
-                # The pool's own price record, as the spend that created this coin left it:
-                # cumulative spot x blocks (2^64-scaled, each asset in asset 0) up to
-                # `last_height`, and the PRE-spend spot it credited. Zero at genesis.
-                "oracle": {"last_height": int(last_height), "cums": [str(int(c)) for c in cums],
-                           "last_spot": [str(int(s)) for s in last_spot]},
-            })
-            walked += 1
-        coin_id = parent
+    # When this coin was spent, as its child's record says; unknown for the first coin.
+    spent_at: int | None = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        while True:
+            if coin_id == launcher:
+                return {"points": points, "walked": walked, "reached": "genesis", "next": None, "tip": tip}
+            if coin_id in known:
+                return {"points": points, "walked": walked, "reached": "known", "next": None, "tip": tip}
+            if walked >= budget:
+                return {"points": points, "walked": walked, "reached": "budget", "next": coin_id, "tip": tip}
+            record_read = pool.submit(rpc, "get_coin_record_by_name", {"name": "0x" + coin_id})
+            spend_read = None if spent_at is None else pool.submit(_spend_of, rpc, coin_id, spent_at)
+            record = (record_read.result() or {}).get("coin_record")
+            if not record:
+                raise HistoryError(f"pool coin {coin_id[:12]} is unknown to the node", "COIN_UNKNOWN")
+            parent = _strip(record["coin"]["parent_coin_info"])
+            height = int(record.get("confirmed_block_index") or 0)
+            timestamp = int(record.get("timestamp") or 0)
+            if not record.get("spent"):
+                # Only the tip can be unspent, and its state is the caller's snapshot.
+                if points:
+                    raise HistoryError("an unspent coin below the tip", "LINEAGE_BROKEN")
+                tip = {"coin_id": coin_id, "height": height, "timestamp": timestamp}
+            else:
+                spent_height = int(record["spent_block_index"])
+                spend = None
+                if spend_read is not None and spent_at == spent_height:
+                    try:
+                        spend = spend_read.result()
+                    except Exception:  # noqa: BLE001 -- read again below, where a failure is raised
+                        spend = None
+                if spend is None:
+                    spend = _spend_of(rpc, coin_id, spent_height)
+                reveal = Program.from_bytes(bytes.fromhex(_strip(spend["puzzle_reveal"])))
+                if reveal.get_tree_hash().hex() != _strip(record["coin"]["puzzle_hash"]):
+                    raise HistoryError("a reveal does not hash to its coin's puzzle", "REVEAL_MISMATCH")
+                state = state_from_reveal(reveal, launcher_bytes)
+                if tip is None and not points:
+                    tip = {"coin_id": coin_id, "height": height, "timestamp": timestamp, "spent": True}
+                last_height, cums, last_spot = state[3]
+                points.append({
+                    "coin_id": coin_id, "parent": parent, "height": height, "timestamp": timestamp,
+                    "spent_height": spent_height,
+                    "reserves": [str(int(r)) for r in state[0]], "total_lp": str(int(state[1])),
+                    # The pool's own price record, as the spend that created this coin left it:
+                    # cumulative spot x blocks (2^64-scaled, each asset in asset 0) up to
+                    # `last_height`, and the PRE-spend spot it credited. Zero at genesis.
+                    "oracle": {"last_height": int(last_height), "cums": [str(int(c)) for c in cums],
+                               "last_spot": [str(int(s)) for s in last_spot]},
+                    # The dev fee and the DAO fee the pool owes, per slot, as this coin holds
+                    # them: each swap adds to them and a collect empties them, so the steps
+                    # between states are the fees each spend earned (the volume overview).
+                    "fees_owed": [str(int(f)) for f in state[2]],
+                    "dao_owed": [str(int(d)) for d in state[6]],
+                })
+                walked += 1
+            # The spend of the parent created this coin, in this coin's block.
+            spent_at = height
+            coin_id = parent
 
 
 def history(payload: dict[str, Any], rpc: Rpc | None = None) -> dict[str, Any]:

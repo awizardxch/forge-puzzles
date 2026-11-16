@@ -330,6 +330,37 @@ def router_surplus_band(fee: int) -> int:
     return fee // 10 + 1
 
 
+def surplus_payments(offer: Offer, asset: bytes32 | None, surplus: int, fee: int,
+                     router_ph: bytes32) -> tuple[list, int]:
+    """The unsigned payments a wallet-built offer's surplus makes, and the router's take.
+
+    Up to the band above the fee (router_surplus_band) the surplus is the router's: the pool
+    moved a hair after the trader signed. Beyond it, the offer is IN THE MONEY -- a resting
+    offer the market moved past (owner, 2026-10-23: an upload asking 3.17 XCH that the route
+    paid 3.2397 for was refused "the price moved" for two days). The router takes exactly its
+    fee and the maker gets the rest, at the address the offer asks to be paid at: price
+    improvement, not a refusal. The maker's signed ask is paid in its own groups as always;
+    only the improvement rides in the unsigned group, so the most a block builder could
+    redirect is the router's fee and the maker's bonus, never what the maker signed for.
+
+    Every output of one coin must be distinct (consensus refuses a duplicate CREATE_COIN), so
+    an improvement equal to a payment already made moves a mojo to the router."""
+    if surplus < fee:
+        raise OfferRejected(f"the surplus of {surplus} {_asset_name(asset)} does not cover the router's fee of {fee}")
+    if surplus <= fee + router_surplus_band(fee):
+        return ([[router_ph, surplus, [router_ph]]] if surplus > 0 else []), surplus
+    payments = offer.get_requested_payments().get(asset, [])
+    maker_ph = payments[0].puzzle_hash
+    taken = {(bytes(p.puzzle_hash), int(p.amount)) for p in payments}
+    improvement = surplus - fee
+    while (bytes(maker_ph), improvement) in taken or (bytes(maker_ph), improvement) == (bytes(router_ph), fee):
+        improvement, fee = improvement - 1, fee + 1
+    out = [[router_ph, fee, [router_ph]]] if fee > 0 else []
+    if improvement > 0:
+        out.append([maker_ph, improvement, [maker_ph]])
+    return out, fee
+
+
 def surplus_payout_solution(offer: Offer, asset: bytes32 | None, payout: int, fee: int,
                             router_ph: bytes32, nonce: bytes32) -> tuple[Program, int]:
     """A WALLET-built offer's payout (owner, 2026-10-10: offers made by the trader's own
@@ -345,15 +376,46 @@ def surplus_payout_solution(offer: Offer, asset: bytes32 | None, payout: int, fe
     if surplus < fee:
         raise OfferRejected(f"the pool pays {payout} of {_asset_name(asset)}; less the router's {fee} that is "
                             f"{payout - fee}, and the offer asks {requested}: quote again")
-    if surplus > fee + router_surplus_band(fee):
-        raise OfferRejected(f"the pool pays {payout} of {_asset_name(asset)}, the offer asks {requested}, leaving "
-                            f"{surplus} where the router's fee is {fee}: the price moved; quote again")
+    # In the money beyond the band: the router's fee, and the maker's improvement (surplus_payments).
     # A fee that floors to nothing (a small payout at a low tier: 238 mojos at 42 bps) pays
     # no router coin at all: a zero-amount CAT payment broke the CAT ring ("clvm raise",
     # mainnet, 2026-10-12), and a zero XCH coin is dust nobody asked for.
-    if surplus <= 0:
+    extra, take = surplus_payments(offer, asset, surplus, fee, router_ph)
+    if not extra:
         return Program.to([*groups]), 0
-    return Program.to([*groups, [nonce, [router_ph, surplus, [router_ph]]]]), surplus
+    return Program.to([*groups, [nonce, *extra]]), take
+
+
+def deposit_payout_solution(offer: Offer, lp_asset: bytes32, minted: int, router_ph: bytes32,
+                            nonce: bytes32) -> tuple[Program, int]:
+    """A deposit's LP payout: the maker's bound groups, plus whatever the pool mints above them.
+
+    A deposit asked for exactly the mint, so one resting while a trade moved the pool in its
+    favour was refused "quote again" (mainnet, 2026-10-23: an add asking 1602442297 LP that
+    the pool would mint 1602540141 for). It is in the money, and as with a swap the maker
+    gets it (owner, 2026-10-23; surplus_payments) -- all of it, since the router has no claim
+    on a deposit. The signed ask is paid in its own groups; only the improvement rides in
+    the unsigned group, hinted to the maker so the wallet sees it. An offer asking MORE than
+    the mint is still refused. Returns (solution, the improvement paid)."""
+    groups = bound_groups(offer, lp_asset)
+    payments = offer.get_requested_payments().get(lp_asset, [])
+    requested = sum(int(p.amount) for p in payments)
+    if requested > minted:
+        raise OfferRejected(f"the pool mints {minted} LP, the offer asks {requested}: a deposit asks for at most what "
+                            "the pool mints at this state; quote again")
+    improvement = minted - requested
+    if improvement == 0:
+        return Program.to(groups), 0
+    # Every output of one coin must be distinct (DUPLICATE_OUTPUT): an improvement equal to a
+    # payment the maker already gets moves a mojo to the router.
+    maker_ph = payments[0].puzzle_hash
+    taken = {(bytes(p.puzzle_hash), int(p.amount)) for p in payments}
+    moved = 0
+    while improvement > 0 and (bytes(maker_ph), improvement) in taken:
+        improvement, moved = improvement - 1, moved + 1
+    extra = ([[maker_ph, improvement, [maker_ph]]] if improvement > 0 else []) + \
+        ([[router_ph, moved, [router_ph]]] if moved > 0 else [])
+    return Program.to([*groups, [nonce, *extra]]), improvement
 
 
 def maker_payment_to(offer: Offer, asset: bytes32 | None, puzzle_hash: bytes32) -> int:
@@ -581,8 +643,8 @@ def settle_add(pool: drv.V16Pool, offer: Offer, height: int, surplus_ph: bytes32
             raise OfferRejected(f"offered XCH {offered_xch} does not cover the LP backing {honest}")
     if honest <= 0:
         raise OfferRejected("the deposit mints no LP")
-    if honest != requested:
-        raise OfferRejected(f"the pool mints {honest} LP, the offer asks {requested}: a deposit asks for exactly what "
+    if honest < requested:
+        raise OfferRejected(f"the pool mints {honest} LP, the offer asks {requested}: a deposit asks for at most what "
                             "the pool mints at this state; quote again")
     if excess > 0:
         # XCH above the backing used to come back to the depositor through a group nothing
@@ -614,8 +676,8 @@ def settle_add(pool: drv.V16Pool, offer: Offer, height: int, surplus_ph: bytes32
     eve_spends = drv.lp_eve_ring(pool, eve, OFFER_PH, honest, action)
     lp_settlement = Coin(eve.name(), settle_ph(pool.lp_asset_id), uint64(honest))
     # A deposit is not a trade, so the router has no claim on it: the LP goes to the
-    # depositor, all of it, in the groups they signed for.
-    sol = exact_payout_solution(offer, pool.lp_asset_id, honest)
+    # depositor, all of it -- the groups they signed for, and any mint above them.
+    sol, improvement = deposit_payout_solution(offer, pool.lp_asset_id, honest, surplus_ph, lp_settlement.name())
     lp_settle_spends = unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
         lp_settlement, pool.lp_asset_id, OFFER_MOD, sol,
         lineage_proof=LineageProof(eve.parent_coin_info, drv.LP_MINT_INNER.get_tree_hash(), eve.amount))]).coin_spends
@@ -623,7 +685,7 @@ def settle_add(pool: drv.V16Pool, offer: Offer, height: int, surplus_ph: bytes32
         pool, "forge_action_add", solution,
         extra_spends=[*extra_spends, *eve_spends, *lp_settle_spends], extra_cats=extra_cats)
     return _finish(offer, pool, pool_bundle, new_state, {
-        "deposits": deposits, "lp_minted": honest, "requested": requested, "surplus": 0,
+        "deposits": deposits, "lp_minted": honest, "requested": requested, "surplus": improvement,
         "backing": honest, "excess_xch": 0, "h": int(height),
     })
 

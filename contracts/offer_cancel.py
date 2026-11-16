@@ -3,9 +3,12 @@
 
 A site-built offer (trade/appOffer.ts) is signed through signCoinSpends, so Sage never
 lists it among its offers and has nothing to cancel. The offer dies the moment any of its
-coins is spent; this spends all of them, each to its own puzzle hash (XCH to itself, a CAT
-to its own inner puzzle), and pays the network fee out of the first XCH coin. The wallet
-signs these spends -- only the wallet that made the offer can.
+coins is spent, so this spends ONE of them back to its own puzzle hash: the largest XCH
+coin, which also pays the network fee, or else one CAT coin (to its own inner puzzle). Sage
+cancels the same way. It used to spend every coin, and an add of 197 small coins made a
+signing request too big for the WalletConnect relay ("[LinkedList] Value too big to insert
+into list", mainnet, 2026-10-23); one coin is one small request whatever the offer holds.
+The wallet signs the spend -- only the wallet that made the offer can.
 
 stdin:  {offer, network_fee?}      network_fee null/omitted -> sized at 5 mojos/cost + 30%
 stdout: {success, coin_spends, network_fee, cost, coins}
@@ -32,7 +35,7 @@ from chia_rs import G2Element, SpendBundle  # noqa: E402
 from chia_rs.sized_bytes import bytes32  # noqa: E402
 from chia_rs.sized_ints import uint64  # noqa: E402
 
-import forge_v16_driver as drv  # noqa: E402
+import forge_v18_driver as drv  # noqa: E402
 
 ZERO = bytes32(b"\x00" * 32)
 P2_STANDARD_MOD_HASH = P2_STANDARD_MOD.get_tree_hash()
@@ -66,6 +69,12 @@ def build(offer_text: str, fee: int) -> tuple[list, int]:
         cats.setdefault(bytes32(asset_id.as_atom()), []).append((cs.coin, inner, proof))
     if not xch and not cats:
         raise ValueError("this offer spends no coins")
+    # One coin kills the offer: the largest XCH coin (it pays the fee), else the largest CAT coin.
+    if xch:
+        xch, cats = [max(xch, key=lambda entry: int(entry[0].amount))], {}
+    else:
+        asset_id, entries = next(iter(cats.items()))
+        xch, cats = [], {asset_id: [max(entries, key=lambda entry: int(entry[0].amount))]}
 
     spends = []
     fee_left = fee

@@ -17,6 +17,9 @@ What this pins:
   * three actions with a repeat in the middle keep their execution order
   * the replayed state equals the state the driver built the spend from
   * a solution whose selector count disagrees with its solutions is refused
+  * a selector that is a program, a nested `puzzles`, and quoted selectors over an
+    empty `puzzles` all replay to the successor the chain created; a selector that
+    resolves to nothing this pool commits to is refused with a typed error
 
 Exit 0 all pass, 1 a failure, 2 nothing exercised (build outputs absent).
 """
@@ -113,6 +116,60 @@ def main() -> int:
         check("a selector count that disagrees with the solutions is refused", False, "replayed anyway")
     except rs.ResyncError as exc:
         check("a selector count that disagrees with the solutions is refused", True, str(exc)[:60])
+
+    # the puzzle RUNS a selector; nothing makes it a path, or
+    # `puzzles` a flat list. Each spend below is first accepted by the consensus validator.
+    print("selectors the chain accepts and the driver never writes:")
+    leaf = pool.leaves["forge_action_observe"]
+    proof = pool.leaf_proof("forge_action_observe")
+    obs_state, obs_tagged, _base, _eph = kit.run_leaf(pool, "forge_action_observe", [H0])
+    obs_solution = kit.with_birth(pool, [H0])
+    honest_successor = pool.advance(kit.state_to_list(obs_state)).coin.name()
+
+    def with_inner(bundle, inner_solution):
+        """`bundle` with the pool singleton's inner solution replaced."""
+        spends = []
+        for cs in bundle.coin_spends:
+            if cs.coin.name() == pool.coin.name():
+                cs = kit.make_spend(pool.coin, kit.puzzle_for_singleton(pool.launcher_id, pool.inner),
+                                    kit.solution_for_singleton(pool.lineage, kit.uint64(1), inner_solution))
+            spends.append(cs)
+        return kit.SpendBundle(spends, kit.G2Element())
+
+    quoted = kit.assemble(pool, leaf, proof, obs_solution, obs_state, obs_tagged, selector=Program.to((1, leaf)))
+    kit.validate(quoted)
+    replayed, names = rs.replay_spend(pool, singleton_solution(quoted, pool))
+    check("a selector that is the program (q . leaf) replays", names == ["forge_action_observe"]
+          and replayed.coin.name() == honest_successor, str(names))
+
+    plain = kit.assemble(pool, leaf, proof, obs_solution, obs_state, obs_tagged)
+    deep = with_inner(plain, Program.to([[[leaf]], [[4, *proof]], [obs_solution]]))
+    kit.validate(deep)
+    replayed, names = rs.replay_spend(pool, singleton_solution(deep, pool))
+    check("`puzzles` = ((leaf)) with selector 4 replays", names == ["forge_action_observe"]
+          and replayed.coin.name() == honest_successor, str(names))
+
+    steps = [("forge_action_swap", [H0, 0, 1, g1, out1, *kit.settlement_ref(s1)]),
+             ("forge_action_collect", [H0, [1]])]
+    bundle, built_state = kit.spend_actions(pool, steps, extra_spends=[s1_spend])
+    inner = list(list(singleton_solution(bundle, pool).as_iter())[2].as_iter())
+    order = [pool.leaves[name] for name, _ in reversed(steps)]      # selectors are in reverse execution order
+    entries = [Program.to((Program.to((1, lf)), entry.rest())) for lf, entry in zip(order, inner[1].as_iter())]
+    mixed = with_inner(bundle, Program.to([0, entries, inner[2]]))  # no `puzzles` at all: every selector is quoted
+    kit.validate(mixed)
+    replayed, names = rs.replay_spend(pool, singleton_solution(mixed, pool))
+    check("two actions, both selectors quoted and `puzzles` empty, replay in execution order",
+          names == ["forge_action_swap", "forge_action_collect"]
+          and replayed.coin.name() == pool.advance(kit.state_to_list(built_state)).coin.name(), str(names))
+
+    for label, selector in (("a selector that returns a program this pool does not commit to", Program.to((1, Program.to(1)))),
+                            ("a selector that cannot run", Program.to([8]))):
+        bad = with_inner(plain, Program.to([[leaf], [[selector, *proof]], [obs_solution]]))
+        try:
+            rs.replay_spend(pool, singleton_solution(bad, pool))
+            check(f"{label} is refused", False, "replayed anyway")
+        except rs.ResyncError as exc:
+            check(f"{label} is refused with a typed error", exc.code == "UNKNOWN_LEAF", exc.code)
 
     print()
     passed = sum(results)

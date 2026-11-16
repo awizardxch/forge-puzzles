@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""The V11 route lanes through forge_stdin, keyless, in the simulator.
+
+Fabricated wallet offers (see _test_v18_offer_lane) drive multi-hop, split,
+flow, vault-route and routed-deposit bundles across pools built by the driver.
+Every bundle must pass consensus validation, pay the trader exactly their
+request, pay the surplus to the router, and return successor snapshots that
+rebuild. Exit 0 all pass, 1 otherwise.
+"""
+from __future__ import annotations
+
+import json
+import sys
+
+sys.path.insert(0, ".")
+sys.stdout.reconfigure(encoding="utf-8")
+
+from chia_rs import SpendBundle
+from chia_rs.sized_bytes import bytes32
+
+import forge_math
+import forge_stdin
+import forge_v18_driver as drv
+import forge_v18_offer as v18
+import forge_v18_route as v18r  # noqa: E402
+import _v14_testkit as kit14  # noqa: E402  -- V14 is live beside V18: a route may cross revisions
+import forge_v14_offer as v14  # noqa: E402
+import forge_v16_driver as drv16  # noqa: E402  -- V16 and V17 are live beside V18: the three-revision route
+import forge_v16_offer as v16  # noqa: E402
+try:   # optional: the public repository ships V18 and not the frozen V17; the V16 -> V17 -> V18 case skips there
+    import forge_v17_driver as drv17  # noqa: E402
+    import forge_v17_offer as v17  # noqa: E402
+except ImportError:
+    drv17 = v17 = None
+from _test_v18_offer_lane import ROUTER_PH, T_A, T_B, TRADER_PH, H, fabricate_offer, make, paid_to
+from forge_offer import ZERO_32
+
+T_C = bytes32(b"\xc3" * 32)
+results = []
+
+
+def check(label, ok, detail=""):
+    print(f"  [{'PASS' if ok else 'FAIL'}] {label}{'  ' + detail if detail else ''}")
+    results.append(bool(ok))
+    return bool(ok)
+
+
+def run(payload):
+    return forge_stdin.build(json.loads(json.dumps(payload)))
+
+
+def snap(pool):
+    return v18.pool_to_snapshot(pool)
+
+
+def hx(asset):
+    return (ZERO_32 if asset is None else asset).hex()
+
+
+def swap_out(pool, i_in, i_out, gross, state=None):
+    r = (state or pool.state)[0]
+    honest = forge_math.swap_output(r[i_in], r[i_out], gross, pool.fee_bps, pool.weights[i_in], pool.weights[i_out])
+    return honest - honest * pool.protocol_fee_bps // 10_000
+
+
+def forge_v18_lane(payload) -> bool:
+    return forge_stdin._lane_version(payload) == drv.PROTOCOL_VERSION
+
+
+def attempt(label, payload, expect_ok=True):
+    try:
+        out = run(payload)
+    except Exception as exc:
+        check(f"{label}: builder accepted", not expect_ok, f"{type(exc).__name__}: {str(exc)[:110]}")
+        return None
+    if not check(f"{label}: builder accepted", expect_ok):
+        return None
+    for s in out["pools"]:
+        check("  successor snapshot rebuilds", v18.snapshot_to_pool(s).coin.puzzle_hash.hex() == s["pool_coin"]["puzzle_hash"])
+    return out
+
+
+def exact_offer(payload: dict, offered: dict, out_asset, salt: int, bps: int = 0, fee_asset="auto"):
+    """The offer a quote produces for this route (F3, 2026-10-07): the router's rate paid by
+    the trader's own spend beside the entry settlement, and EXACTLY what the route releases
+    asked for -- read from the composer's own preview of the same payload. Returns the
+    offer and the amount it asks for."""
+    offered = dict(offered)
+    payments = None
+    if bps:
+        asset = next(iter(offered)) if fee_asset == "auto" else fee_asset
+        fee = offered[asset] * bps // 10_000
+        offered[asset] -= fee
+        payments = {asset: [(ROUTER_PH, fee)]}
+    probe = fabricate_offer(offered, {out_asset: 1}, salt=salt, payments=payments)
+    preview = run({**payload, "offer": probe.to_bech32(), "preview": True})
+    want = int(preview["forge"]["releases"][hx(out_asset)])
+    return fabricate_offer(offered, {out_asset: want}, salt=salt, payments=payments), want
+
+
+def wallet_offer(payload: dict, offered: dict, out_asset, salt: int, ask_delta: int = 0):
+    """A WALLET-built offer for this route (owner, 2026-10-10): Sage's createOffer, so it
+    sits in the trader's own wallet. It pays the router nothing itself and asks for the
+    release less the router's fee, both read from the composer's preview in surplus mode
+    (the probe's `router_fee_mode`). Returns the offer, the release and the fee."""
+    probe = fabricate_offer(offered, {out_asset: 1}, salt=salt)
+    preview = run({**payload, "offer": probe.to_bech32(), "preview": True, "probe": {"router_fee_mode": "surplus"}})
+    release = int(preview["forge"]["releases"][hx(out_asset)])
+    fee = int(preview["forge"].get("router_fee_out", -1))
+    return fabricate_offer(offered, {out_asset: release - fee + ask_delta}, salt=salt), release, fee
+
+
+def wallet_case(label, payload, offered, out_asset, salt, bps, entry_asset=None):
+    print(f"wallet-built {label} at {bps} bps: the router's fee comes off the payout")
+    charged = {**payload, "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": bps}}
+    offer, release, fee = wallet_offer(charged, offered, out_asset, salt)
+    zero, _, _ = wallet_offer(payload, offered, out_asset, salt)
+    check("  the preview names the fee: the rate on the release", fee == release * bps // 10_000, f"{fee} of {release}")
+    out = attempt(f"wallet-built {label}", {**charged, "offer": offer.to_bech32()})
+    if not out:
+        return None
+    bundle = SpendBundle.from_json_dict(out["bundle"])
+    check("  the trader is paid exactly what they signed for", paid_to(bundle, TRADER_PH, out_asset) == release - fee,
+          f"{paid_to(bundle, TRADER_PH, out_asset)} vs {release - fee}")
+    check("  the router is paid its fee in the payout's asset, and nothing of the entry",
+          paid_to(bundle, ROUTER_PH, out_asset) == fee and paid_to(bundle, ROUTER_PH, entry_asset) == 0,
+          f"{paid_to(bundle, ROUTER_PH, out_asset)} vs {fee}")
+    check("  the whole entry reached the pools: the release matches the uncharged route's",
+          release == int(run({**payload, "offer": zero.to_bech32(), "preview": True})["forge"]["releases"][hx(out_asset)]))
+    check("  details name the wallet-built side and the router's take",
+          out["forge"]["router_fee_side"] == "output-surplus" and int(out["forge"]["router_fee"]) == fee, f"{out['forge'].get('router_fee_side')}")
+    greedy, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=1)
+    attempt(f"wallet-built {label}, asking one mojo more than the release less the fee", {**charged, "offer": greedy.to_bech32()}, expect_ok=False)
+    # In the money past the band (owner, 2026-10-23): a resting offer the market moved past
+    # used to be refused "the price moved; quote again" and never fill. The router takes its
+    # fee (a mojo more only to keep outputs distinct) and the maker gets the improvement.
+    under = fee // 10 + 2 + release // 50
+    moved, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=-under)
+    ahead = attempt(f"wallet-built {label}, in the money past the band", {**charged, "offer": moved.to_bech32()})
+    if ahead:
+        b2 = SpendBundle.from_json_dict(ahead["bundle"])
+        router = paid_to(b2, ROUTER_PH, out_asset)
+        check("  in the money: the router is paid its fee, no more", fee <= router <= fee + 1, f"{router} vs {fee}")
+        check("  in the money: the maker gets the whole release less the router's take",
+              paid_to(b2, TRADER_PH, out_asset) == release - router, f"{paid_to(b2, TRADER_PH, out_asset)} vs {release - router}")
+        names = [c.name() for c in b2.additions()]
+        check("  in the money: every output is a distinct coin", len(set(names)) == len(names))
+    return out
+
+
+def main() -> int:
+    if not drv.v18_available():
+        print("  [skip] V11 puzzles not built"); return 2
+    xa = make([None, T_A], [10_000_000_000, 500_000], [1, 1], salt=0x51)          # XCH/A
+    ab = make([T_A, T_B], [800_000, 600_000], [1, 1], salt=0x52)                   # A/B
+    xb = make([None, T_B], [8_000_000_000, 700_000], [1, 1], salt=0x53)           # XCH/B
+    xa2 = make([None, T_A], [30_000_000_000, 1_400_000], [1, 1], salt=0x54)       # a second XCH/A
+    bc = make([T_B, T_C], [500_000, 900_000], [1, 1], salt=0x55)                   # B/C
+    vault = make([T_A], [2_000_000], [1], salt=0x56)                               # vault of A
+    xlp = make([None, vault.lp_asset_id], [5_000_000_000, 400_000], [1, 1], salt=0x57)   # XCH / vault LP
+    triple = make([None, T_A, T_B], [20_000_000_000, 400_000, 300_000], [2, 1, 1], salt=0x58)
+    fee = {"puzzle_hash": ROUTER_PH.hex(), "bps": 0}
+
+    print("multi-hop XCH -> A -> B (two pools)")
+    gross = 100_000_000
+    o1 = swap_out(xa, 0, 1, gross)
+    o2 = swap_out(ab, 0, 1, o1)
+    hop2 = {"action": "multihop-swap", "pools": [snap(xa), snap(ab)], "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H, "dev_fee": fee}
+    offer, want = exact_offer(hop2, {None: gross}, T_B, salt=0x61)
+    check("  the composer's preview releases what the chain computes", want == o2, f"{want} vs {o2}")
+    out = attempt("2-hop", {**hop2, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  amounts follow the chain", [int(a) for a in out["amounts"]] == [gross, o1, o2], f"{out['amounts']}")
+        # The router is paid on the ENTRY (nothing, at 0 bps), so the trader receives every
+        # mojo the last pool released: exactly what the offer asked for, nothing left over.
+        check("  the whole output reaches the trader", paid_to(bundle, TRADER_PH, T_B) == o2, f"{o2}")
+        check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, T_B) == 0)
+        check("  the intermediate A never reaches anyone", paid_to(bundle, TRADER_PH, T_A) == 0 and paid_to(bundle, ROUTER_PH, T_A) == 0)
+
+    print("a route across revisions: a V14 XCH/A pool then the V18 A/B pool, one bundle (owner, 2026-10-07)")
+    xa14 = kit14.make_pool([None, T_A], [10_000_000_000, 500_000], total_lp=1_000_000, weights=[1, 1], fee_bps=30,
+                           protocol_fee_bps=5, protocol_ph=bytes32(b"\x55" * 32), salt=0x5A, leaves="forge", last_height=H - 10)
+    mixed = {"action": "multihop-swap", "pools": [v14.pool_to_snapshot(xa14), snap(ab)],
+             "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H, "dev_fee": fee}
+    m1 = swap_out(xa14, 0, 1, gross)
+    m2 = swap_out(ab, 0, 1, m1)
+    check("  the V14 snapshot is protocol 15 and the V18 one protocol 19",
+          [int(p["protocol_version"]) for p in mixed["pools"]] == [15, 19])
+    offer_m, want_m = exact_offer(mixed, {None: gross}, T_B, salt=0x5B)
+    check("  the preview across revisions releases what the chain computes", want_m == m2, f"{want_m} vs {m2}")
+    try:
+        out_m = run({**mixed, "offer": offer_m.to_bech32()})
+        check("mixed route: builder accepted", True)
+    except Exception as exc:  # noqa: BLE001
+        out_m = None
+        check("mixed route: builder accepted", False, f"{type(exc).__name__}: {str(exc)[:110]}")
+    if out_m:
+        bundle_m = SpendBundle.from_json_dict(out_m["bundle"])
+        check("  the successors come back one per revision, each rebuilt by its own lane",
+              sorted(int(s["protocol_version"]) for s in out_m["pools"]) == [15, 19]
+              and all((v14 if int(s["protocol_version"]) == 15 else v18).snapshot_to_pool(s).coin.puzzle_hash.hex() == s["pool_coin"]["puzzle_hash"]
+                      for s in out_m["pools"]))
+        check("  amounts follow the chain", [int(a) for a in out_m["amounts"]] == [gross, m1, m2], f"{out_m['amounts']}")
+        check("  the whole output reaches the trader", paid_to(bundle_m, TRADER_PH, T_B) == m2)
+        check("  the bundle validates under the mempool's rules", bool(drv.validate(bundle_m)))
+    if drv17 is None:
+        print("a route across V16, V17 and V18: skipped (no V17 in this tree)")
+    else:
+        print("a route across V16, V17 and V18: XCH -> A on V16, A -> B on V17, B -> C on V18, one bundle")
+        common = dict(total_lp=1_000_000, weights=[1, 1], fee_bps=30, protocol_fee_bps=5, protocol_ph=bytes32(b"U" * 32),
+                      leaves="forge", last_height=H - 10)
+        xa16 = drv16.make_pool([None, T_A], [10_000_000_000, 500_000], salt=0x5C, **common)
+        ab17 = drv17.make_pool([T_A, T_B], [800_000, 600_000], salt=0x5D, **common)
+        tri = {"action": "multihop-swap", "pools": [v16.pool_to_snapshot(xa16), v17.pool_to_snapshot(ab17), snap(bc)],
+               "path": [hx(None), hx(T_A), hx(T_B), hx(T_C)], "current_height": H, "dev_fee": fee}
+        check("  the snapshots are protocols 17, 18 and 19", [int(p["protocol_version"]) for p in tri["pools"]] == [17, 18, 19])
+        check("  the lane is the newest on the route (V18)", forge_v18_lane(tri))
+        t1 = swap_out(xa16, 0, 1, gross)
+        t2 = swap_out(ab17, 0, 1, t1)
+        t3 = swap_out(bc, 0, 1, t2)
+        offer_t, want_t = exact_offer(tri, {None: gross}, T_C, salt=0x5E)
+        check("  the preview across three revisions releases what the chain computes", want_t == t3, f"{want_t} vs {t3}")
+        try:
+            out_t = run({**tri, "offer": offer_t.to_bech32()})
+            check("V16 -> V17 -> V18 route: builder accepted", True)
+        except Exception as exc:  # noqa: BLE001
+            out_t = None
+            check("V16 -> V17 -> V18 route: builder accepted", False, f"{type(exc).__name__}: {str(exc)[:110]}")
+        if out_t:
+            bundle_t = SpendBundle.from_json_dict(out_t["bundle"])
+            lanes = {17: v16, 18: v17, 19: v18}
+            check("  the successors come back one per revision, each rebuilt by its own lane",
+                  sorted(int(s["protocol_version"]) for s in out_t["pools"]) == [17, 18, 19]
+                  and all(lanes[int(s["protocol_version"])].snapshot_to_pool(s).coin.puzzle_hash.hex() == s["pool_coin"]["puzzle_hash"]
+                          for s in out_t["pools"]))
+            check("  amounts follow the chain", [int(a) for a in out_t["amounts"]] == [gross, t1, t2, t3], f"{out_t['amounts']}")
+            check("  the whole output reaches the trader", paid_to(bundle_t, TRADER_PH, T_C) == t3)
+            check("  the intermediates A and B reach no one",
+                  all(paid_to(bundle_t, who, a) == 0 for who in (TRADER_PH, ROUTER_PH) for a in (T_A, T_B)))
+            check("  the bundle validates under the mempool's rules", bool(drv.validate(bundle_t)))
+        # the reverse direction, V18 first: the lane is still the newest one on the route
+        rev = {**tri, "pools": list(reversed(tri["pools"])), "path": list(reversed(tri["path"]))}
+        c0 = 50_000
+        r1 = swap_out(bc, 1, 0, c0)
+        r2 = swap_out(ab17, 1, 0, r1)
+        r3 = swap_out(xa16, 1, 0, r2)
+        offer_r, want_r = exact_offer(rev, {T_C: c0}, None, salt=0x5F)
+        check("  reversed (C -> B -> A -> XCH): the preview releases what the chain computes", want_r == r3, f"{want_r} vs {r3}")
+        try:
+            out_r = run({**rev, "offer": offer_r.to_bech32()})
+            check("V18 -> V17 -> V16 route: builder accepted", True)
+            check("  reversed: the bundle validates", bool(drv.validate(SpendBundle.from_json_dict(out_r["bundle"]))))
+            check("  reversed: the whole output reaches the trader", paid_to(SpendBundle.from_json_dict(out_r["bundle"]), TRADER_PH, None) == r3)
+        except Exception as exc:  # noqa: BLE001
+            check("V18 -> V17 -> V16 route: builder accepted", False, f"{type(exc).__name__}: {str(exc)[:110]}")
+
+    single = {**mixed, "action": "swap", "pool": mixed["pools"][0], "protocol_version": 16}
+    try:
+        forge_stdin._lane_version(single); check("a non-route request that names two revisions is still refused", False, "accepted")
+    except ValueError as exc:
+        check("a non-route request that names two revisions is still refused", "mix" in str(exc))
+
+    # The block above runs the router at 0 bps, which cannot tell a fee that is collected
+    # correctly from a fee that is never collected at all. These run it at a real rate.
+    print("multi-hop with a real router rate: the fee comes off the ENTRY, once")
+    for bps in (30, 300, 1000):
+        charged = {"puzzle_hash": ROUTER_PH.hex(), "bps": bps}
+        entry_fee = gross * bps // 10_000
+        net_in = gross - entry_fee
+        n1 = swap_out(xa, 0, 1, net_in)
+        n2 = swap_out(ab, 0, 1, n1)
+        # the trader's own spend pays the fee beside the entry settlement, which holds the net
+        offer_n, asked = exact_offer({**hop2, "dev_fee": charged}, {None: gross}, T_B, salt=0x70 + (bps % 100), bps=bps)
+        check(f"  {bps} bps: the preview prices the route on the net entry", asked == n2, f"{asked} vs {n2}")
+        out_n = attempt(f"2-hop at {bps} bps", {**hop2, "dev_fee": charged, "offer": offer_n.to_bech32()})
+        if not out_n:
+            continue
+        b = SpendBundle.from_json_dict(out_n["bundle"])
+        check(f"  {bps} bps: the router is paid in the ENTRY asset by the trader's own spend, not out of the output",
+              paid_to(b, ROUTER_PH, None) == entry_fee and paid_to(b, ROUTER_PH, T_B) == 0,
+              f"{paid_to(b, ROUTER_PH, None)} vs {entry_fee}")
+        check(f"  {bps} bps: the route is priced on the NET input",
+              [int(a) for a in out_n["amounts"]] == [net_in, n1, n2], f"{out_n['amounts']}")
+        check(f"  {bps} bps: the trader keeps the whole output", paid_to(b, TRADER_PH, T_B) == n2)
+        check(f"  {bps} bps: the response reports what was actually taken",
+              int(out_n["dev_fee_collected"]) == entry_fee, out_n["dev_fee_collected"])
+        check("  two successors, in input order", [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex(), ab.launcher_id.hex()])
+    attempt("2-hop, greedy trader", {**hop2, "offer": fabricate_offer({None: gross}, {T_B: o2 + 1}, salt=0x62).to_bech32()}, expect_ok=False)
+    attempt("2-hop, a stale quote (one mojo under)", {**hop2, "offer": fabricate_offer({None: gross}, {T_B: o2 - 1}, salt=0x62).to_bech32()},
+            expect_ok=False)
+
+    print("multi-hop XCH -> A -> B -> C (three pools, CAT bridges)")
+    o3 = swap_out(bc, 0, 1, o2)
+    hop3 = {"action": "multihop-swap", "pools": [snap(xa), snap(ab), snap(bc)], "path": [hx(None), hx(T_A), hx(T_B), hx(T_C)],
+            "current_height": H, "dev_fee": fee}
+    offer, want = exact_offer(hop3, {None: gross}, T_C, salt=0x63)
+    check("  the preview follows the chain", want == o3)
+    out = attempt("3-hop", {**hop3, "offer": offer.to_bech32()})
+    if out:
+        check("  amounts follow the chain", [int(a) for a in out["amounts"]] == [gross, o1, o2, o3])
+
+    print("split XCH -> A across two pools")
+    g1, g2 = 60_000_000, 40_000_000
+    s1, s2 = swap_out(xa, 0, 1, g1), swap_out(xa2, 0, 1, g2)
+    split2 = {"action": "split-swap", "current_height": H, "dev_fee": fee,
+              "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": g1},
+                           {"pools": [snap(xa2)], "path": [hx(None), hx(T_A)], "amountIn": g2}]}
+    offer, want = exact_offer(split2, {None: g1 + g2}, T_A, salt=0x64)
+    check("  the preview sums the branches", want == s1 + s2)
+    out = attempt("split", {**split2, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  branch amounts are the declared shares of the offered XCH", [[int(a) for a in b] for b in out["branch_amounts"]] == [[g1, s1], [g2, s2]])
+        check("  total_out is the sum", int(out["total_out"]) == s1 + s2)
+        check("  both branches' output reaches the trader, exactly", paid_to(bundle, TRADER_PH, T_A) == s1 + s2)
+        check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, T_A) == 0)
+    # an equal split would create two identical entry children; the composer nudges the
+    # shares apart by one mojo so the coins differ and the total still matches the offer
+    ge = 50_000_000
+    se = swap_out(xa, 0, 1, ge + 1) + swap_out(xa2, 0, 1, ge - 1)
+    spliteq = {"action": "split-swap", "current_height": H, "dev_fee": fee,
+               "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": ge},
+                            {"pools": [snap(xa2)], "path": [hx(None), hx(T_A)], "amountIn": ge}]}
+    offer_eq, want_eq = exact_offer(spliteq, {None: 2 * ge}, T_A, salt=0x6A)
+    check("  the preview prices the nudged shares", want_eq == se)
+    out = attempt("equal split", {**spliteq, "offer": offer_eq.to_bech32()})
+    if out:
+        check("  equal shares were nudged apart by a mojo, total preserved",
+              [int(b[0]) for b in out["branch_amounts"]] == [ge + 1, ge - 1], f"{out['branch_amounts']}")
+    attempt("split sharing a pool", {"action": "split-swap", "offer": offer.to_bech32(), "current_height": H,
+                                     "branches": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": g1},
+                                                  {"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": g2}]}, expect_ok=False)
+
+    print("split with a CAT entry (A -> B directly and A -> XCH -> B)")
+    ga1, ga2 = 30_000, 20_000
+    b1 = swap_out(ab, 0, 1, ga1)
+    x2 = swap_out(xa, 1, 0, ga2)
+    b2 = swap_out(xb, 0, 1, x2)
+    splitc = {"action": "split-swap", "current_height": H, "dev_fee": fee,
+              "branches": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": ga1},
+                           {"pools": [snap(xa), snap(xb)], "path": [hx(T_A), hx(None), hx(T_B)], "amountIn": ga2}]}
+    offer, want = exact_offer(splitc, {T_A: ga1 + ga2}, T_B, salt=0x65)
+    check("  the preview sums both branches", want == b1 + b2)
+    out = attempt("CAT split", {**splitc, "offer": offer.to_bech32()})
+    if out:
+        check("  branch amounts", [[int(a) for a in b] for b in out["branch_amounts"]] == [[ga1, b1], [ga2, x2, b2]])
+
+    print("vault route: XCH -> vault LP on the LP pool, redeemed in the vault")
+    gross = 50_000_000
+    lp_out = swap_out(xlp, 0, 1, gross)
+    vf = forge_math.vault_fee_bps(1, 10, vault.fee_bps)
+    redeemed = forge_math.withdrawal_amounts(vault.state[0], lp_out, vault.state[1], vf)[0]
+    vroute = {"action": "vault-route", "current_height": H, "dev_fee": fee, "swapPool": snap(xlp), "assetIn": hx(None), "vault": snap(vault)}
+    offer, want = exact_offer(vroute, {None: gross}, T_A, salt=0x66)
+    check("  the preview is the redeemed amount", want == redeemed)
+    out = attempt("vault route", {**vroute, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  swap_out and redeemed as quoted", int(out["swap_out"]) == lp_out and int(out["redeemed"]) == redeemed, f"{out['swap_out']} LP -> {out['redeemed']}")
+        check("  the redeemed amount reaches the trader in full", paid_to(bundle, TRADER_PH, T_A) == redeemed)
+        check("  the vault's LP supply fell by the burn", int(out["pools"][1]["state"]["total_lp"]) == vault.state[1] - lp_out)
+
+    print("wrap: XCH -> A on xa, the A deposited into the vault mid-route, its LP sold for XCH on xlp")
+    offered_x = 300_000_000
+    gross_w, backing = v18r.wrap_backing([xa, vault, xlp], [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], offered_x)
+    a_out, lp_mint, x_back = v18r.simulate_chain([xa, vault, xlp], [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], gross_w)
+    check("  the fixed point splits the offered XCH into entry and backing", gross_w + backing == offered_x and backing == lp_mint,
+          f"gross {gross_w} backing {backing} mint {lp_mint}")
+    wroute = {"action": "multihop-swap", "pools": [snap(xa), snap(vault), snap(xlp)],
+              "path": [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee}
+    offer, want_w = exact_offer(wroute, {None: offered_x}, None, salt=0x6b)
+    check("  the preview is the XCH the LP pool releases", want_w == x_back, f"{want_w} vs {x_back}")
+    out = attempt("wrap route", {**wroute, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  amounts follow the chain: entry, A, LP minted, XCH back", [int(a) for a in out["amounts"]] == [gross_w, a_out, lp_mint, x_back], f"{out['amounts']}")
+        check("  the wrap reports its deposit, mint and backing",
+              int(out["wrap"]["deposit"]) == a_out and int(out["wrap"]["minted"]) == lp_mint and int(out["wrap"]["leftover_xch"]) == 0, f"{out['wrap']}")
+        check("  the whole XCH output reaches the trader", paid_to(bundle, TRADER_PH, None) == x_back)
+        check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, None) == 0)
+        check("  no LP leaves the route", paid_to(bundle, TRADER_PH, vault.lp_asset_id) == 0 and paid_to(bundle, ROUTER_PH, vault.lp_asset_id) == 0)
+
+        check("  successors in path order", [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex(), vault.launcher_id.hex(), xlp.launcher_id.hex()])
+        vault_after = out["pools"][1]["state"]
+        check("  the vault holds the deposit and minted the LP",
+              [int(r) for r in vault_after["reserves"]] == [vault.state[0][0] + a_out] and int(vault_after["total_lp"]) == vault.state[1] + lp_mint,
+              f"{vault_after['reserves']} lp {vault_after['total_lp']}")
+        xlp_after = out["pools"][2]["state"]
+        x0, l0 = xlp.state[0]
+        gross_x = forge_math.swap_output(l0, x0, lp_mint, xlp.fee_bps, xlp.weights[1], xlp.weights[0])
+        check("  the LP pool took the minted LP and released the XCH", [int(r) for r in xlp_after["reserves"]] == [x0 - gross_x, l0 + lp_mint], f"{xlp_after['reserves']}")
+
+    # The same wrap route WITH the router charging. The fee is paid by the trader's own spend
+    # beside the entry settlement (F3, 2026-10-07), so the settlement holds the net and the
+    # split between the entry and the wrap's backing is taken on exactly that: nothing is
+    # carved from the hub any more. (Until then the split had to be fee-aware, found on
+    # 2026-09-16 when a 30,000,000 offer at 300 bps came up 56 mojos short.)
+    print("wrap route with the router charging: the fee is paid beside the entry, the split is on the net")
+    charged_w = {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}
+    wpath = [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None)]
+    fee_c = offered_x * 300 // 10_000
+    spend_c = offered_x - fee_c
+    gross_c, backing_c = v18r.wrap_backing([xa, vault, xlp], wpath, spend_c)
+    a_c, mint_c, back_c = v18r.simulate_chain([xa, vault, xlp], wpath, gross_c)
+    check("  the two declared shares use up the net entry",
+          gross_c + backing_c == spend_c, f"gross {gross_c} backing {backing_c} net {spend_c}")
+    check("  the backing covers the mint of the entry's share", backing_c >= mint_c, f"backing {backing_c} vs mint {mint_c}")
+    offer, want_c = exact_offer({**wroute, "dev_fee": charged_w}, {None: offered_x}, None, salt=0x6c, bps=300)
+    check("  the preview is the XCH released plus the backing left over from the mint",
+          want_c == back_c + (backing_c - mint_c), f"{want_c} vs {back_c} + {backing_c - mint_c}")
+    out = attempt("wrap route, router charging", {**wroute, "dev_fee": charged_w, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        amts = [int(a) for a in out["amounts"]]
+        check("  the entry is the declared gross of the net settlement", amts[0] == gross_c, f"builder {amts[0]} vs {gross_c}")
+        check("  the router is paid its cut of the whole entry, once, by the trader's own spend",
+              paid_to(bundle, ROUTER_PH, None) == fee_c, f"{paid_to(bundle, ROUTER_PH, None)} vs {fee_c}")
+        check("  the trader is paid exactly the route's output, the leftover backing included",
+              paid_to(bundle, TRADER_PH, None) == want_c and amts[-1] == back_c,
+              f"trader {paid_to(bundle, TRADER_PH, None)}, route out {amts[-1]}, offline {back_c}")
+        check("  successors in path order (charged)",
+              [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex(), vault.launcher_id.hex(), xlp.launcher_id.hex()])
+        vc = out["pools"][1]["state"]
+        check("  the vault holds the deposit and minted the LP the route then sold",
+              [int(r) for r in vc["reserves"]] == [vault.state[0][0] + amts[1]] and int(vc["total_lp"]) == vault.state[1] + amts[2],
+              f"{vc['reserves']} lp {vc['total_lp']}")
+        check("  no LP leaves the charged route",
+              paid_to(bundle, TRADER_PH, vault.lp_asset_id) == 0 and paid_to(bundle, ROUTER_PH, vault.lp_asset_id) == 0)
+    attempt("wrapping the wrong asset into the vault", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xb), snap(vault), snap(xlp)],
+                                                        "path": [hx(None), hx(T_B), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee}, expect_ok=False)
+    attempt("a wrap with no XCH to back it", {"action": "multihop-swap", "offer": fabricate_offer({T_A: 50_000}, {None: 1}, salt=0x6c).to_bech32(),
+                                              "pools": [snap(vault), snap(xlp)], "path": [hx(T_A), hx(vault.lp_asset_id), hx(None)], "current_height": H, "dev_fee": fee}, expect_ok=False)
+    print("wrap as the entry: the trader offers A plus the backing, and is paid XCH")
+    dep_a = 50_000
+    lp_mint2, x_back2 = v18r.simulate_chain([vault, xlp], [hx(T_A), hx(vault.lp_asset_id), hx(None)], dep_a)
+    wentry = {"action": "multihop-swap", "pools": [snap(vault), snap(xlp)], "path": [hx(T_A), hx(vault.lp_asset_id), hx(None)],
+              "current_height": H, "dev_fee": fee}
+    offer, want_e = exact_offer(wentry, {T_A: dep_a, None: lp_mint2 + 777}, None, salt=0x6d)
+    check("  the preview is the XCH released plus the 777 over-supplied", want_e == x_back2 + 777, f"{want_e}")
+    out = attempt("wrap entry", {**wentry, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  the whole offered A is wrapped", int(out["wrap"]["deposit"]) == dep_a and int(out["wrap"]["minted"]) == lp_mint2)
+        # The 777 mojos the trader over-supplied above the mint's backing are theirs: they
+        # leave with the output, inside the group the trader signed for.
+        check("  XCH beyond the backing comes back to the TRADER with the output",
+              int(out["wrap"]["leftover_xch"]) == 777
+              and paid_to(bundle, TRADER_PH, None) == x_back2 + 777
+              and paid_to(bundle, ROUTER_PH, None) == 0,
+              f"trader {paid_to(bundle, TRADER_PH, None)} of {x_back2 + 777}")
+
+    # The same wrap entry WITH the router charging. The case above runs at 0 bps, where
+    # "the whole offered A is wrapped" holds trivially. Charging, the entry hub carves the
+    # fee out of the offered A before the vault sees it -- while the XCH backing is taken
+    # from the offer directly and is NOT charged. A quote that wraps the whole A (the TS
+    # mirror did, pinned by wrapRoute.check) promises a mint the vault never makes, and an
+    # offer sized from it is refused. Found 2026-10-02 reading the lane after the same
+    # mismatch on plain multi-hop paths ("route releases 142 ... asks 143").
+    print("wrap as the entry with the router charging: the fee comes off the A, not the backing")
+    charged_e = {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}
+    net_a = dep_a - dep_a * 300 // 10_000
+    lp_net, x_net = v18r.simulate_chain([vault, xlp], [hx(T_A), hx(vault.lp_asset_id), hx(None)], net_a)
+    offer, want_n = exact_offer({**wentry, "dev_fee": charged_e}, {T_A: dep_a, None: lp_net}, None, salt=0x6e, bps=300, fee_asset=T_A)
+    check("  the preview prices the wrap on the net A", want_n == x_net, f"{want_n} vs {x_net}")
+    out = attempt("wrap entry, router charging", {**wentry, "dev_fee": charged_e, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  the vault receives the A less the router's cut, and mints on that",
+              int(out["wrap"]["deposit"]) == net_a and int(out["wrap"]["minted"]) == lp_net,
+              f"{out['wrap']} vs deposit {net_a} mint {lp_net}")
+        check("  the router is paid in A, its cut of the entry, by the trader's own spend, and nothing in XCH",
+              paid_to(bundle, ROUTER_PH, T_A) == dep_a * 300 // 10_000 and paid_to(bundle, ROUTER_PH, None) == 0,
+              f"A {paid_to(bundle, ROUTER_PH, T_A)} XCH {paid_to(bundle, ROUTER_PH, None)}")
+        check("  the backing is exactly the net mint: none of it is charged, none left over",
+              int(out["wrap"]["leftover_xch"]) == 0, f"{out['wrap']}")
+    # An offer that pays no router fee at all, with the router charging, is refused.
+    offer = fabricate_offer({T_A: dep_a, None: lp_mint2}, {None: x_back2}, salt=0x6f)
+    attempt("an offer paying no router fee, router charging", {**wentry, "dev_fee": charged_e, "offer": offer.to_bech32()}, expect_ok=False)
+    # Wallet-built wraps paid in a CAT (owner, 2026-10-23: every trade a Sage offer). The offer
+    # carries the CAT and the XCH backing, both whole and uncharged; the backing covers the mint
+    # of the WHOLE CAT, and the router's fee comes off the payout. The page sizes it from the
+    # quote rebuilt with the fee suspended (forgeAdapter.walletBuiltOffered).
+    wallet_case("wrap entry A + backing -> XCH", {k: v for k, v in wentry.items() if k != "dev_fee"},
+                {T_A: dep_a, None: lp_mint2}, None, 0x9E, 300, entry_asset=T_A)
+    dep_b = 30_000
+    a_mid, lp_b = v18r.simulate_chain([ab, vault], [hx(T_B), hx(T_A), hx(vault.lp_asset_id)], dep_b)
+    bwrap = {"action": "multihop-swap", "pools": [snap(ab), snap(vault)], "path": [hx(T_B), hx(T_A), hx(vault.lp_asset_id)],
+             "current_height": H}
+    wallet_case("B -> A -> wrap, B + backing -> vault LP", bwrap, {T_B: dep_b, None: lp_b}, vault.lp_asset_id, 0x9F, 300,
+                entry_asset=T_B)
+
+    print("revisiting route: XCH -> A on xa, wrapped in the vault, the LP sold for XCH on xlp, that XCH buying A again on xa2")
+    rpools = [xa, vault, xlp, xa2]
+    rpath = [hx(None), hx(T_A), hx(vault.lp_asset_id), hx(None), hx(T_A)]
+    offered_r = 400_000_000
+    gross_r, backing_r = v18r.wrap_backing(rpools, rpath, offered_r)
+    outs_r = v18r.simulate_chain(rpools, rpath, gross_r)
+    rroute = {"action": "multihop-swap", "pools": [snap(p) for p in rpools], "path": rpath, "current_height": H, "dev_fee": fee}
+    offer, want_r = exact_offer(rroute, {None: offered_r}, T_A, salt=0x6e)
+    check("  the preview is the second pass's output", want_r == outs_r[-1], f"{want_r} vs {outs_r[-1]}")
+    out = attempt("revisiting route", {**rroute, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        check("  amounts follow the chain through both passes", [int(a) for a in out["amounts"]] == [gross_r, *outs_r], f"{out['amounts']}")
+        check("  the second pass's whole output reaches the trader", paid_to(bundle, TRADER_PH, T_A) == outs_r[-1])
+        check("  the router takes nothing out of the output", paid_to(bundle, ROUTER_PH, T_A) == 0)
+        check("  the XCH released mid-route reached xa2, not the trader", paid_to(bundle, TRADER_PH, None) == 0 and paid_to(bundle, ROUTER_PH, None) == 0)
+        check("  four successors in path order", [s["launcher_id"] for s in out["pools"]] == [p.launcher_id.hex() for p in rpools])
+        xa2_after = out["pools"][3]["state"]
+        check("  xa2 took the released XCH", int(xa2_after["reserves"][0]) == xa2.state[0][0] + outs_r[2], f"{xa2_after['reserves']}")
+    attempt("a chain leg fed the wrong asset", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), snap(bc)],
+                                                 "path": [hx(None), hx(T_A), hx(T_C)], "current_height": H, "dev_fee": fee}, expect_ok=False)
+
+    print("flow: a triangle XCH -> A -> B -> XCH with the entry rescaled to the offer")
+    gross = 200_000_000
+    fa = swap_out(xa, 0, 1, gross)
+    fb = swap_out(ab, 0, 1, fa)
+    fx = swap_out(xb, 1, 0, fb)
+    tri = {"action": "flow-balance", "current_height": H, "startAsset": hx(None),
+           "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": gross // 2},
+                    {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": 1},
+                    {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": 1}]}
+    offer, want_t = exact_offer(tri, {None: gross}, None, salt=0x67)
+    check("  the preview is the XCH the triangle returns", want_t == fx, f"{want_t} vs {fx}")
+    out = attempt("triangle flow", {**tri, "offer": offer.to_bech32()})
+    if out:
+        check("  legs re-derived in order", [[int(a), int(b)] for a, b in out["leg_amounts"]] == [[gross, fa], [fa, fb], [fb, fx]], f"{out['leg_amounts']}")
+        check("  total_out is the XCH released", int(out["total_out"]) == fx)
+
+    print("flow: a merge and a pool crossed twice (two actions in one spend)")
+    # XCH splits into A (via xa) and B (via xb); A -> B on ab; both B streams merge into xb back to XCH,
+    # so xb is crossed twice (XCH->B, then B->XCH on its post-swap state).
+    gx = 300_000_000
+    d1, d2 = 2, 1
+    ga, gb = gx * d1 // 3, gx * d2 // 3
+    a_out = swap_out(xa, 0, 1, ga)
+    b_from_xb = swap_out(xb, 0, 1, gb)
+    b_from_ab = swap_out(ab, 0, 1, a_out)
+    merge = {"action": "flow-balance", "current_height": H, "startAsset": hx(None),
+             "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": d1},
+                      {"pool": snap(xb), "assetIn": hx(None), "assetOut": hx(T_B), "amountIn": d2},
+                      {"pool": snap(ab), "assetIn": hx(T_A), "assetOut": hx(T_B), "amountIn": 1},
+                      {"pool": snap(xb), "assetIn": hx(T_B), "assetOut": hx(None), "amountIn": 1}]}
+    offer, _want_m = exact_offer(merge, {None: gx}, None, salt=0x68)
+    out = attempt("merge flow", {**merge, "offer": offer.to_bech32()})
+    if out:
+        legs = [[int(a), int(b)] for a, b in out["leg_amounts"]]
+        check("  entry legs got their declared shares", legs[0][0] == ga and legs[1][0] == gb, f"{legs}")
+        check("  the merged leg drank both B streams", legs[3][0] == b_from_xb + b_from_ab)
+        check("  one successor per distinct pool", len(out["pools"]) == 3)
+        xb_after = next(s for s in out["pools"] if s["launcher_id"] == xb.launcher_id.hex())
+        # first crossing: XCH in (gb), B out (honest1); second: B in (legs[3][0]), XCH out (honest2) priced on the first's state
+        x0, b0 = xb.state[0]
+        honest1 = forge_math.swap_output(x0, b0, gb, xb.fee_bps, xb.weights[0], xb.weights[1])
+        honest2 = forge_math.swap_output(b0 - honest1, x0 + gb, legs[3][0], xb.fee_bps, xb.weights[1], xb.weights[0])
+        check("  the twice-crossed pool's reserves reflect both actions",
+              [int(x) for x in xb_after["state"]["reserves"]] == [x0 + gb - honest2, b0 - honest1 + legs[3][0]],
+              f"{xb_after['state']['reserves']}")
+    attempt("flow repeating a pair", {"action": "flow-balance", "offer": offer.to_bech32(), "current_height": H, "startAsset": hx(None),
+                                      "legs": [{"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": 1},
+                                               {"pool": snap(xa), "assetIn": hx(None), "assetOut": hx(T_A), "amountIn": 1}]}, expect_ok=False)
+
+    print("routed deposit: uneven XCH + A into the triple, selling part of the A into B first")
+    dep_x, dep_a, sell_a = 2_000_000_000, 80_000, 30_000
+    b_bought = swap_out(ab, 0, 1, sell_a)
+    deposits = [0, dep_a - sell_a, b_bought]
+    # the XCH deposit is what is left of the offered XCH after the backing
+    mint = forge_math.invariant_lp_mint(triple.state[0], [dep_x, *deposits[1:]], triple.state[1], triple.fee_bps, triple.weights, version=10)
+    rdep = {"action": "routed-deposit", "current_height": H, "pool": snap(triple),
+            "sales": [{"pools": [snap(ab)], "path": [hx(T_A), hx(T_B)], "amountIn": sell_a}], "dev_fee": fee}
+    offer, want_d = exact_offer(rdep, {None: dep_x + mint, T_A: dep_a}, triple.lp_asset_id, salt=0x69)
+    check("  the preview is the mint", want_d == mint, f"{want_d} vs {mint}")
+    # the same preview sized from amounts alone, a probe standing in for the offer: what
+    # the page asks for before the wallet has built anything
+    probe_out = run({**rdep, "preview": True, "probe": {"offered": {hx(None): str(dep_x + mint), hx(T_A): str(dep_a)},
+                                                          "requested": [hx(triple.lp_asset_id)]}})
+    check("  a preview from a probe (no offer) reports the same mint", int(probe_out["minted"]) == mint
+          and probe_out.get("preview") is True and "bundle" not in probe_out, f"{probe_out.get('minted')} vs {mint}")
+    out = attempt("routed deposit", {**rdep, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        minted = int(out["minted"])
+        check("  the sale bought B for the deposit", [int(a) for a in out["sale_outputs"]] == [b_bought])
+        check("  deposits: the unsold A, the bought B, and XCH net of backing",
+              int(out["deposits"][hx(T_A)]) == dep_a - sell_a and int(out["deposits"][hx(T_B)]) == b_bought
+              and int(out["deposits"][hx(None)]) + minted == dep_x + mint, f"{out['deposits']} minted {minted}")
+        check("  the whole mint reaches the depositor", paid_to(bundle, TRADER_PH, triple.lp_asset_id) == minted == want_d)
+        check("  the router takes no LP", paid_to(bundle, ROUTER_PH, triple.lp_asset_id) == 0)
+        check("  successors: the sale pool then the target", [s["launcher_id"] for s in out["pools"]] == [ab.launcher_id.hex(), triple.launcher_id.hex()])
+        check("  target snapshot grew total_lp by the mint", int(out["target"]["state"]["total_lp"]) == triple.state[1] + minted)
+
+    print("zap: XCH only into xa, part of it swapped into A inside the same pool, then the add")
+    zap_x, zap_swap = 3_000_000_000, 1_000_000_000
+    x0, a0 = xa.state[0]
+    gross_a = forge_math.swap_output(x0, a0, zap_swap, xa.fee_bps, xa.weights[0], xa.weights[1])
+    a_out = gross_a - gross_a * xa.protocol_fee_bps // 10_000
+    post = [x0 + zap_swap, a0 - gross_a]
+    est = forge_math.invariant_lp_mint(post, [zap_x - zap_swap, a_out], xa.state[1], xa.fee_bps, xa.weights, version=10)
+    zap = {"action": "routed-deposit", "current_height": H, "pool": snap(xa),
+           "sales": [{"pools": [snap(xa)], "path": [hx(None), hx(T_A)], "amountIn": zap_swap}], "dev_fee": fee}
+    offer, want_z = exact_offer(zap, {None: zap_x + est}, xa.lp_asset_id, salt=0x6a)
+    out = attempt("zap through the target", {**zap, "offer": offer.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        minted = int(out["minted"])
+        check("  one pool, one successor", [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex()])
+        check("  the swap bought A at the pool's own rate", [int(a) for a in out["sale_outputs"]] == [a_out])
+        check("  deposits: the bought A and the XCH left after the swap and the backing",
+              int(out["deposits"][hx(T_A)]) == a_out and int(out["deposits"][hx(None)]) + minted == zap_x + est - zap_swap,
+              f"{out['deposits']} minted {minted}")
+        check("  the mint is priced on the post-swap state", minted == forge_math.invariant_lp_mint(
+            post, [zap_x + est - zap_swap - minted, a_out], xa.state[1], xa.fee_bps, xa.weights, version=10), f"{minted} vs {est}")
+        check("  the whole mint reaches the depositor, as the preview said", paid_to(bundle, TRADER_PH, xa.lp_asset_id) == minted == want_z)
+        check("  the router takes no LP", paid_to(bundle, ROUTER_PH, xa.lp_asset_id) == 0)
+        after = out["target"]["state"]
+        check("  reserves reflect swap then add", [int(r) for r in after["reserves"]] == [post[0] + int(out["deposits"][hx(None)]), post[1] + a_out],
+              f"{after['reserves']}")
+        check("  the protocol fee on the swap is owed", [int(f) for f in after["fees_owed"]] == [0, gross_a - a_out], f"{after['fees_owed']}")
+        check("  total_lp grew by the mint", int(after["total_lp"]) == xa.state[1] + minted)
+
+    # Wallet-built offers (owner, 2026-10-10): every route's offer made by the trader's own
+    # wallet, so it shows in Sage, the router's fee taken off the final payout.
+    wallet_case("multi-hop XCH -> A -> B", hop2, {None: 100_000_000}, T_B, 0x91, 300)
+    wallet_case("multi-hop XCH -> A -> B -> C", hop3, {None: 100_000_000}, T_C, 0x92, 42)
+    wallet_case("split XCH -> A", split2, {None: 100_000_000}, T_A, 0x93, 100)
+    # Branch amounts that do not divide the entry evenly (mainnet, 2026-10-12): the floored
+    # shares fell a mojo short of the hub, the preview passed and settlement refused with
+    # "the 00000000 hub holds 1 more than the offer asks for". The shortfall now goes to
+    # the largest branch, so preview and settlement agree to the mojo.
+    odd = {**split2, "branches": [{**split2["branches"][0], "amountIn": 62_812_502},
+                                  {**split2["branches"][1], "amountIn": 36_767_497}]}
+    wallet_case("split XCH -> A, branch shares that do not divide the entry", odd, {None: 100_000_001}, T_A, 0x97, 300)
+    # A route's CAT payout so small the fee floors to 0 (see the offer lane): no router coin.
+    wallet_case("multi-hop XCH -> A -> B, a payout whose fee floors to 0", hop2, {None: 1_000_000}, T_B, 0x98, 42)
+    wallet_case("vault route XCH -> LP -> A", vroute, {None: 50_000_000}, T_A, 0x94, 300)
+    wallet_case("multi-hop B -> A -> XCH (fee in XCH)", {**hop2, "pools": [snap(ab), snap(xa)], "path": [hx(T_B), hx(T_A), hx(None)]},
+                {T_B: 20_000}, None, 0x95, 300, entry_asset=T_B)
+    # An exempt wallet (0 bps) pays nothing either way: its plain offer settles exactly.
+    plain, release0, fee0 = wallet_offer(hop2, {None: 100_000_000}, T_B, 0x96)
+    check("wallet-built at 0 bps: no fee is sized", fee0 == 0, f"{fee0}")
+    out0 = attempt("wallet-built at 0 bps", {**hop2, "offer": plain.to_bech32()})
+    if out0:
+        check("  the trader receives the whole release", paid_to(SpendBundle.from_json_dict(out0["bundle"]), TRADER_PH, T_B) == release0)
+
+    # Zaps in the Swap tab (owner, 2026-10-11): one asset in, a pool's LP out, and back.
+    # Zap in is the target's own join (a routed deposit with no sales); zap out burns the
+    # LP for every reserve and swaps the others into the one asked for, in the same spend.
+    print("zap out: LP in, one asset out, the remove and the swap in one spend of the pool")
+    burn = xa.state[1] // 50
+    zap_x = {"action": "zap-out", "current_height": H, "pool": snap(xa), "assetOut": hx(None)}
+    zap_a = {**zap_x, "assetOut": hx(T_A)}
+    zx0, za0 = xa.state[0]
+    payout = forge_math.withdrawal_amounts(xa.state[0], burn, xa.state[1], 0)
+    post_rm = [zx0 - payout[0], za0 - payout[1]]
+    gross_x = forge_math.swap_output(post_rm[1], post_rm[0], payout[1], xa.fee_bps, xa.weights[1], xa.weights[0])
+    x_net = gross_x - gross_x * xa.protocol_fee_bps // 10_000 - gross_x * xa.state[5] // 10_000
+    offer_zx, want_zx = exact_offer(zap_x, {xa.lp_asset_id: burn}, None, salt=0x71)
+    check("  the preview releases the removed XCH plus the A swapped back at the post-remove state",
+          want_zx == payout[0] + x_net, f"{want_zx} vs {payout[0]} + {x_net}")
+    out = attempt("zap out to XCH, exact offer", {**zap_x, "offer": offer_zx.to_bech32()})
+    if out:
+        bundle = SpendBundle.from_json_dict(out["bundle"])
+        after = out["pools"][0]["state"]
+        check("  one pool, one successor", [s["launcher_id"] for s in out["pools"]] == [xa.launcher_id.hex()])
+        check("  the trader receives exactly the release, all in XCH", paid_to(bundle, TRADER_PH, None) == want_zx)
+        check("  no A leaves the pool", paid_to(bundle, TRADER_PH, T_A) == 0)
+        check("  total_lp fell by the burn", int(after["total_lp"]) == xa.state[1] - burn, f"{after['total_lp']}")
+        check("  A's reserve is back where the remove took it from, plus the swap's input",
+              int(after["reserves"][1]) == post_rm[1] + payout[1], f"{after['reserves']}")
+    wallet_case("zap out LP -> XCH", zap_x, {xa.lp_asset_id: burn}, None, 0x72, 300, entry_asset=xa.lp_asset_id)
+    wallet_case("zap out LP -> A", zap_a, {xa.lp_asset_id: burn}, T_A, 0x73, 100, entry_asset=xa.lp_asset_id)
+    attempt("zap out of a vault's LP (a vault redeems instead)",
+            {"action": "zap-out", "current_height": H, "pool": snap(vault), "assetOut": hx(T_A),
+             "offer": fabricate_offer({vault.lp_asset_id: 1000}, {T_A: 1}, salt=0x74).to_bech32()}, expect_ok=False)
+    attempt("zap out to an asset the pool does not hold",
+            {**zap_x, "assetOut": hx(T_B), "offer": fabricate_offer({xa.lp_asset_id: burn}, {T_B: 1}, salt=0x75).to_bech32()},
+            expect_ok=False)
+
+    print("zap in: one asset in, the target's own join mints the LP")
+    zap_in = {"action": "routed-deposit", "current_height": H, "pool": snap(xa), "sales": []}
+    wallet_case("zap in XCH -> LP", zap_in, {None: 2_000_000_000}, xa.lp_asset_id, 0x76, 300)
+    wallet_case("zap in A -> LP (XCH for the backing only)", zap_in, {T_A: 20_000, None: 5_000_000}, xa.lp_asset_id, 0x77, 42,
+                entry_asset=T_A)
+
+    # A pool without XCH (owner, 2026-10-12: XCH -> the LOVE/SPROUT LP found no route): the
+    # XCH is sold into A on xa and into B on xb, both deposited in A/B, the rest backs the mint.
+    print("zap in to a pool without XCH: two sales and the add, the rest exactly the backing")
+    zap_ab = {"action": "zap-in", "current_height": H, "pool": snap(ab), "pools": [snap(xa), snap(xb)]}
+    for x_in, salt in ((1_000_000_000, 0x78), (3_333_333_337, 0x79), (250_000_001, 0x7A)):
+        offer_ab, want_ab = exact_offer({**zap_ab, "dev_fee": fee}, {None: x_in}, ab.lp_asset_id, salt=salt)
+        out = attempt(f"zap in {x_in} XCH -> A/B LP", {**zap_ab, "dev_fee": fee, "offer": offer_ab.to_bech32()})
+        if not out:
+            continue
+        sales, minted = [int(a) for a in out["sales"]], int(out["minted"])
+        check("  the sales and the backing spend the offered XCH exactly", sum(sales) + minted == x_in, f"{sales} + {minted}")
+        deps = [int(out["deposits"][hx(T_A)]), int(out["deposits"][hx(T_B)])]
+        r_ab = ab.state[0]
+        check("  the deposit sits on the pool's ratio within a mojo of each sale",
+              abs(deps[0] * r_ab[1] - deps[1] * r_ab[0]) <= max(r_ab), f"{deps} vs {r_ab}")
+        check("  the trader gets the LP the preview named", minted == want_ab and
+              paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, ab.lp_asset_id) == want_ab)
+        check("  three successors: both XCH pools and the target", len(out["pools"]) == 3)
+    wallet_case("zap in XCH -> A/B LP", zap_ab, {None: 2_000_000_000}, ab.lp_asset_id, 0x7B, 300)
+    attempt("zap in to a pool without XCH, the sale pools swapped", {**zap_ab, "pools": [snap(xb), snap(xa)],
+            "offer": fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: 1}, salt=0x7C).to_bech32()}, expect_ok=False)
+    attempt("zap in to a pool without XCH, an offer bringing A too", {**zap_ab,
+            "offer": fabricate_offer({None: 1_000_000_000, T_A: 5_000}, {ab.lp_asset_id: 1}, salt=0x7D).to_bech32()}, expect_ok=False)
+    wallet_case("zap-in lane, XCH into a pool holding XCH (its own join)", {**zap_ab, "pool": snap(xa), "pools": []},
+                {None: 2_000_000_000}, xa.lp_asset_id, 0x9D, 300)
+    attempt("zap in to a pool holding XCH, naming sale pools", {**zap_ab, "pool": snap(xa),
+            "offer": fabricate_offer({None: 1_000_000_000}, {xa.lp_asset_id: 1}, salt=0x7E).to_bech32()}, expect_ok=False)
+    # The CAT-in zap (owner, 2026-10-12): every LP mojo needs an XCH mojo of bundle value, so
+    # some of the CAT is sold for XCH inside the bundle; the offer carries the CAT alone.
+    print("CAT zap into a pool holding XCH: a small sale on the pool for the backing, then the join")
+    zap_cat = {"action": "zap-in", "current_height": H, "pool": snap(xa), "pools": []}
+    for a_in, salt in ((20_000, 0x90), (3_333, 0x91), (150_000, 0x92)):
+        offer_c, want_c = exact_offer({**zap_cat, "dev_fee": fee}, {T_A: a_in}, xa.lp_asset_id, salt=salt)
+        out = attempt(f"zap in {a_in} A -> XCH/A LP", {**zap_cat, "dev_fee": fee, "offer": offer_c.to_bech32()})
+        if not out:
+            continue
+        sold, minted = int(out["sales"][0]), int(out["minted"])
+        deps = {k: int(v) for k, v in out["deposits"].items()}
+        check("  the rest of A is deposited, and the sale's XCH is the backing plus the XCH deposit",
+              deps[hx(T_A)] == a_in - sold and deps[hx(None)] + minted == int(out["sale_outputs"][0]),
+              f"sold {sold}, deposits {deps}, minted {minted}")
+        check("  the sale is small: most of A goes in through the join", sold * 4 < a_in, f"{sold} of {a_in}")
+        check("  the trader gets the LP the preview named", minted == want_c
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa.lp_asset_id) == want_c)
+        check("  one pool, one successor", len(out["pools"]) == 1)
+    wallet_case("CAT zap in A -> XCH/A LP", zap_cat, {T_A: 20_000}, xa.lp_asset_id, 0x93, 300, entry_asset=T_A)
+    attempt("CAT zap into a pool holding XCH, naming sale pools", {**zap_cat, "pools": [snap(xa2)],
+            "offer": fabricate_offer({T_A: 20_000}, {xa.lp_asset_id: 1}, salt=0x94).to_bech32()}, expect_ok=False)
+    attempt("CAT zap paying an asset the pool does not hold", {**zap_cat,
+            "offer": fabricate_offer({T_B: 20_000}, {xa.lp_asset_id: 1}, salt=0x95).to_bech32()}, expect_ok=False)
+    attempt("CAT zap of a single mojo (nothing left to back the mint)", {**zap_cat,
+            "offer": fabricate_offer({T_A: 1}, {xa.lp_asset_id: 1}, salt=0x96).to_bech32()}, expect_ok=False)
+
+    print("CAT zap into a pool without XCH: A sold for XCH, some XCH for B, both deposited, the rest the backing")
+    for a_in, salt in ((40_000, 0x98), (7_777, 0x99), (123_457, 0x9A)):
+        offer_c, want_c = exact_offer({**zap_ab, "dev_fee": fee}, {T_A: a_in}, ab.lp_asset_id, salt=salt)
+        out = attempt(f"zap in {a_in} A -> A/B LP", {**zap_ab, "dev_fee": fee, "offer": offer_c.to_bech32()})
+        if not out:
+            continue
+        s_a, y = (int(v) for v in out["sales"])
+        x_out, b_out = (int(v) for v in out["sale_outputs"])
+        minted = int(out["minted"])
+        deps = [int(out["deposits"][hx(T_A)]), int(out["deposits"][hx(T_B)])]
+        check("  the XCH from A buys B and backs the mint, exactly", y + minted == x_out, f"{y} + {minted} vs {x_out}")
+        check("  the rest of A and all of B are deposited", deps == [a_in - s_a, b_out], f"{deps}")
+        r_ab = ab.state[0]
+        check("  the deposit sits near the pool's ratio", abs(deps[0] * r_ab[1] - deps[1] * r_ab[0]) <= 2 * deps[0] * r_ab[1] // 100 + max(r_ab),
+              f"{deps} vs {r_ab}")
+        check("  the trader gets the LP the preview named", minted == want_c
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, ab.lp_asset_id) == want_c)
+        check("  three successors", len(out["pools"]) == 3)
+    wallet_case("CAT zap in A -> A/B LP", zap_ab, {T_A: 40_000}, ab.lp_asset_id, 0x9B, 300, entry_asset=T_A)
+    attempt("CAT zap into a pool without XCH with an offer of A and XCH", {**zap_ab,
+            "offer": fabricate_offer({T_A: 40_000, None: 1_000_000}, {ab.lp_asset_id: 1}, salt=0x9C).to_bech32()}, expect_ok=False)
+
+    # Owner, 2026-10-12: XCH -> the five-asset ⚒️🧙‍♂️ LP found no route; only one of its assets
+    # trades against XCH. One sale into that asset, deposited one-sided, the rest the backing.
+    print("XCH zap into a multi-asset pool without XCH, one asset tradeable: one sale, one-sided deposit")
+    abc = make([T_A, T_B, T_C], [800_000, 600_000, 900_000], [2, 1, 1], salt=0x5C)
+    zap_abc = {"action": "zap-in", "current_height": H, "pool": snap(abc), "pools": [snap(xa)]}
+    for x_in, salt in ((1_000_000_000, 0xA0), (77_777_777, 0xA1), (3_000_000_003, 0xA2)):
+        offer_m, want_m = exact_offer({**zap_abc, "dev_fee": fee}, {None: x_in}, abc.lp_asset_id, salt=salt)
+        out = attempt(f"zap in {x_in} XCH -> A/B/C LP", {**zap_abc, "dev_fee": fee, "offer": offer_m.to_bech32()})
+        if not out:
+            continue
+        sold, minted = int(out["sales"][0]), int(out["minted"])
+        deps = {k: int(v) for k, v in out["deposits"].items()}
+        check("  the sale and the backing spend the offered XCH exactly", sold + minted == x_in, f"{sold} + {minted}")
+        check("  only A is deposited, all of the sale's output",
+              deps[hx(T_A)] == int(out["sale_outputs"][0]) and deps[hx(T_B)] == 0 and deps[hx(T_C)] == 0, f"{deps}")
+        check("  the trader gets the LP the preview named", minted == want_m
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, abc.lp_asset_id) == want_m)
+        check("  two successors", len(out["pools"]) == 2)
+    wallet_case("XCH zap in -> A/B/C LP", zap_abc, {None: 1_000_000_000}, abc.lp_asset_id, 0xA3, 300)
+    for label, payload, lp, salt in (("one-sale zap buying B on XCH/B instead (any tradeable asset)", {**zap_abc, "pools": [snap(xb)]}, abc.lp_asset_id, 0xA4),
+                                     ("a two-asset pool zapped through one sale, one-sided", {**zap_abc, "pool": snap(ab), "pools": [snap(xa2)]}, ab.lp_asset_id, 0xA5)):
+        offer_o, want_o = exact_offer({**payload, "dev_fee": fee}, {None: 1_000_000_000}, lp, salt=salt)
+        out = attempt(label, {**payload, "dev_fee": fee, "offer": offer_o.to_bech32()})
+        if out:
+            check("  sale plus backing is the offered XCH, and the trader gets the preview's LP",
+                  int(out["sales"][0]) + int(out["minted"]) == 1_000_000_000 and int(out["minted"]) == want_o)
+    attempt("one-sale zap through a pool holding no XCH", {**zap_abc, "pools": [snap(bc)],
+            "offer": fabricate_offer({None: 1_000_000_000}, {abc.lp_asset_id: 1}, salt=0xA6).to_bech32()}, expect_ok=False)
+
+    # A chain of mints (owner, 2026-10-12): XCH -> the A/B LP (both assets bought on their XCH
+    # pools), that LP deposited one-sided into a pool holding it -- two LP mints, one bundle.
+    print("zap through an LP: XCH mints the A/B LP, which is deposited into a pool holding it")
+    # Creation sorts a pool's assets (forge_v18_create.canonical) and the leaves rely on it,
+    # so a fixture holding an LP lists its assets in that order too.
+    def make_sorted(spec, salt):
+        spec = sorted(spec, key=lambda t: bytes(t[0]))
+        return make([a for a, _, _ in spec], [r for _, r, _ in spec], [w for _, _, w in spec], salt=salt)
+    lp_pool = make_sorted([(T_C, 900_000, 1), (ab.lp_asset_id, 300_000, 2)], 0x5D)
+    via_ab = {"action": "zap-in", "current_height": H, "pool": snap(lp_pool), "viaPool": snap(ab), "pools": [snap(xa), snap(xb)]}
+    for x_in, salt in ((1_000_000_000, 0xB0), (333_333_337, 0xB1), (2_500_000_001, 0xB2)):
+        offer_v, want_v = exact_offer({**via_ab, "dev_fee": fee}, {None: x_in}, lp_pool.lp_asset_id, salt=salt)
+        out = attempt(f"zap {x_in} XCH through the A/B LP", {**via_ab, "dev_fee": fee, "offer": offer_v.to_bech32()})
+        if not out:
+            continue
+        sales, minted = [int(a) for a in out["sales"]], int(out["minted"])
+        inner = out.get("inner_mints") or [{}]
+        m1 = int(inner[0].get("minted", -1))
+        check("  sales + the A/B mint's backing + the outer mint's backing == the offered XCH",
+              sum(sales) + m1 + minted == x_in, f"{sales} + {m1} + {minted}")
+        check("  the whole A/B mint is deposited, and nothing else",
+              int(out["deposits"][hx(ab.lp_asset_id)]) == m1 and int(out["deposits"][hx(T_C)]) == 0, f"{out['deposits']}")
+        check("  the trader gets the outer LP the preview named, and no A/B LP",
+              minted == want_v and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, lp_pool.lp_asset_id) == want_v
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, ab.lp_asset_id) == 0)
+        check("  four successors: both XCH pools, A/B and the outer pool", len(out["pools"]) == 4)
+    wallet_case("zap through the A/B LP", via_ab, {None: 1_000_000_000}, lp_pool.lp_asset_id, 0xB3, 300)
+
+    print("zap through an XCH pool's LP: XCH mints the XCH/A LP by its join, deposited into a pool holding it")
+    xa_lp_pool = make_sorted([(T_B, 600_000, 1), (xa.lp_asset_id, 200_000, 1)], 0x5E)
+    via_xa = {"action": "zap-in", "current_height": H, "pool": snap(xa_lp_pool), "viaPool": snap(xa), "pools": []}
+    for x_in, salt in ((1_000_000_000, 0xB4), (55_555_555, 0xB5)):
+        offer_v, want_v = exact_offer({**via_xa, "dev_fee": fee}, {None: x_in}, xa_lp_pool.lp_asset_id, salt=salt)
+        out = attempt(f"zap {x_in} XCH through the XCH/A LP", {**via_xa, "dev_fee": fee, "offer": offer_v.to_bech32()})
+        if out:
+            m1 = int(out["inner_mints"][0]["minted"])
+            check("  the XCH/A mint is deposited whole, and the trader gets the preview's LP",
+                  int(out["deposits"][hx(xa.lp_asset_id)]) == m1 and int(out["minted"]) == want_v
+                  and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa_lp_pool.lp_asset_id) == want_v)
+            check("  two successors", len(out["pools"]) == 2)
+    wallet_case("zap through the XCH/A LP", via_xa, {None: 1_000_000_000}, xa_lp_pool.lp_asset_id, 0xB6, 300)
+    # A CAT through an LP (owner, 2026-10-12: Caster -> the ✨❤️‍🔥🧙‍♂️ XCH LP -> a pool holding
+    # it): a little A sold for XCH on XCH/A, the rest of A and that XCH mint the XCH/A LP,
+    # which is deposited into the pool holding it; the sale's XCH backs both mints exactly.
+    print("CAT zap through an LP: A sold on XCH/A, A + XCH mint its LP, deposited into the pool holding it")
+    for a_in, salt in ((20_000, 0xC0), (3_333, 0xC1), (150_000, 0xC2)):
+        offer_c, want_c = exact_offer({**via_xa, "dev_fee": fee}, {T_A: a_in}, xa_lp_pool.lp_asset_id, salt=salt)
+        out = attempt(f"CAT zap {a_in} A through the XCH/A LP", {**via_xa, "dev_fee": fee, "offer": offer_c.to_bech32()})
+        if not out:
+            continue
+        m1 = int(out["inner_mints"][0]["minted"])
+        inner_deps = {k: int(v) for k, v in out["inner_mints"][0]["deposits"].items()}
+        sold, x = int(out["sales"][0]), int(out["sale_outputs"][0])
+        check("  the rest of A goes into XCH/A, and the sale's XCH covers its XCH deposit and both backings",
+              inner_deps[hx(T_A)] == a_in - sold and inner_deps[hx(None)] + m1 + int(out["minted"]) == x,
+              f"sold {sold} for {x}; inner {inner_deps}, minted {m1} then {out['minted']}")
+        check("  the whole XCH/A mint is deposited, and the trader gets the preview's LP",
+              int(out["deposits"][hx(xa.lp_asset_id)]) == m1 and int(out["minted"]) == want_c
+              and paid_to(SpendBundle.from_json_dict(out["bundle"]), TRADER_PH, xa_lp_pool.lp_asset_id) == want_c)
+        check("  two successors", len(out["pools"]) == 2)
+    wallet_case("CAT zap through the XCH/A LP", via_xa, {T_A: 20_000}, xa_lp_pool.lp_asset_id, 0xC3, 300, entry_asset=T_A)
+    # A valuable CAT (mainnet, 2026-10-12: Caster, 2,206 mojos against 14.3 XCH): the sale
+    # search tried one mojo, which rounds to no input after the fee and raised, refusing the
+    # whole zap. One mojo now just buys nothing and the search moves on.
+    xc = make([None, T_C], [10_000_000_000, 2_000], [1, 1], salt=0x5F)
+    xc_holder = make_sorted([(T_B, 600_000, 1), (xc.lp_asset_id, 200_000, 3)], 0x60)
+    via_xc = {"action": "zap-in", "current_height": H, "pool": snap(xc_holder), "viaPool": snap(xc), "pools": []}
+    offer_v, want_v = exact_offer({**via_xc, "dev_fee": fee}, {T_C: 500}, xc_holder.lp_asset_id, salt=0xC5)
+    out = attempt("CAT zap of a valuable CAT through its XCH pool's LP", {**via_xc, "dev_fee": fee, "offer": offer_v.to_bech32()})
+    if out:
+        check("  a mojo-sized sale backs both mints, and the trader gets the preview's LP",
+              int(out["sales"][0]) <= 5 and int(out["minted"]) == want_v, f"sold {out['sales']}, minted {out['minted']}")
+    attempt("CAT zap through an LP paying a CAT the inner pool lacks", {**via_xa,
+            "offer": fabricate_offer({T_B: 20_000}, {xa_lp_pool.lp_asset_id: 1}, salt=0xC4).to_bech32()}, expect_ok=False)
+
+    attempt("zap through an LP the target does not hold", {**via_ab, "pool": snap(abc),
+            "offer": fabricate_offer({None: 1_000_000_000}, {abc.lp_asset_id: 1}, salt=0xB7).to_bech32()}, expect_ok=False)
+    attempt("zap through an LP, paid in a CAT", {**via_ab,
+            "offer": fabricate_offer({T_A: 20_000}, {lp_pool.lp_asset_id: 1}, salt=0xB8).to_bech32()}, expect_ok=False)
+    off_by_one, want_lp = exact_offer({**via_ab, "dev_fee": fee}, {None: 1_000_000_000}, lp_pool.lp_asset_id, salt=0xB9)
+    attempt("zap through an LP asking one outer LP mojo more", {**via_ab, "dev_fee": fee,
+            "offer": fabricate_offer({None: 1_000_000_000}, {lp_pool.lp_asset_id: want_lp + 1}, salt=0xB9).to_bech32()}, expect_ok=False)
+
+    probe_ab = fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: 1}, salt=0x7F)
+    honest_lp = int(run({**zap_ab, "offer": probe_ab.to_bech32(), "preview": True})["forge"]["releases"][hx(ab.lp_asset_id)])
+    attempt("zap in asking one LP mojo more than the mint", {**zap_ab,
+            "offer": fabricate_offer({None: 1_000_000_000}, {ab.lp_asset_id: honest_lp + 1}, salt=0x7F).to_bech32()}, expect_ok=False)
+
+    print("lane guards")
+    v10_like = dict(snap(xa)); v10_like["protocol_version"] = 10
+    attempt("a route mixing revisions", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xa), v10_like],
+                                         "path": [hx(None), hx(T_A), hx(T_B)], "current_height": H}, expect_ok=False)
+    attempt("swapping through a vault", {"action": "multihop-swap", "offer": offer.to_bech32(), "pools": [snap(xlp), snap(vault)],
+                                         "path": [hx(None), hx(vault.lp_asset_id), hx(T_A)], "current_height": H}, expect_ok=False)
+
+    print()
+    passed = sum(results)
+    print(f"{passed}/{len(results)} V18 route-lane checks passed")
+    return 0 if passed == len(results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

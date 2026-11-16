@@ -120,8 +120,20 @@ def wallet_case(label, payload, offered, out_asset, salt, bps, entry_asset=None)
           out["forge"]["router_fee_side"] == "output-surplus" and int(out["forge"]["router_fee"]) == fee, f"{out['forge'].get('router_fee_side')}")
     greedy, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=1)
     attempt(f"wallet-built {label}, asking one mojo more than the release less the fee", {**charged, "offer": greedy.to_bech32()}, expect_ok=False)
-    stale, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=-(fee // 10 + 2))
-    attempt(f"wallet-built {label}, the price moved past the band", {**charged, "offer": stale.to_bech32()}, expect_ok=False)
+    # In the money past the band (owner, 2026-10-23): a resting offer the market moved past
+    # used to be refused "the price moved; quote again" and never fill. The router takes its
+    # fee (a mojo more only to keep outputs distinct) and the maker gets the improvement.
+    under = fee // 10 + 2 + release // 50
+    moved, _, _ = wallet_offer(charged, offered, out_asset, salt, ask_delta=-under)
+    ahead = attempt(f"wallet-built {label}, in the money past the band", {**charged, "offer": moved.to_bech32()})
+    if ahead:
+        b2 = SpendBundle.from_json_dict(ahead["bundle"])
+        router = paid_to(b2, ROUTER_PH, out_asset)
+        check("  in the money: the router is paid its fee, no more", fee <= router <= fee + 1, f"{router} vs {fee}")
+        check("  in the money: the maker gets the whole release less the router's take",
+              paid_to(b2, TRADER_PH, out_asset) == release - router, f"{paid_to(b2, TRADER_PH, out_asset)} vs {release - router}")
+        names = [c.name() for c in b2.additions()]
+        check("  in the money: every output is a distinct coin", len(set(names)) == len(names))
     return out
 
 
@@ -403,6 +415,18 @@ def main() -> int:
     # An offer that pays no router fee at all, with the router charging, is refused.
     offer = fabricate_offer({T_A: dep_a, None: lp_mint2}, {None: x_back2}, salt=0x6f)
     attempt("an offer paying no router fee, router charging", {**wentry, "dev_fee": charged_e, "offer": offer.to_bech32()}, expect_ok=False)
+    # Wallet-built wraps paid in a CAT (owner, 2026-10-23: every trade a Sage offer). The offer
+    # carries the CAT and the XCH backing, both whole and uncharged; the backing covers the mint
+    # of the WHOLE CAT, and the router's fee comes off the payout. The page sizes it from the
+    # quote rebuilt with the fee suspended (forgeAdapter.walletBuiltOffered).
+    wallet_case("wrap entry A + backing -> XCH", {k: v for k, v in wentry.items() if k != "dev_fee"},
+                {T_A: dep_a, None: lp_mint2}, None, 0x9E, 300, entry_asset=T_A)
+    dep_b = 30_000
+    a_mid, lp_b = v16r.simulate_chain([ab, vault], [hx(T_B), hx(T_A), hx(vault.lp_asset_id)], dep_b)
+    bwrap = {"action": "multihop-swap", "pools": [snap(ab), snap(vault)], "path": [hx(T_B), hx(T_A), hx(vault.lp_asset_id)],
+             "current_height": H}
+    wallet_case("B -> A -> wrap, B + backing -> vault LP", bwrap, {T_B: dep_b, None: lp_b}, vault.lp_asset_id, 0x9F, 300,
+                entry_asset=T_B)
 
     print("revisiting route: XCH -> A on xa, wrapped in the vault, the LP sold for XCH on xlp, that XCH buying A again on xa2")
     rpools = [xa, vault, xlp, xa2]

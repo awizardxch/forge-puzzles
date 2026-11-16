@@ -87,7 +87,7 @@ def coin_records(sk, inner, ph, salt):
     return xch, cat, grand
 
 
-def make_offer(sk, inner, ph):
+def make_offer(sk, inner, ph, with_xch=True):
     xch, cat, grand = coin_records(sk, inner, ph, 0x31)
     payload = {
         "change_puzzle_hash": ph.hex(),
@@ -100,6 +100,8 @@ def make_offer(sk, inner, ph):
         ],
         "requested": [{"asset_id": bytes32(b"\x77" * 32).hex(), "amount": "1234"}],
     }
+    if not with_xch:
+        payload["offered"] = payload["offered"][1:]
     built = fob.build(payload)["coin_spends"]
     fix = lambda v: v if str(v).startswith("0x") else "0x" + str(v)  # noqa: E731
     spends = [CoinSpend.from_json_dict({
@@ -107,7 +109,7 @@ def make_offer(sk, inner, ph):
         "puzzle_reveal": fix(s["puzzle_reveal"]), "solution": fix(s["solution"])}) for s in built]
     offer = Offer(fob._requested_payments(payload["requested"], ph, [s.coin for s in spends]),
                   SpendBundle(spends, sign(sk, spends)), fob._drivers(payload["requested"]))
-    return offer.to_bech32(), {xch.name(), cat.name()}
+    return offer.to_bech32(), ({xch.name(), cat.name()} if with_xch else {cat.name()}), xch.name(), cat.name()
 
 
 def outputs(spends) -> list[tuple[bytes, int]]:
@@ -127,20 +129,27 @@ def outputs(spends) -> list[tuple[bytes, int]]:
 def main() -> int:
     sk, inner, ph = wallet(0x51)
     other_sk, _, _ = wallet(0x52)
-    offer_text, offer_coins = make_offer(sk, inner, ph)
+    offer_text, offer_coins, xch_id, cat_id = make_offer(sk, inner, ph)
     fee = 60_000_000
 
-    print("cancel: every offered coin back to its own address")
+    # One spent coin kills an offer, so the cancel spends one: an add of 197 small coins made a
+    # spend-them-all request too big for the WalletConnect relay (mainnet, 2026-10-23).
+    print("cancel: one offered coin back to its own address")
     spends, _ = oc.build(offer_text, fee)
-    check("both offered coins are spent -- the XCH and the CAT", {s.coin.name() for s in spends} == offer_coins)
+    check("exactly one offered coin is spent -- the XCH, which pays the fee", [s.coin.name() for s in spends] == [xch_id])
     outs = outputs(spends)
     check("the XCH comes back to its own address, less only the fee", (ph, 2_000_000_000_000 - fee) in outs)
-    check("the CAT comes back to its own inner address, whole", (ph, 5_000) in outs)
-    check("nothing else is paid", len(outs) == 2)
+    check("nothing else is paid", len(outs) == 1)
     ok, why = mempool_valid(SpendBundle(spends, sign(sk, spends)))
     check("signed by the wallet that made the offer, it passes validate_clvm_and_signature", ok, why)
     ok, _ = mempool_valid(SpendBundle(spends, sign(other_sk, spends)))
     check("signed by another wallet, consensus refuses it", not ok)
+    cat_only, _coins, _x, cat_coin = make_offer(sk, inner, ph, with_xch=False)
+    cat_spends, _ = oc.build(cat_only, 0)
+    check("an offer of CAT only: its one CAT coin is spent, back to its own inner address, whole",
+          [s.coin.name() for s in cat_spends] == [cat_coin] and outputs(cat_spends) == [(ph, 5_000)])
+    ok, why = mempool_valid(SpendBundle(cat_spends, sign(sk, cat_spends)))
+    check("  and it passes validate_clvm_and_signature", ok, why)
     try:
         oc.build(offer_text, 10**16)
         check("a fee the offer's XCH cannot cover is refused", False)

@@ -106,6 +106,19 @@ class CreatorCat:
     coin: Coin
     inner: Program                  # the creator's inner p2 puzzle
     lineage: LineageProof
+    # More coins of the same CAT, spent in one ring with `coin` when no single coin holds the
+    # reserve (owner, 2026-10-29: "can't you simply use a combine first"): `coin` still creates
+    # the reserve's launcher and the change, so the reserve's parent is unchanged; these only
+    # add their amounts to the ring. Each is (coin, inner p2 puzzle, lineage proof).
+    extra: tuple = ()
+
+    @property
+    def total(self) -> int:
+        return int(self.coin.amount) + sum(int(c.amount) for c, _inner, _lineage in self.extra)
+
+    @property
+    def coins(self) -> list:
+        return [self.coin, *(c for c, _inner, _lineage in self.extra)]
 
 
 @dataclass(frozen=True)
@@ -192,8 +205,8 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
                             f"(launcher, eve, XCH reserve {xch_reserve}, fee {fee}, LP backing {config.total_lp - 1}, network fee {network_fee})")
     for asset, cat in cats.items():
         i = config.asset_ids.index(asset)
-        if int(cat.coin.amount) < config.reserves[i]:
-            raise OfferRejected(f"the creator's {asset.hex()[:8]} coin holds {cat.coin.amount}, the reserve needs {config.reserves[i]}")
+        if cat.total < config.reserves[i]:
+            raise OfferRejected(f"the creator's {asset.hex()[:8]} coins hold {cat.total}, the reserve needs {config.reserves[i]}")
 
     # the pool, with the creator's XCH coin as the launcher's parent
     shape = drv.make_pool(config.asset_ids, config.reserves, total_lp=config.total_lp, leaves="forge", weights=config.weights,
@@ -289,7 +302,7 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
     digest = None
     if gate_proof_keys:
         import forge_network
-        digest = gate_proof_digest(forge_network.network_id(), [xch.coin.name(), *(c.coin.name() for c in cats.values())])
+        digest = gate_proof_digest(forge_network.network_id(), [xch.coin.name(), *(coin.name() for c in cats.values() for coin in c.coins)])
         for proof_key in gate_proof_keys:
             conditions.append([AGG_SIG_UNSAFE, bytes(proof_key), digest])
     creator_spends = [make_spend(xch.coin, xch.puzzle, drv.p2_delegated_solution(conditions))]
@@ -302,10 +315,14 @@ def plan(registry: drv.Registry, slots: dict, config: CreationConfig, xch: Creat
     for asset, cat in cats.items():
         i = config.asset_ids.index(asset)
         conds = [[CREATE_COIN, drv.RESERVE_LAUNCHER_HASH, config.reserves[i]]]   # V16: CAT-wrapped by the layer
-        if int(cat.coin.amount) > config.reserves[i]:
-            conds.append([CREATE_COIN, cat.inner.get_tree_hash(), int(cat.coin.amount) - config.reserves[i], [cat.inner.get_tree_hash()]])
-        creator_spends.extend(unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
-            cat.coin, asset, cat.inner, drv.p2_delegated_solution(conds), lineage_proof=cat.lineage)]).coin_spends)
+        if cat.total > config.reserves[i]:
+            conds.append([CREATE_COIN, cat.inner.get_tree_hash(), cat.total - config.reserves[i], [cat.inner.get_tree_hash()]])
+        # One ring: the first coin creates the launcher and the change; the others create
+        # nothing and only add their amounts (the CAT layer balances the ring).
+        ring = [SpendableCAT(cat.coin, asset, cat.inner, drv.p2_delegated_solution(conds), lineage_proof=cat.lineage)]
+        ring.extend(SpendableCAT(coin, asset, inner, drv.p2_delegated_solution([]), lineage_proof=lineage)
+                    for coin, inner, lineage in cat.extra)
+        creator_spends.extend(unsigned_spend_bundle_for_spendable_cats(CAT_MOD, ring).coin_spends)
     registry_after = registry.advance([x.as_int() for x in reg_state.as_iter()])     # RegistryState is [initialized, pool_count, creation_fee]
     return CreationPlan(pool, registry_after, key, left, right, recipient_ph, creator_spends, router_spends, network_fee, {
         "launcher_id": launcher_id.hex(), "lp_asset_id": pool.lp_asset_id.hex(), "key": key.hex(),

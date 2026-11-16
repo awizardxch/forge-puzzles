@@ -58,3 +58,39 @@ def check_address_network(text: str, what: str = "address") -> None:
     other = "xch1" if prefix == "txch" else "txch1"
     if t.startswith(other):
         raise ValueError(f"{what} {t[:12]}... is a {other[:-1]} address; this responder serves {network_id()}")
+
+
+# ── Which revision a NEW pool is built on, per network ─────────────────────────────────────
+# Mirrors FORGE_CREATE_PROTOCOL_BY_NETWORK / FORGE_CREATE_FALLBACK_BY_NETWORK and createProtocol()
+# in api/_forgeVersion.js (the router declares the protocol on every creation; this is the default
+# for a forge_stdin request that names no revision).
+#   testnet  19 (V18): since 2026-11-14, when the V18 testnet registry 881f66fc was launched.
+#   mainnet  19 (V18) once the mainnet V18 registry's record (v18-mainnet.json) is held, 17 (V16)
+#            until then (owner, 2026-11-14: V18 ships to mainnet beside V16, the audit follows;
+#            no V17 on mainnet). The gate is the record, never a setting: on a router it reaches
+#            the volume only through the admin upload, which checks it against the chain.
+# To change a table: edit BOTH (here and api/_forgeVersion.js) and the pinned expectations in
+# contracts/_test_v18_create_default.py and api/__checks__/createProtocolByNetwork.check.mjs.
+# There is deliberately no environment override.
+CREATE_PROTOCOL_BY_NETWORK = {"mainnet": 19, "testnet11": 19}
+# What a network creates on while its target's record is not held. Testnet has no entry.
+CREATE_FALLBACK_BY_NETWORK = {"mainnet": 17}
+
+
+def revision_tag_of(protocol: int) -> str:
+    """"v18" for protocol 19: the protocol number and the revision name are off by one."""
+    return f"v{int(protocol) - 1}"
+
+
+def create_protocol(held=None) -> int:
+    """The protocol a creation that names none is built on, on this network, now.
+
+    `held(revision_tag)` says whether that revision's registry record is held; by default
+    record_path() names an existing file (the state volume first, else .awizard/)."""
+    network = network_id()
+    target = CREATE_PROTOCOL_BY_NETWORK[network]
+    fallback = CREATE_FALLBACK_BY_NETWORK.get(network)
+    if fallback is None or fallback == target:
+        return target
+    is_held = held if held is not None else (lambda tag: record_path(tag).is_file())
+    return target if is_held(revision_tag_of(target)) else fallback

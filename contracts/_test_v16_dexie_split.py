@@ -139,6 +139,43 @@ def main() -> int:
     check("one branch beside a Dexie offer builds through the router's builder",
           int(out["total_out"]) == want, out.get("total_out"))
 
+    # Wallet-built (owner, 2026-10-23: every trade a Sage offer). The trader's own wallet makes
+    # a plain offer: the WHOLE entry, asking for the release less the router's fee. The maker
+    # is paid first, out of the entry, at what it asked; the pools get the rest; the fee comes
+    # off the whole payout, the maker's share included -- what forgeAdapter.walletBuiltPayout
+    # prices on the page for a Forge+Dexie split.
+    print("wallet-built beside a Dexie offer: the whole entry in, the fee off the whole payout")
+    for label, pool, entry_asset, out_asset, total, maker_in, maker_out, salt in (
+            ("CAT -> CAT", ab, T_A, T_B, a_total, a_maker, 39_000, 0xB1),
+            ("XCH -> CAT", xb, None, T_B, x_total, x_maker, 9_000, 0xB5)):
+        i_in, i_out = pool.asset_ids.index(entry_asset), pool.asset_ids.index(out_asset)
+        maker = maker_offer({out_asset: maker_out}, {entry_asset: maker_in}, salt=salt)
+        path = [(entry_asset or ZERO_32).hex(), out_asset.hex()]
+        payload = {"action": "split-swap", "current_height": H,
+                   "branches": [{"pools": [v16.pool_to_snapshot(pool)], "path": path, "amountIn": str(total - maker_in)}],
+                   "dexieOffers": [maker.to_bech32()], "dev_fee": {"puzzle_hash": ROUTER_PH.hex(), "bps": 300}}
+        probe = fabricate_offer({entry_asset: total}, {out_asset: 1}, salt=salt + 1)
+        preview = forge_stdin.build(json.loads(json.dumps({**payload, "offer": probe.to_bech32(), "preview": True,
+                                                           "probe": {"router_fee_mode": "surplus"}})))
+        release = pool_out(pool, i_in, i_out, total - maker_in) + maker_out
+        fee = release * 300 // 10_000
+        check(f"{label}: the surplus preview releases the pool's share of entry less the maker's ask, plus the maker's",
+              int(preview["forge"]["releases"][out_asset.hex()]) == release and int(preview["forge"]["router_fee_out"]) == fee,
+              f"{preview['forge'].get('releases')} fee {preview['forge'].get('router_fee_out')} vs {release} {fee}")
+        offer = fabricate_offer({entry_asset: total}, {out_asset: release - fee}, salt=salt + 2)
+        out = forge_stdin.build(json.loads(json.dumps({**payload, "offer": offer.to_bech32()})))
+        b = SpendBundle.from_json_dict(out["bundle"])
+        check(f"{label}: the maker is paid exactly its ask", paid_to(b, MAKER_PH, entry_asset) == maker_in)
+        check(f"{label}: the trader is paid what they signed for", paid_to(b, TRADER_PH, out_asset) == release - fee,
+              f"{paid_to(b, TRADER_PH, out_asset)} vs {release - fee}")
+        check(f"{label}: the router is paid its fee off the payout, and nothing of the entry",
+              paid_to(b, ROUTER_PH, out_asset) == fee and paid_to(b, ROUTER_PH, entry_asset) == 0,
+              f"{paid_to(b, ROUTER_PH, out_asset)} vs {fee}")
+        check(f"{label}: details name the wallet-built side", out["forge"]["router_fee_side"] == "output-surplus")
+        greedy = fabricate_offer({entry_asset: total}, {out_asset: release - fee + 1}, salt=salt + 3)
+        refused(f"{label}: asking one mojo more than the release less the fee",
+                lambda: forge_stdin.build(json.loads(json.dumps({**payload, "offer": greedy.to_bech32()}))), "")
+
     print("what is refused")
     def split(maker, entry=a_total):
         return v16r.split_swap([([ab], [T_A, T_B], entry - 1_000)], fabricate_offer({T_A: entry}, {T_B: 1}, salt=0xA1), H,

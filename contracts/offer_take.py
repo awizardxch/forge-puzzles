@@ -35,6 +35,8 @@ from chia.wallet.trading.offer import Offer
 from chia_rs import validate_clvm_and_signature
 from chia_rs.sized_bytes import bytes32
 
+from forge_offer import duplicate_payee_reason
+
 MAX_LEGS = 4
 MAX_MAKERS = 8
 TESTNET11_GENESIS = bytes.fromhex("37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615")
@@ -79,6 +81,11 @@ def plan(makers) -> dict:
     for maker in makers:
         if not maker.get_offered_amounts() or not maker.get_requested_amounts():
             raise ValueError("every maker's offer must offer something and request something")
+    # The counter-offer's settlement coin pays every maker: two asking one puzzle hash for
+    # one amount would have it create one coin twice (DUPLICATE_OUTPUT, Err 4).
+    duplicate = duplicate_payee_reason(makers)
+    if duplicate:
+        raise ValueError(duplicate)
     offered = _sum(_amounts(m.get_offered_amounts()) for m in makers)
     requested = _sum(_amounts(m.get_requested_amounts()) for m in makers)
     if not offered or not requested:

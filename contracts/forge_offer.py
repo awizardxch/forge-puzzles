@@ -297,10 +297,46 @@ def requested_solution(offer: Offer, asset_id: bytes32 | None) -> list[Program]:
     groups: dict[bytes32, list[list[object]]] = {}
     for payment in offer.get_requested_payments().get(asset_id, []):
         item: list[object] = [payment.puzzle_hash, int(payment.amount)]
-        if payment.memos:
+        # An EMPTY memo list is still a third element: `(ph amount ())` is what the maker
+        # notarized and asserts, and its tree hash is not `(ph amount)`'s. Most Dexie offers
+        # carry one (2026-10-24: 19 of 24 open XCH -> wUSDC.b offers), and dropping it made
+        # the settlement announce a group the maker never asserted (ASSERT_ANNOUNCE_CONSUMED_
+        # FAILED, Err 12). chia's CreateCoin reads no memos as None and `()` as [].
+        if payment.memos is not None:
             item.append([bytes(memo) for memo in payment.memos])
         groups.setdefault(payment.nonce, []).append(item)
     return [Program.to((nonce, payments)) for nonce, payments in groups.items()]
+
+
+def duplicate_payee(offers: Sequence[Offer]) -> tuple[bytes32 | None, bytes32, int] | None:
+    """The first (asset, puzzle hash, amount) that two requested payments share across
+    `offers` (within one of them too), or None.
+
+    An asset's requested payments are all made by one settlement coin -- the route's entry
+    hub, or a counter-offer's coin -- and a coin id is (parent, puzzle hash, amount): two
+    payments of one (puzzle hash, amount) are one coin created twice, and consensus refuses
+    the whole bundle as DUPLICATE_OUTPUT (Err 4). Live 2026-10-24: two 1 XCH Dexie offers
+    from one maker, both paying e3992d3d..., taken in one 5 XCH -> wUSDC.b route."""
+    seen: set[tuple[bytes32 | None, bytes32, int]] = set()
+    for offer in offers:
+        for asset_id, payments in offer.get_requested_payments().items():
+            for payment in payments:
+                key = (asset_id, bytes32(payment.puzzle_hash), int(payment.amount))
+                if key in seen:
+                    return key
+                seen.add(key)
+    return None
+
+
+def duplicate_payee_reason(offers: Sequence[Offer]) -> str | None:
+    """`duplicate_payee` as the refusal the builders raise, or None when every payment differs."""
+    found = duplicate_payee(offers)
+    if found is None:
+        return None
+    asset_id, puzzle_hash, amount = found
+    asset = "XCH" if asset_id is None else asset_id.hex()[:8]
+    return (f"two of the taken Dexie offers pay {puzzle_hash.hex()[:8]} the same {amount} of {asset}; "
+            "they cannot settle in one bundle")
 
 
 def singleton_struct(launcher_id: bytes32) -> list[bytes32]:

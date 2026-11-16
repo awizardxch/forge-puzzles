@@ -11,6 +11,7 @@ and refuse a reveal that is not this pool's V16 singleton.
 Exit 0 all pass, 1 a failure.
 """
 import sys
+import threading
 
 sys.path.insert(0, ".")
 sys.stdout.reconfigure(encoding="utf-8")
@@ -49,37 +50,69 @@ pools = [drv.make_pool([None, CAT], RESERVES[0], total_lp=5_000_000, leaves="for
 for step, reserves in enumerate(RESERVES[1:], start=1):
     # Distinct oracle readings per state, so a walk that dropped or shifted them shows.
     pools.append(pools[-1].advance(drv.forge_state(
-        reserves, 5_000_000, last_height=1_000 * step, cums=[7_000 * step], last_spot=[300 + step])))
+        reserves, 5_000_000, fees=[0, 40 * step], last_height=1_000 * step, cums=[7_000 * step],
+        last_spot=[300 + step], dao_owed=[0, 9 * step])))
 LAUNCHER = pools[0].launcher_id.hex()
 coins = [pool.coin for pool in pools]
 TIP = coins[-1].name().hex()
 
 
 class FakeNode:
-    """Answers get_coin_record_by_name and get_puzzle_and_solution for the lineage."""
+    """Answers get_coin_record_by_name and get_puzzle_and_solution for the lineage.
 
-    def __init__(self, reveal_for=None):
+    As on chain, a coin is spent in the block that creates its child, and a spend is
+    only found at the height it happened; `drift` breaks the first rule, to show the
+    walk still answers from the record, and `lenient` the second: a read at a wrong
+    height then answers with another coin's reveal, which only the record can catch. `overlap` makes each record read wait briefly
+    for its coin's spend read, and notes whether that read was already asked for.
+    """
+
+    def __init__(self, reveal_for=None, drift=0, overlap=False, lenient=False):
         self.calls = 0
-        self.reveal_for = reveal_for or {}
+        self.routes = []
+        # Serialized here, on the thread that built them: chia's Program panics when
+        # another thread touches it, and the walk reads side by side.
+        reveals = {index: puzzle_for_singleton(pool.launcher_id, pool.inner) for index, pool in enumerate(pools)}
+        reveals.update(reveal_for or {})
+        self.reveal_hex = {index: "0x" + bytes(reveal).hex() for index, reveal in reveals.items()}
+        self.drift = drift
+        self.lenient = lenient
+        self.overlap = overlap
+        self.asked = {}
+        self.overlapped = []
+        self.lock = threading.Lock()
+
+    def _spend_asked(self, name):
+        with self.lock:
+            return self.asked.setdefault(name, threading.Event())
 
     def __call__(self, route, payload):
-        self.calls += 1
+        with self.lock:
+            self.calls += 1
+            self.routes.append(route)
         if route == "get_coin_record_by_name":
             name = payload["name"].removeprefix("0x")
             for index, coin in enumerate(coins):
                 if coin.name().hex() == name:
                     spent = index < len(coins) - 1
+                    if self.overlap and spent:
+                        self.overlapped.append(self._spend_asked(name).wait(1.0))
                     return {"coin_record": {
                         "coin": {"parent_coin_info": "0x" + coin.parent_coin_info.hex(),
                                  "puzzle_hash": "0x" + coin.puzzle_hash.hex(), "amount": 1},
                         "confirmed_block_index": 100 + index * 10, "timestamp": 1_000 + index,
-                        "spent": spent, "spent_block_index": 105 + index * 10 if spent else 0}}
+                        "spent": spent, "spent_block_index": 110 + index * 10 + self.drift if spent else 0}}
             return {"coin_record": None}
         if route == "get_puzzle_and_solution":
             name = payload["coin_id"].removeprefix("0x")
+            self._spend_asked(name).set()
             index = next(i for i, coin in enumerate(coins) if coin.name().hex() == name)
-            reveal = self.reveal_for.get(index) or puzzle_for_singleton(pools[index].launcher_id, pools[index].inner)
-            return {"coin_solution": {"puzzle_reveal": "0x" + bytes(reveal).hex(), "solution": "0x80"}}
+            if payload["height"] != 110 + index * 10 + self.drift:
+                if self.lenient:
+                    wrong = (index + 1) % len(coins)
+                    return {"coin_solution": {"puzzle_reveal": self.reveal_hex[wrong], "solution": "0x80"}}
+                raise ValueError(f"no spend of {name[:12]} at height {payload['height']}")
+            return {"coin_solution": {"puzzle_reveal": self.reveal_hex[index], "solution": "0x80"}}
         raise AssertionError(route)
 
 
@@ -98,10 +131,37 @@ check("each point carries the oracle reading its coin was curried with",
           {"last_height": 1_000, "cums": ["7000"], "last_spot": ["301"]},
           {"last_height": 0, "cums": ["0"], "last_spot": ["0"]}],
       str([p["oracle"] for p in out["points"]]))
+check("each point carries the dev and DAO fees its coin owed",
+      [(p["fees_owed"], p["dao_owed"]) for p in out["points"]] == [
+          (["0", "80"], ["0", "18"]), (["0", "40"], ["0", "9"]), (["0", "0"], ["0", "0"])],
+      str([(p["fees_owed"], p["dao_owed"]) for p in out["points"]]))
 check("the unspent tip is reported, with when its state began",
       out["tip"] == {"coin_id": TIP, "height": 130, "timestamp": 1_003})
 check("the eve coin's parent is the launcher, which ends the walk",
       out["points"][-1]["parent"] == LAUNCHER)
+check("two node calls a spent coin, one for the tip", node.calls == 1 + 2 * 3, f"{node.calls} calls")
+
+print("record and spend side by side:")
+node = FakeNode(overlap=True)
+side = ph.walk(node, LAUNCHER, TIP, set(), 50)
+# A walk that waits for each record before asking for the spend leaves every one of
+# these False: the record read times out without the spend read having been made.
+check("each spent coin's spend is asked for while its record is still being read",
+      node.overlapped == [True, True, True], str(node.overlapped))
+check("and the walk is the same walk", side == out)
+node = FakeNode(drift=3)
+drifted = ph.walk(node, LAUNCHER, TIP, set(), 50)
+check("a record whose spent height is not its child's still decides the height read",
+      [p["spent_height"] for p in drifted["points"]] == [133, 123, 113]
+      and [p["reserves"] for p in drifted["points"]] == [p["reserves"] for p in out["points"]],
+      str([p["spent_height"] for p in drifted["points"]]))
+check("at the cost of one more call for each spend guessed wrong", node.calls == 1 + 3 * 3, f"{node.calls} calls")
+try:
+    lenient = ph.walk(FakeNode(drift=3, lenient=True), LAUNCHER, TIP, set(), 50)
+except ph.HistoryError as exc:
+    lenient = exc.code
+check("a spend read at a height the record does not confirm is never used, even when the node answers it",
+      lenient == drifted, "" if isinstance(lenient, dict) else lenient)
 
 print("stopping and resuming:")
 middle = coins[1].name().hex()

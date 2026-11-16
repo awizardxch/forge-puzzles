@@ -16,8 +16,10 @@ report is worth more than a quiet fix either way.
 
 ## Scope
 
-**In scope: the revisions in this repository.** `contracts/v16` (protocol 17) is
-the shipping pool: the only revision on mainnet, and live on testnet11 beside
+**In scope: the revisions in this repository.** `contracts/v18` (protocol 19) is
+the mainnet target and the revision to audit (`FORGE_PUZZLE_V18.md`; deployed on
+testnet11, not yet on mainnet). `contracts/v16` (protocol 17) is the pool live on
+mainnet today, and live on testnet11 beside
 `contracts/v15` (protocol 16) and `contracts/v14` (protocol 15), which are kept
 live, undrained. `contracts/vault_*.py` with `contracts/mips.py` is the lock.
 Those are what an audit should look at. V16 changes one constant from V15 (the
