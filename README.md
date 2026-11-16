@@ -7,8 +7,12 @@ Everything here can move funds. That is the whole point of the split — the
 interface lives in a separate repository, so what is in front of you *is* the
 attack surface and nothing dilutes that claim.
 
-> **Status: unaudited.** V16 (protocol 17) is the shipping revision. It runs on
-> mainnet, where it is the only revision (21 pools on 2026-10-18), and on testnet11
+> **Status: unaudited.** V18 (protocol 19, "v2") launched on mainnet on 2026-11-15,
+> before the independent audit, and V16 pools stay live beside it while their liquidity
+> providers migrate. V18's compiled puzzles and its mainnet registry are in
+> [`contracts/v18`](contracts/v18/README.md), and what it changes is CHIP-0062 revisions 14 and 15;
+> its sources follow later. V16 (protocol 17, "v1") runs on
+> mainnet (21 pools on 2026-10-18), and on testnet11
 > beside V15 (protocol 16) and V14 (protocol 15), which are kept, not retired. V16
 > changes one thing from V15, the burn address of the locked minimum; V15 changed
 > the `coinid` derivations, canonical state atoms and the creation fee. Both build
