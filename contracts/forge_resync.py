@@ -314,7 +314,8 @@ def resync(payload: dict[str, Any]) -> dict[str, Any]:
     # a revision ships; there is no sensible default for an unknown one.
     REPLAY_LANES = {11: "forge_v11_resync", 13: "forge_v12_resync", 14: "forge_v13_resync", 15: "forge_v14_resync", 16: "forge_v15_resync", 17: "forge_v16_resync",
                     18: "forge_v17_resync",   # V17, served beside V16 (2026-11-11)
-                    19: "forge_v18_resync"}   # V18, served beside V17 and V16 (2026-11-13)
+                    19: "forge_v18_resync",   # V18, served beside V17 and V16 (2026-11-13)
+                    20: "forge_v19_resync"}   # V19 (review 2026-11-16 findings 08/09), beside V18
     lane = REPLAY_LANES.get(int((stale_snapshot or {}).get("protocol_version") or 0))
     if lane is not None:
         import importlib
@@ -344,7 +345,7 @@ def resync(payload: dict[str, Any]) -> dict[str, Any]:
             # there; a known earlier state (`fallback_pools`) is tried only when it cannot answer,
             # and never past a spend waiting in the mempool. Every other revision (V14, V15) has
             # no registry rebuild, so the earlier state is its only way back.
-            if lane in ("forge_v16_resync", "forge_v17_resync", "forge_v18_resync"):
+            if lane in ("forge_v16_resync", "forge_v17_resync", "forge_v18_resync", "forge_v19_resync"):
                 try:
                     return _recover_from_registry(payload, exc)
                 except ResyncError as recover_exc:

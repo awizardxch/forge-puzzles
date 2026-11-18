@@ -1,0 +1,112 @@
+// forge_action_rebase.rue -- Forge V19 `rebase` leaf (rCAT issuer lane). Testnet research only; unaudited.
+//
+// CHIP-0038's issuer re-denominates the pool's reserve of its revocable CAT after a stock split,
+// a reverse split, or a revocation it made from the reserve by its hidden path. TibetSwap's v2r
+// `rebase`, adapted to an n-asset pool and hardened (owner decision D4, 2026-11-11):
+//
+//   * Authorized by the issuer alone: a mode-23 message from a coin AT H -- the asset's hidden
+//     puzzle hash, taken from CONFIG, never from a coin -- to THIS pool coin, naming the canonical
+//     index and the new amount. It cannot be replayed on a successor, another pool, or another asset.
+//   * The FIRST action of its spend. Forge runs several actions per spend, so a trade placed before
+//     a rebase in the same spend could sandwich it; TibetSwap's single-action pair never faces this.
+//   * The dev and DAO fees owed on that reserve are paid first, in pre-rebase units, to the fixed
+//     recipients (as `collect` does), so a rebase cannot re-denominate fees already earned.
+//   * Down: the surplus goes to a coin only the issuer can spend -- CREATE_COIN to H, which the
+//     layer's owner path wraps to rev(H, H) -- bound in the puzzle, where TibetSwap leaves it open.
+//   * Up: the issuer funds the difference; the CAT ring refuses an unfunded upward rebase.
+//   * Never to zero. A zero reserve degenerates the swap bracket (the floor invariant becomes 0,
+//     so a tiny input could claim the whole other side) and the oracle divides by each reserve.
+//     V17 therefore never lets a reserve reach zero; an issuer may rebase to 1. (A deliberate
+//     departure from the earlier "rebase to zero suspends" idea.)
+//   * LP supply unchanged: each LP keeps its share of the re-denominated reserve.
+//
+// Present in every V17 root (the finalizer sees only the config's hash, so the root cannot depend
+// on it) and refused outright for a plain asset (zero H): inert in a pool without an rCAT.
+//
+// What it cannot stop, by the nature of the asset (stated on the site): an issuer can rebase its
+// reserve to 1 and sell, which drains the other reserves -- the same power as minting and selling.
+//
+// solution: h, index, new_amount
+
+import upstream::action::StateTruth;
+import forge_action_common::*;
+
+fn fee_payout(index: Int, recipient: Bytes32, amount: Int, rest: List<Condition>) -> List<Condition> {
+    if amount > 0 {
+        (
+            for_reserve(index, CreateCoin {
+                puzzle_hash: recipient,
+                amount: amount,
+                memos: Memos { value: [recipient] },
+            }),
+            rest
+        )
+    } else {
+        rest
+    }
+}
+
+fn main(
+    CONFIG: PoolConfig,
+    truth: StateTruth,
+    h: Int,
+    birth: Int,
+    index_spelled: Int,
+    new_amount_spelled: Int,
+) -> ActionOutput {
+    // The first action of its spend: nothing has run before it in this spend.
+    assert truth.ephemeral_state is nil;
+    let p = prologue(CONFIG, truth, h, birth);
+    let n = count_ints(p.state.reserves);
+    // Canonical before any test: arithmetic emits the canonical integer, so the
+    // range test, the list lookups, the reserve tag and the issuer's message all see one value.
+    let index = index_spelled + 0;
+    let new_amount = new_amount_spelled + 0;
+    assert index >= 0 && index < n;
+    let hidden = nth_bytes(CONFIG.hidden_puzzle_hashes, index);
+    // A plain asset has no issuer: nothing to rebase.
+    assert hidden != zero_bytes32();
+    assert new_amount > 0;
+
+    let old = nth_int(p.state.reserves, index);
+    let fee = nth_int(p.state.fees_owed, index);
+    let dao = nth_int(p.state.dao_owed, index);
+    let surplus = if old > new_amount { old - new_amount } else { 0 };
+
+    let payouts = fee_payout(index, CONFIG.protocol_puzzle_hash, fee,
+                  fee_payout(index, CONFIG.dao_puzzle_hash, dao,
+                  fee_payout(index, hidden, surplus, nil)));
+
+    ActionOutput {
+        state_truth: StateTruth {
+            ephemeral_state: p.height,
+            actual_state: ForgeState {
+                reserves: set_at(p.state.reserves, index, new_amount),
+                total_lp: p.state.total_lp,
+                fees_owed: set_at(p.state.fees_owed, index, 0),
+                oracle: p.state.oracle,
+                prev_root: p.state.prev_root,
+                dao_fee_bps: p.state.dao_fee_bps,
+                dao_owed: set_at(p.state.dao_owed, index, 0),
+                reserve_parents: p.state.reserve_parents,
+            },
+        },
+        conditions: concat(
+            p.conditions,
+            concat(
+                [
+                    ReceiveMessage {
+                        mode: SENDER_PUZZLE | RECEIVER_COIN,
+                        message: rebase_message(index, new_amount),
+                        sender: [hidden],
+                    },
+                    // For a price consumer: a TWAP spanning a rebase is wrong by up to the ratio.
+                    CreatePuzzleAnnouncement {
+                        message: tree_hash(["forge-rebase-v19", index, old, new_amount]),
+                    },
+                ],
+                payouts,
+            ),
+        ),
+    }
+}

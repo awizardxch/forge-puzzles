@@ -39,6 +39,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import forge_math  # noqa: E402
+from forge_lp_add_fee import add_router_fee  # noqa: E402
 from chia.types.blockchain_format.program import Program  # noqa: E402
 from chia.types.coin_spend import make_spend  # noqa: E402
 from chia.wallet.cat_wallet.cat_utils import (  # noqa: E402
@@ -475,7 +476,7 @@ def surplus_payout_solution(offer: Offer, asset: bytes32 | None, payout: int, fe
 
 
 def deposit_payout_solution(offer: Offer, lp_asset: bytes32, minted: int, router_ph: bytes32,
-                            nonce: bytes32) -> tuple[Program, int]:
+                            nonce: bytes32, fee: int = 0) -> tuple[Program, int]:
     """A deposit's LP payout: the maker's bound groups, plus whatever the pool mints above them.
 
     A deposit asked for exactly the mint, so one resting while a trade moved the pool in its
@@ -484,10 +485,21 @@ def deposit_payout_solution(offer: Offer, lp_asset: bytes32, minted: int, router
     gets it (owner, 2026-10-23; surplus_payments) -- all of it, since the router has no claim
     on a deposit. The signed ask is paid in its own groups; only the improvement rides in
     the unsigned group, hinted to the maker so the wallet sees it. An offer asking MORE than
-    the mint is still refused. Returns (solution, the improvement paid)."""
+    the mint is still refused. Returns (solution, the improvement paid).
+
+    `fee` (owner, 2026-11-16): an UNBALANCED add pays the router its rate on the swapped
+    share (forge_lp_add_fee), off this payout as every wallet-built lane pays it -- the
+    unsigned group pays the router its fee and the maker any improvement beyond the band
+    (surplus_payments). A proportional add has fee 0 and keeps the path above, unchanged."""
     groups = bound_groups(offer, lp_asset)
     payments = offer.get_requested_payments().get(lp_asset, [])
     requested = sum(int(p.amount) for p in payments)
+    if fee > 0:
+        if requested > minted - fee:
+            raise OfferRejected(f"the pool mints {minted} LP; less the router's {fee} on the swapped share that is "
+                                f"{minted - fee}, and the offer asks {requested}: quote again")
+        extra, take = surplus_payments(offer, lp_asset, minted - requested, fee, router_ph)
+        return Program.to([*groups, [nonce, *extra]]), minted - requested - take
     if requested > minted:
         raise OfferRejected(f"the pool mints {minted} LP, the offer asks {requested}: a deposit asks for at most what "
                             "the pool mints at this state; quote again")
@@ -704,7 +716,7 @@ def _mint(pool: drv.V18Pool, deposits: list[int]) -> int:
     return forge_math.invariant_lp_mint(pool.state[0], deposits, pool.state[1], pool.fee_bps, pool.weights, version=MATH_VERSION)
 
 
-def settle_add(pool: drv.V18Pool, offer: Offer, height: int, surplus_ph: bytes32) -> SettleResult:
+def settle_add(pool: drv.V18Pool, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0) -> SettleResult:
     offered, wanted = _pool_asset_settlements(pool, offer)
     if list(wanted) != [pool.lp_asset_id]:
         raise OfferRejected("an add offer requests this pool's LP and nothing else")
@@ -748,6 +760,9 @@ def settle_add(pool: drv.V18Pool, offer: Offer, height: int, surplus_ph: bytes32
         raise OfferRejected(f"the offer's XCH exceeds the mint's backing by {excess}: a deposit offers exactly "
                             "the backing; quote again")
     new_total = pool.state[1] + honest
+    # The router's rate on the swapped share of an unbalanced add (owner, 2026-11-16;
+    # forge_lp_add_fee): nothing on a proportional add, a vault, or an exempt caller.
+    router_fee = add_router_fee(honest, pool.state[0], deposits, pool.weights, fee_bps)
 
     eve_ph = construct_cat_puzzle(CAT_MOD, pool.lp_asset_id, drv.LP_MINT_INNER).get_tree_hash()
     # The XCH settlement creates the one-mojo eve through a second group; its first group
@@ -772,9 +787,11 @@ def settle_add(pool: drv.V18Pool, offer: Offer, height: int, surplus_ph: bytes32
     action = [honest, new_total, probe_state.get_tree_hash(), pool.inner_hash, ZERO_32]
     eve_spends = drv.lp_eve_ring(pool, eve, OFFER_PH, honest, action)
     lp_settlement = Coin(eve.name(), settle_ph(pool.lp_asset_id), uint64(honest))
-    # A deposit is not a trade, so the router has no claim on it: the LP goes to the
-    # depositor, all of it -- the groups they signed for, and any mint above them.
-    sol, improvement = deposit_payout_solution(offer, pool.lp_asset_id, honest, surplus_ph, lp_settlement.name())
+    # A proportional deposit is not a trade, so the router has no claim on it: the LP goes to
+    # the depositor, all of it -- the groups they signed for, and any mint above them. An
+    # unbalanced one pays the router's fee on its swapped share, off this payout.
+    sol, improvement = deposit_payout_solution(offer, pool.lp_asset_id, honest, surplus_ph, lp_settlement.name(),
+                                               fee=router_fee)
     lp_settle_spends = unsigned_spend_bundle_for_spendable_cats(CAT_MOD, [SpendableCAT(
         lp_settlement, pool.lp_asset_id, OFFER_MOD, sol,
         lineage_proof=LineageProof(eve.parent_coin_info, drv.LP_MINT_INNER.get_tree_hash(), eve.amount))]).coin_spends
@@ -784,6 +801,8 @@ def settle_add(pool: drv.V18Pool, offer: Offer, height: int, surplus_ph: bytes32
     return _finish(offer, pool, pool_bundle, new_state, {
         "deposits": deposits, "lp_minted": honest, "requested": requested, "surplus": improvement,
         "backing": honest, "excess_xch": 0, "h": int(height),
+        "router_fee": honest - requested - improvement if router_fee else 0,
+        "router_fee_bps": int(fee_bps) if router_fee else 0,
     })
 
 
@@ -853,13 +872,15 @@ def settle(action: str, pool: drv.V18Pool, offer: Offer, height: int, surplus_ph
            fee_bps: int = 0) -> SettleResult:
     """Dispatch by action name; the surplus defaults to the pool's protocol recipient.
 
-    `fee_bps` is the router's own rate and applies to swaps only. A deposit or a
-    withdrawal has no router fee: its overage is rounding on the trader's own
-    liquidity, and those two settlers still pay it where they always did.
+    `fee_bps` is the router's own rate. A swap pays it on the whole trade; an add pays it
+    on the swapped share of an unbalanced deposit only, nothing when the deposit is
+    proportional (owner, 2026-11-16; forge_lp_add_fee); a withdrawal never pays it.
     """
     if action not in SETTLERS:
         raise ValueError(f"V{PROTOCOL_VERSION} settles swap, add and remove; got {action!r}")
     recipient = surplus_ph if surplus_ph is not None else pool.protocol_ph
     if action == "swap":
         return settle_swap(pool, offer, int(height), recipient, int(fee_bps))
+    if action == "add":
+        return settle_add(pool, offer, int(height), recipient, int(fee_bps))
     return SETTLERS[action](pool, offer, int(height), recipient)

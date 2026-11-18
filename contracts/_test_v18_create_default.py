@@ -29,8 +29,12 @@ sys.stdout.reconfigure(encoding="utf-8")
 import forge_network  # noqa: E402
 import forge_stdin  # noqa: E402
 
-EXPECTED = {"mainnet": 19, "testnet11": 19}
-FALLBACK = {"mainnet": 17}
+# V19 (protocol 20, 2026-11-17) is the target on both networks once its record is held; with no v19
+# record held (every case below) each network falls back down its ladder to exactly what this suite
+# pinned before: testnet 19, mainnet 19 with v18-mainnet.json held, else 17. The V19 cases are
+# contracts/_test_v19_create_default.py's.
+EXPECTED = {"mainnet": 20, "testnet11": 20}
+FALLBACK = {"mainnet": [19, 17], "testnet11": [19]}
 results: list[bool] = []
 
 
@@ -51,9 +55,11 @@ def on(network: str | None):
 def api_tables() -> tuple[dict, dict]:
     text = (Path(__file__).resolve().parent.parent / "api" / "_forgeVersion.js").read_text(encoding="utf-8")
     m = re.search(r"FORGE_CREATE_PROTOCOL_BY_NETWORK\s*=\s*Object\.freeze\(\{\s*mainnet:\s*(\d+),\s*testnet:\s*(\d+)\s*\}\)", text)
-    f = re.search(r"FORGE_CREATE_FALLBACK_BY_NETWORK\s*=\s*Object\.freeze\(\{\s*mainnet:\s*(\d+)\s*\}\)", text)
+    f = re.search(r"FORGE_CREATE_FALLBACK_BY_NETWORK\s*=\s*Object\.freeze\(\{\s*mainnet:\s*Object\.freeze\(\[([\d,\s]*)\]\),"
+                  r"\s*testnet:\s*Object\.freeze\(\[([\d,\s]*)\]\)\s*\}\)", text)
+    ladder = lambda g: [int(x) for x in g.replace(" ", "").split(",") if x]  # noqa: E731
     return ({"mainnet": int(m.group(1)), "testnet11": int(m.group(2))} if m else {},
-            {"mainnet": int(f.group(1))} if f else {})
+            {"mainnet": ladder(f.group(1)), "testnet11": ladder(f.group(2))} if f else {})
 
 
 class Volume:
@@ -81,17 +87,17 @@ def main() -> int:
     saved = os.environ.get("FORGE_NETWORK")
     try:
         print("the tables:")
-        check("forge_network.CREATE_PROTOCOL_BY_NETWORK is mainnet 19, testnet 19",
+        check("forge_network.CREATE_PROTOCOL_BY_NETWORK is mainnet 20, testnet 20 (V19 once its record is held)",
               forge_network.CREATE_PROTOCOL_BY_NETWORK == EXPECTED, str(forge_network.CREATE_PROTOCOL_BY_NETWORK))
-        check("forge_network.CREATE_FALLBACK_BY_NETWORK is mainnet 17 (V16 until v18-mainnet.json is held), testnet none",
+        check("forge_network.CREATE_FALLBACK_BY_NETWORK is mainnet [19, 17] (V18 with v18-mainnet.json, else V16), testnet [19]",
               forge_network.CREATE_FALLBACK_BY_NETWORK == FALLBACK, str(forge_network.CREATE_FALLBACK_BY_NETWORK))
         target, fallback = api_tables()
         check("api/_forgeVersion.js FORGE_CREATE_PROTOCOL_BY_NETWORK says the same", target == EXPECTED, str(target))
         check("api/_forgeVersion.js FORGE_CREATE_FALLBACK_BY_NETWORK says the same", fallback == FALLBACK, str(fallback))
-        check("no network ever creates V17 (18)", 18 not in EXPECTED.values() and 18 not in FALLBACK.values())
+        check("no network ever creates V17 (18)", 18 not in EXPECTED.values() and all(18 not in f for f in FALLBACK.values()))
         check("the V18 lane is carried (19 in forge_stdin._LANES)", 19 in forge_stdin._LANES)
         check("every default is a lane forge_stdin carries",
-              all(v in forge_stdin._LANES for v in [*EXPECTED.values(), *FALLBACK.values()]))
+              all(v in forge_stdin._LANES for v in [*EXPECTED.values(), *(p for f in FALLBACK.values() for p in f)]))
 
         creation = {"action": "prepare-create", "config": {"asset_ids": ["xch", "aa" * 32]}}
         cases = (

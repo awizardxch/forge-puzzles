@@ -1,0 +1,462 @@
+// forge_registry_common.rue -- shared by the Forge V19 registry leaves. Testnet research only; unaudited.
+//
+// The registry is a second CHIP-0050 singleton, one per network, with the
+// upstream default finalizer and no reserve. It holds one slot per registered
+// pool in an XCHandles-style sorted doubly-linked list keyed by the pool's
+// economic config, so a duplicate key cannot be inserted, and it is what the
+// frontend and router scan instead of the server and localStorage deployment
+// index that let retired pools reappear.
+//
+// The load-bearing function here is `pool_full_puzzle_hash`: from a launcher id
+// and a config it rebuilds EXACTLY the puzzle hash a genuine V14 pool's eve coin
+// carries -- reserve puzzle hashes, the multi-reserve finalizer curried with the
+// config binding, the six leaves and their merkle root in the wallet-sdk tree
+// shape, the eve state -- so `register` can assert the launcher actually created
+// that pool. Only V14 hashes are computable here, which is the revision gate: no
+// other revision can register.
+//
+// V13 also pins what the second audit found free: the protocol fee recipient, the
+// price scale and the oracle window are registry constants, not per-pool choices,
+// so a registrar cannot route the protocol fee to themselves under a market's key
+// or register a pool whose first spend exceeds the cost limit (M-3, L-3).
+
+import upstream::action::StateTruth;
+import forge_action_common::*;
+
+export inline const REGISTRY_SLOT_NONCE: Int = 0;
+export inline const POOL_SLOT_NONCE: Int = 1;
+// V19 (external review 2026-11-16, findings 08 and 09: an unbalanced add pays the dev and DAO
+// fees on its swapped share; the genesis supply is bounded above by the reserves) is protocol 20;
+// V18 (2026-11-13: `register` refuses a pool listing its own LP) was protocol 19;
+// V17 (rCAT, canonical selectors and stricter registration) was protocol 18;
+// V16 (2026-10-09: the genesis floor is burned to Chia's burn address 0x...dead) was protocol 17;
+// V15 (the 2026-10-07 review revision: coinid derivations, canonical state atoms) was protocol 16; V14 was protocol 15: reserves are born from a
+// launcher whose announcement `register` derives, and the leaves bind their settlements'
+// amounts -- a different admission rule and different leaves, so a different registry.
+export inline const PROTOCOL_VERSION: Int = 20;
+
+export struct RegistryState {
+    initialized: Int,
+    pool_count: Int,
+    // V15: the creation fee is STATE, not a constant, so the treasury can change it for
+    // future pairs without rolling the registry over (owner, 2026-10-07). `init` seeds it
+    // from CONSTANTS.creation_fee; only `set_fee` moves it; `register` charges whatever it
+    // holds at the time of the spend.
+    creation_fee: Int,
+}
+
+// What a coin at the treasury's puzzle hash sends (mode 23, receiver = this registry
+// coin) to set the creation fee for future pairs. The receiver is committed by
+// consensus, so the message names only the fee.
+export fn registry_fee_message(new_fee: Int) -> Bytes32 {
+    tree_hash(["forge-registry-fee-v19", new_fee])
+}
+
+// V17: a pool that names a DAO is listed only with that DAO's consent. The market key holds
+// the DAO recipient, so the DAO proves control of its recipient by spending a
+// coin AT it that sends this message to the registry coin (mode 23, as `dao_fee` and `set_fee`
+// already do), naming the exact pool (its launcher), its configuration and the opening rate.
+// Anyone may list a pool with a DAO address they control; nobody can bind one they do not.
+// The receiver is the registry coin, so a consent is spent with the registration it names.
+export fn dao_consent_message(launcher_id: Bytes32, config_hash: Bytes32, dao_fee_bps: Int) -> Bytes32 {
+    tree_hash(["forge-dao-consent-v19", launcher_id, config_hash, dao_fee_bps])
+}
+
+export struct RegistryOutput {
+    state_truth: StateTruth,
+    ...conditions: List<Condition>,
+}
+
+// Curried into every registry leaf. Everything a V12 pool is made of, plus the
+// gate and where its fee goes.
+export struct RegistryConstants {
+    action_layer_mod_hash: Bytes32,
+    p2_delegated_mod_hash: Bytes32,
+    slot_mod_hash: Bytes32,
+    reserve_finalizer_mod_hash: Bytes32,
+    reserve_amount_program_hash: Bytes32,
+    lp_tail_mod_hash: Bytes32,
+    leaves: LeafModHashes,
+    creation_fee: Int,
+    treasury_puzzle_hash: Bytes32,
+    // this registry's own slot first-curry hash (nonce 0) and hint (its launcher id)
+    slot_1st_curry_hash: Bytes32,
+    hint: Bytes32,
+    // V13: protocol parameters every registered pool must carry verbatim.
+    protocol_puzzle_hash: Bytes32,
+    price_scale: Int,
+    oracle_window: Int,
+    // V14: the mod hash of forge_reserve_launcher, the only puzzle a reserve may be born from.
+    reserve_launcher_mod_hash: Bytes32,
+    // V17: the mandatory dev fee rate, pinned at registry genesis.
+    // Every pool must carry exactly this rate, so a creator cannot register a cheaper twin, and
+    // the rate cannot change for a pool's life (it is curried into the leaves; no leaf moves it).
+    // A different rate needs a new registry, never a spend on an existing pool.
+    protocol_fee_bps: Int,
+}
+
+// A registered pool's slot value: (key . (launcher_id . (left_key . right_key))).
+export fn slot_value_hash(key: Bytes32, launcher_id: Bytes32, left_key: Bytes32, right_key: Bytes32) -> Bytes32 {
+    tree_hash((key, (launcher_id, (left_key, right_key))))
+}
+
+// The uniqueness key: the economic config. Two pools with the same assets,
+// weights, LP fee and DAO recipient are the same market, and the list admits one
+// of them; a different DAO may list its own pool of the same pair.
+// V17: the dev fee is no longer part of the key. It is pinned to the
+// registry's rate (valid_pool), so every pool of a market carries the same dev
+// fee and a respelled-rate twin can no longer be a distinct key. valid_config
+// forces the remaining key fields canonical, so one market has one key.
+// V17 (rCAT): the hidden puzzle hashes are part of the key, so (X, H), (X, H') and plain X are
+// three markets, and a pool cannot be listed under another issuer's H by naming the asset alone.
+export fn pool_key(config: PoolConfig) -> Bytes32 {
+    tree_hash([config.asset_ids, config.weights, config.fee_bps, config.dao_puzzle_hash, config.hidden_puzzle_hashes])
+}
+
+export inline fn min_key() -> Bytes32 {
+    0x0000000000000000000000000000000000000000000000000000000000000000
+}
+
+export inline fn max_key() -> Bytes32 {
+    0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+}
+
+fn zeros(count: Int) -> List<Int> {
+    if count <= 0 {
+        nil
+    } else {
+        (0, zeros(count - 1))
+    }
+}
+
+fn all_positive(list: List<Int>) -> Bool {
+    if list is nil {
+        true
+    } else {
+        list.first > 0 && all_positive(list.rest)
+    }
+}
+
+// V19 (finding 09): the least entry of a non-empty list. valid_pool calls it after
+// count_ints(reserves) == count_bytes(asset_ids), and a pool always lists an asset; an empty
+// list (unreachable) answers 0, which refuses.
+fn min_int_list(list: List<Int>) -> Int {
+    if list is nil {
+        0
+    } else if list.rest is nil {
+        list.first
+    } else {
+        let rest = min_int_list(list.rest);
+        if list.first < rest { list.first } else { rest }
+    }
+}
+
+// V19 (finding 09): for the XCH slot (asset id zero), total_lp <= reserve_xch. An XCH
+// deposit then never needs more XCH locked as LP backing than it puts in.
+fn xch_backed(asset_ids: List<Bytes32>, reserves: List<Int>, total_lp: Int) -> Bool {
+    if asset_ids is nil {
+        true
+    } else if reserves is nil {
+        false
+    } else {
+        (asset_ids.first != zero_bytes32() || total_lp <= reserves.first)
+            && xch_backed(asset_ids.rest, reserves.rest, total_lp)
+    }
+}
+
+export fn singleton_struct_hash(launcher_id: Bytes32) -> Bytes32 {
+    tree_hash((SINGLETON_MOD_HASH, (launcher_id, SINGLETON_LAUNCHER_PUZZLE_HASH)))
+}
+
+// ---- V17 (rCAT): the issuer binds H (owner decision 2026-11-12) ----------------------------
+//
+// CHIP-0038 ties a revocable CAT's hidden puzzle hash H to nothing: anyone can wrap a PLAIN
+// CAT in a revocation layer with an H they hold. A pool naming (asset, H_attacker) would hand
+// every LP's deposited reserve to that H's holder through the hidden path. So a pool may name
+// (asset, H) only when the ASSET'S OWN ISSUER says H is its revocation hash:
+//
+//   1. The asset is an rCAT of the CHIP-0038 reference TAIL, everything_with_singleton (EWS),
+//      whose asset id is a curry of the issuer's singleton -- the singleton created at the
+//      asset's origin, the only thing that can mint or melt it. The registrant names the
+//      issuer's launcher id L and the TAIL's nonce N; `register` recomputes
+//          asset_id == curry(EWS, [SINGLETON_MOD_HASH, singleton_struct(L), N])
+//      A plain CAT wrapped in someone's own H fails here: its id is not that curry.
+//   2. That issuer singleton attests the pairing: a mode-23 message from the singleton's coin
+//      (puzzle hash curry(SINGLETON_MOD, [struct(L), inner]), any inner -- the singleton layer
+//      guarantees lineage from L's launcher) to this registry coin, naming the asset, H and
+//      the pool's launcher, so it cannot be replayed to another pool.
+//
+// Both steps apply only when the registrant supplies a proof. Attestation is OPTIONAL (owner
+// decision 2026-11-12): an issuer may be unable to attest (lost singleton, non-EWS TAIL,
+// unresponsive), so an rCAT with a nil proof registers with no issuer condition and the
+// fake-H defence for it is the router/site gate, which checks H against the asset's mint on
+// chain. A proof that IS given is enforced in full, so an attested pool is provably
+// issuer-approved on chain. This proves H is the issuer's own, not that the issuer is honest.
+export inline const EVERYTHING_WITH_SINGLETON_MOD_HASH: Bytes32 = 0x0876da2005fe6262d4504c27a1b6379227aba8adbbad3758cb0e329a4e74c6cc;
+
+export struct IssuerProof {
+    launcher_id: Bytes32,
+    nonce: Bytes,
+    ...inner_puzzle_hash: Bytes32,
+}
+
+export fn ews_asset_id(launcher_id: Bytes32, nonce: Bytes) -> Bytes32 {
+    curry_tree_hash(EVERYTHING_WITH_SINGLETON_MOD_HASH, [
+        tree_hash_atom(SINGLETON_MOD_HASH),
+        tree_hash_atom(singleton_struct_hash(launcher_id)),
+        tree_hash_atom(nonce),
+    ])
+}
+
+export fn rcat_issuer_message(asset_id: Bytes32, hidden_puzzle_hash: Bytes32, pool_launcher_id: Bytes32) -> Bytes32 {
+    tree_hash(["forge-rcat-issuer-v19", asset_id, hidden_puzzle_hash, pool_launcher_id])
+}
+
+// One proof per asset, walked in step with the asset ids and H list: nil for a plain asset,
+// nil or an IssuerProof for an rCAT (attestation is OPTIONAL, owner decision 2026-11-12).
+// Returns the issuers' RECEIVE_MESSAGEs. A list of the wrong length or a proof on a plain
+// asset fails the registration; a proof that is given is enforced in full (EWS + message).
+export fn issuer_attestations(asset_ids: List<Bytes32>, hiddens: List<Bytes32>, proofs: List<Any>,
+                              pool_launcher_id: Bytes32) -> List<Condition> {
+    if asset_ids is nil {
+        assert proofs is nil;
+        nil
+    } else {
+        inline let (proof, remaining) = unchecked_cast::<(Any, List<Any>)>(proofs);
+        inline let (hidden, remaining_hiddens) = unchecked_cast::<(Bytes32, List<Bytes32>)>(hiddens);
+        if hidden == zero_bytes32() {
+            assert proof is nil;
+            issuer_attestations(asset_ids.rest, remaining_hiddens, remaining, pool_launcher_id)
+        } else if proof is nil {
+            // Unattested rCAT (owner decision 2026-11-12): the issuer may be unable to attest,
+            // so no issuer condition. The router/site gate checks H against the asset's mint.
+            issuer_attestations(asset_ids.rest, remaining_hiddens, remaining, pool_launcher_id)
+        } else {
+            let p = unchecked_cast::<IssuerProof>(proof);
+            assert is_puzzle_hash(p.launcher_id);
+            assert is_puzzle_hash(p.inner_puzzle_hash);
+            let struct_hash = singleton_struct_hash(p.launcher_id);
+            assert asset_ids.first == ews_asset_id(p.launcher_id, p.nonce);
+            (
+                ReceiveMessage {
+                    mode: SENDER_PUZZLE | RECEIVER_COIN,
+                    message: rcat_issuer_message(asset_ids.first, hidden, pool_launcher_id),
+                    sender: [curry_tree_hash(SINGLETON_MOD_HASH, [struct_hash, p.inner_puzzle_hash])],
+                },
+                issuer_attestations(asset_ids.rest, remaining_hiddens, remaining, pool_launcher_id)
+            )
+        }
+    }
+}
+
+// p2_delegated_by_singleton curried with (SINGLETON_MOD_HASH, struct hash, nonce = asset index).
+fn reserve_inner_hash(c: RegistryConstants, struct_hash: Bytes32, index: Int) -> Bytes32 {
+    curry_tree_hash(c.p2_delegated_mod_hash, [
+        tree_hash_atom(SINGLETON_MOD_HASH),
+        tree_hash_atom(struct_hash),
+        tree_hash(index),
+    ])
+}
+
+export fn reserve_inner_hashes(c: RegistryConstants, struct_hash: Bytes32, asset_ids: List<Bytes32>, index: Int) -> List<Bytes32> {
+    if asset_ids is nil {
+        nil
+    } else {
+        (reserve_inner_hash(c, struct_hash, index), reserve_inner_hashes(c, struct_hash, asset_ids.rest, index + 1))
+    }
+}
+
+// V17 (rCAT): an rCAT reserve is the same reserve puzzle under the revocation layer with the
+// pool's H. The INNER hash (what the finalizer recreates and the reserve launcher creates) is
+// unchanged: the layer's owner path rewrites that CREATE_COIN to rev(H, inner) itself. Only
+// the FULL hash -- the coin the finalizer's message is addressed to -- carries H.
+fn reserve_full_hashes(asset_ids: List<Bytes32>, hiddens: List<Bytes32>, inner_hashes: List<Bytes32>) -> List<Bytes32> {
+    if asset_ids is nil {
+        nil
+    } else {
+        inline let (inner, remaining) = unchecked_cast::<(Bytes32, List<Bytes32>)>(inner_hashes);
+        inline let (hidden, remaining_hiddens) = unchecked_cast::<(Bytes32, List<Bytes32>)>(hiddens);
+        (
+            if asset_ids.first == zero_bytes32() {
+                inner
+            } else {
+                cat_puzzle_hash(asset_ids.first, layered_puzzle_hash(hidden, inner))
+            },
+            reserve_full_hashes(asset_ids.rest, remaining_hiddens, remaining)
+        )
+    }
+}
+
+// ---- V14: reserve parents are derived from the launcher, never claimed (spec 1.3) --------
+
+// The full puzzle hash a reserve launcher for `asset_id` has: bare for XCH, CAT-wrapped for a CAT.
+// V17 (rCAT): an rCAT reserve's launcher is the launcher under the same layer and H, so the
+// reserve it creates is born layered (the layer wraps the launcher's CREATE_COIN).
+export fn reserve_launcher_full_hash(c: RegistryConstants, asset_id: Bytes32, hidden_puzzle_hash: Bytes32) -> Bytes32 {
+    if asset_id == zero_bytes32() {
+        c.reserve_launcher_mod_hash
+    } else {
+        cat_puzzle_hash(asset_id, layered_puzzle_hash(hidden_puzzle_hash, c.reserve_launcher_mod_hash))
+    }
+}
+
+// P_i = coinid(grandparent_i, launcher_full_hash_i, reserves[i]), one per asset. A list of
+// the wrong length fails: `first` of nil raises, and a leftover tail is asserted away.
+export fn derived_reserve_parents(c: RegistryConstants, asset_ids: List<Bytes32>, hiddens: List<Bytes32>, reserves: List<Int>, grandparents: List<Bytes32>) -> List<Bytes32> {
+    if asset_ids is nil {
+        assert reserves is nil;
+        assert grandparents is nil;
+        nil
+    } else {
+        inline let (amount, remaining_amounts) = unchecked_cast::<(Int, List<Int>)>(reserves);
+        inline let (grandparent, remaining_grandparents) = unchecked_cast::<(Bytes32, List<Bytes32>)>(grandparents);
+        inline let (hidden, remaining_hiddens) = unchecked_cast::<(Bytes32, List<Bytes32>)>(hiddens);
+        assert grandparent != zero_bytes32();
+        (
+            coinid(grandparent, reserve_launcher_full_hash(c, asset_ids.first, hidden), amount),
+            derived_reserve_parents(c, asset_ids.rest, remaining_hiddens, remaining_amounts, remaining_grandparents)
+        )
+    }
+}
+
+// One coin announcement per reserve, from the derived parent: it created the reserve's inner
+// puzzle hash (wrapped by the CAT layer for a CAT) for exactly reserves[i], hinted with this
+// launcher id. The announcing coin must be spent in the bundle, so the reserve is born in it.
+export fn reserve_launch_asserts(parents: List<Bytes32>, inner_hashes: List<Bytes32>, reserves: List<Int>, launcher_id: Bytes32) -> List<Condition> {
+    if parents is nil {
+        assert inner_hashes is nil;
+        assert reserves is nil;
+        nil
+    } else {
+        inline let (inner_hash, remaining_inner) = unchecked_cast::<(Bytes32, List<Bytes32>)>(inner_hashes);
+        inline let (amount, remaining_amounts) = unchecked_cast::<(Int, List<Int>)>(reserves);
+        (
+            AssertCoinAnnouncement {
+                id: sha256(parents.first + reserve_launcher_message(inner_hash, amount, launcher_id)),
+            },
+            reserve_launch_asserts(parents.rest, remaining_inner, remaining_amounts, launcher_id)
+        )
+    }
+}
+
+// The genesis state a V12 pool opens with: the reserves and LP the creator
+// funded, no fees owed, an oracle at height 0 with zero accumulators, a zero
+// prev_root, the opening DAO rate and nothing owed to the DAO.
+export fn eve_state_hash(reserves: List<Int>, total_lp: Int, asset_count: Int, dao_fee_bps: Int, reserve_parents: List<Bytes32>) -> Bytes32 {
+    // V12: the eve state carries the creation reserves' parent ids (finding P1, reserve receivers).
+    // V13: the oracle opens with a zero last_spot too.
+    tree_hash([reserves, total_lp, zeros(asset_count), [0, zeros(asset_count - 1), zeros(asset_count - 1)], zero_bytes32(), dao_fee_bps, zeros(asset_count), reserve_parents])
+}
+
+// EXACTLY the puzzle hash `make_pool` in the harness and the driver produce:
+// singleton_top_layer_v1_1 around the action layer curried with the
+// multi-reserve finalizer, the five-leaf root, and the eve state.
+export fn pool_full_puzzle_hash(
+    c: RegistryConstants,
+    launcher_id: Bytes32,
+    config: PoolConfig,
+    reserves: List<Int>,
+    total_lp: Int,
+    dao_fee_bps: Int,
+    reserve_parents: List<Bytes32>,
+) -> Bytes32 {
+    let struct_hash = singleton_struct_hash(launcher_id);
+    let n = count_bytes(config.asset_ids);
+    let inner_hashes = reserve_inner_hashes(c, struct_hash, config.asset_ids, 0);
+    let full_hashes = reserve_full_hashes(config.asset_ids, config.hidden_puzzle_hashes, inner_hashes);
+
+    // the pool's own observation-slot first-curry hash (nonce 1)
+    let pool_slot_1st = curry_tree_hash(c.slot_mod_hash, [
+        tree_hash((SINGLETON_MOD_HASH, struct_hash)),
+        tree_hash(POOL_SLOT_NONCE),
+    ]);
+    let config_hash = tree_hash(config);
+    // V13: the finalizer carries the configuration binding in its first curry.
+    let finalizer_1st = curry_tree_hash(c.reserve_finalizer_mod_hash, [
+        tree_hash_atom(c.action_layer_mod_hash),
+        tree_hash(full_hashes),
+        tree_hash(inner_hashes),
+        c.reserve_amount_program_hash,
+        tree_hash_atom(launcher_id),
+        tree_hash_atom(config_hash),
+        tree_hash(c.leaves),
+        tree_hash_atom(pool_slot_1st),
+    ]);
+    let finalizer = curry_tree_hash(finalizer_1st, [tree_hash_atom(finalizer_1st)]);
+    // the same root the finalizer asserts on every spend
+    let root = config_root(c.leaves, config_hash, pool_slot_1st);
+
+    let inner = curry_tree_hash(c.action_layer_mod_hash, [
+        finalizer,
+        tree_hash_atom(root),
+        eve_state_hash(reserves, total_lp, n, dao_fee_bps, reserve_parents),
+    ]);
+    curry_tree_hash(SINGLETON_MOD_HASH, [struct_hash, inner])
+}
+
+// What the registry requires of a pool before it will list it. V10's
+// validate_config (carried), the LP asset id tied to THIS launcher, a genesis every
+// reserve of which is funded and whose supply exceeds the locked floor, and -- V13 --
+// the protocol parameters the registry pins.
+// V17: the weights' greatest common divisor, so a market cannot be listed twice
+// by scaling its weights ([2,2] is the same market as [1,1]). Euclid, folding left; gcd(0,w)=w.
+fn int_gcd(a: Int, b: Int) -> Int {
+    if b == 0 {
+        a
+    } else {
+        let (_, r) = divmod(a, b);
+        int_gcd(b, r)
+    }
+}
+
+fn weights_gcd(weights: List<Int>, acc: Int) -> Int {
+    if weights is nil {
+        acc
+    } else {
+        weights_gcd(weights.rest, int_gcd(acc, weights.first))
+    }
+}
+
+// V18: true when `asset_id` is one of the pool's reserve assets.
+// `register` asserts the pool's OWN LP asset id is not: see the note there.
+export fn lists_asset(asset_ids: List<Bytes32>, asset_id: Bytes32) -> Bool {
+    if asset_ids is nil {
+        false
+    } else {
+        asset_ids.first == asset_id || lists_asset(asset_ids.rest, asset_id)
+    }
+}
+
+export fn valid_pool(c: RegistryConstants, launcher_id: Bytes32, config: PoolConfig, reserves: List<Int>, total_lp: Int, dao_fee_bps: Int) -> Bool {
+    valid_config(config)
+        && dao_fee_bps >= 0
+        && dao_fee_bps <= MAX_DAO_FEE_BPS
+        // V17: canonical, so the hashed genesis state carries one encoding of the rate.
+        && dao_fee_bps == dao_fee_bps + 0
+        && (dao_fee_bps == 0 || config.dao_puzzle_hash != zero_bytes32())
+        // V17: the dev fee is mandatory and exactly the registry's rate.
+        && config.protocol_fee_bps == c.protocol_fee_bps
+        // V17: weights in lowest terms, one market one key.
+        && weights_gcd(config.weights, 0) == 1
+        && count_ints(reserves) == count_bytes(config.asset_ids)
+        && all_positive(reserves)
+        // V17: a genesis supply floor. One LP unit is the most any add can lose to rounding,
+        // so the floor caps that loss at 1 / MIN_GENESIS_LP of the pool. It costs the creator MIN_GENESIS_LP - 1
+        // mojos of LP backing (0.000001 XCH). It subsumes V13's `total_lp > LOCKED_BURN`.
+        && total_lp >= MIN_GENESIS_LP
+        // V19 (external review 2026-11-16, finding 09): a genesis supply bounded by the
+        // reserves it stands on. At most MAX_GENESIS_LP_PER_MOJO LP per mojo of the scarcest
+        // reserve (a vault: lpRatio <= 10^6), and, when XCH is an asset, at most one LP per
+        // XCH mojo (an XCH vault: lpRatio <= 1), so a deposit never needs more LP backing
+        // than a bounded multiple of what it adds. Checked once: afterward the ratio moves
+        // only with the market.
+        && total_lp <= MAX_GENESIS_LP_PER_MOJO * min_int_list(reserves)
+        && xch_backed(config.asset_ids, reserves, total_lp)
+        && config.protocol_puzzle_hash == c.protocol_puzzle_hash
+        && config.price_scale == c.price_scale
+        && config.oracle_window == c.oracle_window
+        && config.lp_tail_hash == curry_tree_hash(c.lp_tail_mod_hash, [
+            tree_hash_atom(launcher_id),
+            tree_hash(PROTOCOL_VERSION),
+        ])
+}

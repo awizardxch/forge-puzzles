@@ -25,6 +25,7 @@ stdin JSON, by "mode":
   identify       {network_id, offer?, proof?}        -> {payers, proof: {ok, reason, proven, payers}}
   keys-to-phs    {keys}                              -> {phs: {key: ph}}
   message        {network_id, keys, payers, expires_at} -> {message}
+  verify-signin  {proof: {message, key, signature|signatures, scheme?}} -> {verdict: {ok, reason, proven}}
   token-balances {node_url, phs, assets}             -> {balances: {ph: {asset: mojos}}}
   sign-keys      {secret_keys, message}              (checks only) -> {keys, signature, phs}
   probe-offer    {payers}                            (checks only) -> {offer}
@@ -49,6 +50,14 @@ from chia_rs import AugSchemeMPL, G1Element, G2Element, PrivateKey
 from chia_rs.sized_bytes import bytes32
 
 PROOF_TITLE = "The Forge - fee rate"   # ASCII only: it must survive every wallet's signing prompt
+# The operator sign-in's own title (api/_adminSession.js builds the text, with a nonce the router
+# issued). A fee proof is never a sign-in and a sign-in is never a fee proof (external review
+# 2026-11-16, finding 01): each verifier refuses the other's title.
+SIGNIN_TITLE = "The Forge - operator sign-in"
+# The longest a fee proof may stand (external review 2026-11-16, finding 04): the site signs one
+# a day, the message helper allows seven, and the verifier is what holds the line, since a
+# proof can be built offline with any expiry. A few minutes over, for clock skew.
+MAX_PROOF_TTL_SECONDS = 7 * 24 * 3600 + 10 * 60
 MAX_KEYS = 600
 # The creation gate matches a whole wallet scan (WalletConnect pages run to 5,000 keys);
 # ~0.26 ms a key, so 6,000 is under two seconds.
@@ -243,7 +252,7 @@ def verify_proof(proof: dict, network_id: str, offer_payers: list[str] | None) -
         return refuse(f"a proof names 1 to {MAX_KEYS} distinct keys")
     if len(payers) > MAX_PAYERS:
         return refuse(f"a proof vouches for at most {MAX_PAYERS} payers")
-    if not message.startswith(PROOF_TITLE):
+    if message.startswith(SIGNIN_TITLE) or not message.startswith(PROOF_TITLE):
         return refuse("not a Forge fee proof")
     if _field(message, "Network") != network_id:
         return refuse("the proof names another network")
@@ -252,8 +261,13 @@ def verify_proof(proof: dict, network_id: str, offer_payers: list[str] | None) -
         when = datetime.fromisoformat(expires.replace("Z", "+00:00"))
     except ValueError:
         return refuse("the proof has no readable expiry")
-    if when <= datetime.now(timezone.utc):
+    if when.tzinfo is None:
+        return refuse("the proof's expiry names no time zone")
+    now = datetime.now(timezone.utc)
+    if when <= now:
         return refuse("the proof has expired")
+    if (when - now).total_seconds() > MAX_PROOF_TTL_SECONDS:
+        return refuse("the proof's expiry is further out than a fee proof may stand (7 days)")
     if _field(message, "Keys") != list_digest(keys):
         return refuse("the proof's key digest does not match the keys it lists")
     if _field(message, "Payers") != list_digest(payers):
@@ -269,6 +283,32 @@ def verify_proof(proof: dict, network_id: str, offer_payers: list[str] | None) -
         if missing:
             return refuse(f"the offer spends a coin the proof does not vouch for ({missing[0][:8]}...)")
     return {"ok": True, "reason": None, "proven": proven, "payers": sorted(vouched), "expires_at": expires}
+
+
+def verify_signin(proof: dict) -> dict:
+    """{"ok", "reason", "proven"}: the operator sign-in's signature. The router compares the
+    message to the one it issued with its nonce (api/_adminSession.js) and asks here only
+    whether `key` signed it, by the stand-in spend (AGG_SIG_UNSAFE over sha256(message)) or
+    chip0002_signMessage. A fee proof's text is refused outright."""
+    def refuse(reason: str) -> dict:
+        return {"ok": False, "reason": reason, "proven": []}
+    try:
+        message = str(proof.get("message") or "")
+        key = _clean(proof.get("key"))
+        listed = proof.get("signatures")
+        raw = listed[0] if isinstance(listed, list) and len(listed) == 1 else proof.get("signature")
+        sig = G2Element.from_bytes(bytes.fromhex(_clean(raw)))
+        pk = G1Element.from_bytes(bytes.fromhex(key))
+    except Exception as exc:  # noqa: BLE001
+        return refuse(f"malformed sign-in: {exc}")
+    if message.startswith(PROOF_TITLE) or not message.startswith(SIGNIN_TITLE + "\n"):
+        return refuse("not an operator sign-in message")
+    if _field(message, "Key") != key:
+        return refuse("the sign-in names another key")
+    digest = chip0002_digest(message) if proof.get("scheme") == "chip0002" else message_digest(message)
+    if not AugSchemeMPL.verify(pk, digest, sig):
+        return refuse("the signature is not this key's over the sign-in message")
+    return {"ok": True, "reason": None, "proven": [key_ph(key)]}
 
 
 def _post(url: str, body: dict) -> dict:
@@ -331,6 +371,9 @@ def main() -> int:
         print(json.dumps({"success": True, "message": build_message(
             str(payload["network_id"]), list(payload.get("keys") or []), list(payload.get("payers") or []),
             str(payload["expires_at"]))}))
+        return 0
+    if mode == "verify-signin":
+        print(json.dumps({"success": True, "verdict": verify_signin(payload.get("proof") or {})}))
         return 0
     if mode == "token-balances":
         print(json.dumps({"success": True, "balances": token_balances(

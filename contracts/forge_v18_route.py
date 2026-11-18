@@ -54,6 +54,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import forge_math  # noqa: E402
+from forge_lp_add_fee import add_router_fee  # noqa: E402
 from chia.types.blockchain_format.program import Program  # noqa: E402
 from chia.types.coin_spend import make_spend  # noqa: E402
 from chia.wallet.cat_wallet.cat_utils import (  # noqa: E402
@@ -276,6 +277,10 @@ class _Composer:
         # `compose` from the offer, or by a preview asked to size one (`fee_mode="surplus"`).
         self.wallet_built = False
         self.router_fee_out = 0
+        # A routed deposit's router fee (owner, 2026-11-16): not the rate on the whole payout
+        # but on the deposit's swapped share (forge_lp_add_fee), so its size comes from the
+        # lane: `payout_fee(asset, total)` -> the fee on that payout. None: the rate as above.
+        self.payout_fee = None
         self.states = [p.state for p in pools]
         # V18 (rCAT): every asset's H, from the pools' configs (route_hiddens)
         self.hidden = route_hiddens(pools)
@@ -717,7 +722,7 @@ class _Composer:
         paid: dict[str, int] = {}
         payouts = [k for k, ps in self.leg_producers.items()
                    if sum(int(p.coin.amount) for p in ps) > self.ext_exit_amount.get(k, 0)]
-        if self.wallet_built and self.fee_bps > 0 and len(payouts) != 1:
+        if self.wallet_built and (self.fee_bps > 0 or self.payout_fee is not None) and len(payouts) != 1:
             # The fee is a rate on the payout; with two payout assets which one carries it
             # would be the trader's pick. Such a route keeps the site-built offer. With no
             # fee (an exempt wallet) nothing has to choose, so a balance's dust may ride along.
@@ -730,7 +735,8 @@ class _Composer:
             makers = self.ext_exit_groups.get(key, [])
             total = sum(int(p.coin.amount) for p in producers) - owed
             requested = int(wanted.get(asset, 0))
-            fee = total * self.fee_bps // 10_000 if self.wallet_built else 0
+            fee = (0 if not self.wallet_built else self.payout_fee(asset, total) if self.payout_fee is not None
+                   else total * self.fee_bps // 10_000)
             if self.preview:
                 self.released[_hex(asset)] = total
                 paid[_hex(asset)] = total - fee
@@ -877,7 +883,7 @@ def _take_external(c: "_Composer", maker: Offer, entry: set, exits: set, candida
 
 def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph: bytes32,
             fee_bps: int = 0, fee_ph: bytes32 | None = None, externals: list | None = None,
-            preview: bool = False, fee_mode: str = "auto") -> RouteResult:
+            preview: bool = False, fee_mode: str = "auto", payout_fee=None) -> RouteResult:
     all_cats = {a for p in pools for a in p.asset_ids if a is not None} | {p.lp_asset_id for p in pools}
     hiddens = route_hiddens(pools)                       # V18 (rCAT): refuses one asset under two H
     offered = find_route_settlements(offer, pools)
@@ -950,6 +956,10 @@ def compose(pools: list, legs: list[Leg], offer: Offer, height: int, surplus_ph:
         c.wallet_built = fee_mode == "surplus" if preview else (
             all(maker_payment_to(offer, a, fee_ph, hiddens.get(_key(a), ZERO_32)) == 0 for a in offered)
             and all(requested_to(offer, a, fee_ph) == 0 for a in wanted))
+    if payout_fee is not None and fee_ph is not None:
+        # A routed deposit's fee on its swapped share: always off the payout, as a wallet-built
+        # offer pays it, and nothing on the entry (fee_bps is 0 here).
+        c.wallet_built, c.fee_ph, c.payout_fee = True, fee_ph, payout_fee
     for asset, s in offered.items():
         c.offer_producers[_key(asset)] = Producer(s.coin, asset, s.lineage_proof, "offer settlement")
     candidates = sorted(all_cats | {a for a in wanted if a is not None})
@@ -1415,7 +1425,7 @@ def vault_route(swap_pool, asset_in, vault, offer: Offer, height: int, surplus_p
 
 
 def routed_deposit(target, sales: list, offer: Offer, height: int, surplus_ph: bytes32, fee_bps: int = 0, fee_ph: bytes32 | None = None,
-                   preview: bool = False, fee_mode: str = "auto") -> RouteResult:
+                   preview: bool = False, fee_mode: str = "auto", add_fee_bps: int = 0, add_fee_ph: bytes32 | None = None) -> RouteResult:
     """sales: [(pools, path, amount_in)] selling excess into deficit assets; then the add.
 
     A sale may cross the target itself: that is the zap (roadmap item 9), one asset in,
@@ -1432,9 +1442,41 @@ def routed_deposit(target, sales: list, offer: Offer, height: int, surplus_ph: b
         legs.extend(_chain(distinct, pools, path, amount_in))
     sale_legs = list(legs)
     legs.append(Leg(_pool_index(distinct, target), "add"))
-    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode)
+    payout_fee = None
+    if int(add_fee_bps) > 0 and add_fee_ph is not None:
+        # The Liquidity tab's deposit (owner, 2026-11-16): the router's rate on the swapped share
+        # only, and `fee_bps` (the rate on the whole payout) is the Swap tab's zap, not this.
+        if int(fee_bps) > 0:
+            raise OfferRejected("a routed deposit is charged on its swapped share or on its payout, not both")
+        payout_fee = swapped_share_fee(target, sales, offer, distinct, int(add_fee_bps))
+        fee_ph = add_fee_ph
+    result = compose(distinct, legs, offer, height, surplus_ph, fee_bps, fee_ph, preview=preview, fee_mode=fee_mode,
+                     payout_fee=payout_fee)
     return RouteResult(result.bundle, result.pools, legs,
                        {**result.details, "sale_outputs": [leg.out for leg in sale_legs]})
+
+
+def swapped_share_fee(target, sales: list, offer: Offer, pools: list, bps: int):
+    """The router's fee on a routed deposit, as `payout_fee` for the composer: the rate on the
+    swapped share of the GROSS deposit -- everything the offer brings of the target's assets,
+    the XCH less the mint's backing -- against the target's reserves before the route
+    (forge_lp_add_fee.add_router_fee). That is the same figure the direct add charges for the
+    same deposit, whichever way the balancing is done. A sale that spends an asset the target
+    does not hold (XCH above the backing into a pool without XCH, another CAT) turns the deposit
+    into a trade: the whole payout pays the rate, as the Swap tab's zap does."""
+    held = {_key(a) for a in target.asset_ids}
+    offered = {_key(a): int(s.coin.amount) for a, s in find_route_settlements(offer, pools).items()}
+    foreign = any(_key(_asset(path[0])) not in held for _, path, _ in sales)
+    lp_key = _key(target.lp_asset_id)
+
+    def fee(asset, total: int) -> int:
+        if _key(asset) != lp_key or total <= 0:
+            return 0
+        if foreign:
+            return total * bps // 10_000
+        gross = [offered.get(_key(a), 0) - (total if a is None else 0) for a in target.asset_ids]
+        return add_router_fee(total, target.state[0], [max(0, d) for d in gross], target.weights, bps)
+    return fee
 
 
 def _sale_out(pool, asset_in, asset_out, amount: int) -> int:

@@ -25,6 +25,12 @@ WEIGHT_SCALE = 10_000
 # single-asset pool kept the exact reserve-to-LP ratio it was created with.
 VAULT_FEE_VERSION = 8
 RATIO_SCALE = 1_000_000_000_000
+# Forge V19 (protocol 20; external review 2026-11-16, finding 08): from this math version an
+# unbalanced add also pays the in-puzzle dev fee (`fees_owed`, rate `protocol_fee_bps`) and the
+# DAO fee (`dao_owed`, the rate in state) on the swapped share of each asset's excess, booked
+# in the deposited asset, and every fee of the add is charged on a grossed-up base so an add then
+# a remove never pays more than a swap (add_fee_terms). Older versions are unchanged.
+ADD_OUTPUT_FEE_VERSION = 19
 MAX_ASSETS = 10
 # V6 requires two assets, V7 allows one. The puzzle enforces its own floor, so
 # the shared mirror accepts one upward rather than duplicating the module.
@@ -74,12 +80,85 @@ def normalised_weights(old: Sequence[int], weights: Sequence[int] | None) -> lis
     return [int(w) for w in weights]
 
 
+def max_deposit_ratio(old: Sequence[int], deposits: Sequence[int]) -> int:
+    """V19: the LARGEST deposit ratio across the assets (RATIO_SCALE fixed point)."""
+    return max((deposit * RATIO_SCALE) // reserve for reserve, deposit in zip(old, deposits))
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -((-a) // b)
+
+
+def add_fee_terms(
+    old: Sequence[int],
+    deposits: Sequence[int],
+    weights: Sequence[int] | None,
+    fee_bps: int,
+    protocol_fee_bps: int,
+    dao_fee_bps: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """V19 (external review 2026-11-16, finding 08): per asset, the (LP fee, dev fee, DAO fee) an
+    add charges, mirroring forge_curve.rue (swap_base, effective_product, add_output_fees) exactly.
+
+    For an asset that does not hold all the weight, with ratio = min_deposit_ratio(old, gross),
+    growth = RATIO_SCALE + max_deposit_ratio(old, gross), F = fee + dev + DAO bps, W = WEIGHT_SCALE:
+
+        excess  = deposit - floor(old * ratio / RATIO_SCALE)
+        swapped = floor(excess * (K - k) / K)
+        base    = ceil(swapped * W * growth / ((W - F) * RATIO_SCALE))
+        lp_fee  = ceil(excess * fee * (K - k) * growth / (K * RATIO_SCALE * (W - F)))
+        dev     = ceil(base * dev_bps / W)
+        dao     = ceil(base * dao_bps / W)
+
+    W / (W - F) grosses the swapped share up to what a swap of the route's net input is charged
+    on (that input already carries the add's fees); growth covers the depositor's own pro-rata
+    claim on the LP fee it leaves in the pool, and the curve's departure from the linear share at
+    large sizes. Every division rounds in the pool's favor. A vault keeps V8's LP fee,
+    floor(deposit * fee / W), and books no dev or DAO fee. A proportional add has excess 0 (at most
+    a rounding mojo), so it books nothing."""
+    units = normalised_weights(old, weights)
+    K = sum(units)
+    ratio = min_deposit_ratio(old, deposits)
+    growth = RATIO_SCALE + max_deposit_ratio(old, deposits)
+    scale = WEIGHT_SCALE - fee_bps - protocol_fee_bps - dao_fee_bps
+    lp, dev, dao = [], [], []
+    for r, d, k in zip(old, deposits, units):
+        if k == K:
+            lp.append((d * fee_bps * K) // (K * WEIGHT_SCALE)); dev.append(0); dao.append(0)
+            continue
+        excess = d - (r * ratio) // RATIO_SCALE
+        swapped = (excess * (K - k)) // K
+        base = _ceil_div(swapped * WEIGHT_SCALE * growth, scale * RATIO_SCALE)
+        lp.append(_ceil_div(excess * fee_bps * (K - k) * growth, K * RATIO_SCALE * scale))
+        dev.append(_ceil_div(base * protocol_fee_bps, WEIGHT_SCALE))
+        dao.append(_ceil_div(base * dao_fee_bps, WEIGHT_SCALE))
+    return lp, dev, dao
+
+
+def add_output_fees(
+    old: Sequence[int],
+    deposits: Sequence[int],
+    weights: Sequence[int] | None,
+    fee_bps: int,
+    protocol_fee_bps: int,
+    dao_fee_bps: int,
+) -> tuple[list[int], list[int]]:
+    """V19 (finding 08): per asset, the (dev fee, DAO fee) an add books in the deposited asset
+    (add_fee_terms), mirroring forge_curve.rue add_output_fees. The successor state is
+    reserves = old + deposit - dev - dao, fees_owed += dev, dao_owed += dao; the reserve coins
+    still grow by the full deposit."""
+    _, dev, dao = add_fee_terms(old, deposits, weights, fee_bps, protocol_fee_bps, dao_fee_bps)
+    return dev, dao
+
+
 def effective_amounts(
     old: Sequence[int],
     deposits: Sequence[int],
     fee_bps: int,
     weights: Sequence[int] | None = None,
     version: int = VAULT_FEE_VERSION,
+    protocol_fee_bps: int = 0,
+    dao_fee_bps: int = 0,
 ) -> list[int]:
     """Reserves as the LP mint sees them, mirroring `effective_product`.
 
@@ -92,10 +171,16 @@ def effective_amounts(
     A vault (one asset holding all the weight) is the other special case: the
     imbalance share is zero there, but for a vault the deposit IS the trade, so
     the puzzle charges the full LP fee on the whole deposit instead.
+
+    From ADD_OUTPUT_FEE_VERSION (V19) the add's fees are add_fee_terms': the LP fee on a
+    grossed-up base, and the dev and DAO fees, which leave the curve too.
     """
     units = normalised_weights(old, weights)
     total_weight = sum(units)
     ratio = min_deposit_ratio(old, deposits)
+    if version >= ADD_OUTPUT_FEE_VERSION:
+        lp, dev, dao = add_fee_terms(old, deposits, units, fee_bps, protocol_fee_bps, dao_fee_bps)
+        return [r + d - a - b - c for r, d, a, b, c in zip(old, deposits, lp, dev, dao)]
     effective = []
     for reserve, deposit, weight in zip(old, deposits, units):
         balanced = (reserve * ratio) // RATIO_SCALE
@@ -142,6 +227,8 @@ def invariant_lp_mint(
     fee_bps: int,
     weights: Sequence[int] | None = None,
     version: int = VAULT_FEE_VERSION,
+    protocol_fee_bps: int = 0,
+    dao_fee_bps: int = 0,
 ) -> int:
     """Largest mint the puzzle will accept for this deposit.
 
@@ -166,7 +253,7 @@ def invariant_lp_mint(
     total_weight = sum(units)
     old_product = weighted_product(old, units)
     target = (total_lp ** total_weight) * weighted_product(
-        effective_amounts(old, deposits, fee_bps, units, version), units)
+        effective_amounts(old, deposits, fee_bps, units, version, protocol_fee_bps, dao_fee_bps), units)
 
     low, high, best = 0, max(total_lp * 4, 1024), 0
     while ((total_lp + high) ** total_weight) * old_product <= target:
