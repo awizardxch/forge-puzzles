@@ -76,3 +76,8 @@ V17_LEAF_ORDER = (*LEAF_ORDER, "forge_action_rebase", "forge_action_refund")
 # V18 (protocol 19): the same eight leaves in the same order -- V18 changes only the
 # registry's `register` leaf. Its own name so V18 never reads a V17 constant.
 V18_LEAF_ORDER = V17_LEAF_ORDER
+
+# V19 (protocol 20): the same eight leaves in the same order -- V19 changes the `add` leaf's
+# body and the registry's `register` admission, not the leaf set. Its own name so V19 never
+# reads a V18 constant.
+V19_LEAF_ORDER = V18_LEAF_ORDER

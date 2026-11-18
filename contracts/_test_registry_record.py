@@ -120,8 +120,30 @@ def main() -> int:
     kept = rr.merge(rec(A, [pool("11", "router"), pool("22", "router")]), rec(A, [pool("11", "upload"), pool("33", "upload")]))
     check("  the router's own pool records are kept, and win over the upload's",
           {p["launcher_id"][:2]: p["note"] for p in kept["pools"]} == {"11": "router", "22": "router", "33": "upload"})
+    named = lambda i, note, emoji, symbol: {**pool(i, note), "emoji": emoji, "symbol": symbol}
+    renamed = rr.merge(rec(A, [named("11", "router", "💎", "e33500…/TXCH 8:1")]),
+                       rec(A, [named("11", "upload", "💎 XCH", "⚒️💎XCH")]))
+    r11 = renamed["pools"][0]
+    check("  an upload's name and symbol replace the router's for a pool it holds; the rest stays the router's",
+          (r11["note"], r11["emoji"], r11["symbol"]) == ("router", "💎 XCH", "⚒️💎XCH"), f"{r11}")
+    blank = rr.merge(rec(A, [named("11", "router", "💎 XCH", "⚒️💎XCH")]), rec(A, [named("11", "upload", "", "")]))
+    check("  an upload with no name leaves the router's name", (blank["pools"][0]["emoji"], blank["pools"][0]["symbol"]) == ("💎 XCH", "⚒️💎XCH"))
     acc = rr.merge(rec(B, [], [A]), rec("cc" * 32, [], [B]))
     check("  retired registries accumulate", sorted(r["launcher_id"] for r in acc["retired_registries"]) == sorted([A, B]))
+    # External review 2026-11-16 ("registry-record upload pins no registry", with finding 01): a
+    # rollover is the record's own word, so only FORGE_ADMIN_TOKEN may make one, or install the
+    # first record on an empty router; a wallet session may only move the held registry's tip.
+    for label, held_rec, incoming in (("a declared rollover", rec(A), rec(B, [], [A])), ("a first record on an empty router", None, rec(A))):
+        try:
+            rr.merge(held_rec, incoming, registry_change_allowed=False)
+            check(f"  without the token, {label} is refused", False)
+        except (rr.Refused, TypeError) as exc:
+            check(f"  without the token, {label} is refused", getattr(exc, "code", None) == "NEEDS_TOKEN", str(exc)[:70])
+    try:
+        same = rr.merge(rec(A, [pool("11", "x")]), rec(A, [pool("22", "y")]), registry_change_allowed=False)
+        check("  without the token, the held registry's own update is kept", same["registry"]["launcher_id"] == A and len(same["pools"]) == 2)
+    except (rr.Refused, TypeError) as exc:
+        check("  without the token, the held registry's own update is kept", False, str(exc)[:70])
 
     print("kept exactly: integers past 2**53 survive the upload")
     import tempfile

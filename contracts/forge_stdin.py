@@ -44,6 +44,10 @@ from forge_split_swap import SplitBranchSpec, build_split_swap
 from forge_flow_balance import FlowLegSpec, build_flow_balance
 from forge_routed_deposit import DepositSale, build_routed_deposit
 from forge_transition import build_transition
+import forge_v19_offer as off19
+import forge_v19_route as rt19
+import forge_v19_create as cre19
+import forge_v19_driver as drv19
 import forge_v18_offer as off18
 import forge_v18_route as rt18
 import forge_v18_create as cre18
@@ -84,7 +88,9 @@ import forge_v14_driver as drv14
 # no snapshot to read one from (a creation) takes the NETWORK's creation revision,
 # forge_network.create_protocol() -- never max(_LANES). Adding 19 here used to make V18 the
 # default creation lane everywhere, mainnet included.
-_LANES = {19: (off18, rt18, cre18, drv18), 17: (off16, rt16, cre16, drv16),
+# V19 (protocol 20; external review 2026-11-16, findings 08 and 09) is carried beside V18: V18
+# stays reachable for its holders (remove, and migrate-v18-to-v19) while its pools drain.
+_LANES = {20: (off19, rt19, cre19, drv19), 19: (off18, rt18, cre18, drv18), 17: (off16, rt16, cre16, drv16),
           16: (off15, rt15, cre15, drv15), 15: (off14, rt14, cre14, drv14)}
 if drv17 is not None:
     _LANES[18] = (off17, rt17, cre17, drv17)
@@ -108,11 +114,14 @@ else:
 # The route actions a composer builds across revisions (forge_v16_route._drv; a route that
 # never touches a V16 pool is built by forge_v15_route, which spends V14 and V15 pools).
 _CROSS_REVISION_ACTIONS = frozenset({"multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-in", "zap-lp",
-                                     "migrate-v16-to-v17", "migrate-v16-to-v18", "migrate-v17-to-v18"})
+                                     "migrate-v16-to-v17", "migrate-v16-to-v18", "migrate-v17-to-v18",
+                                     "migrate-v16-to-v19", "migrate-v17-to-v19", "migrate-v18-to-v19"})
 
 # The migrations, each built by the lane of the revision it mints: action -> (source protocol,
 # target protocol). forge_vNN_route.migrate_vAA_to_vNN does the work.
-_MIGRATIONS = {"migrate-v16-to-v17": (17, 18), "migrate-v16-to-v18": (17, 19), "migrate-v17-to-v18": (18, 19)}
+_MIGRATIONS = {"migrate-v16-to-v17": (17, 18), "migrate-v16-to-v18": (17, 19), "migrate-v17-to-v18": (18, 19),
+               # V19 (protocol 20): every live older revision migrates into its V19 mirror.
+               "migrate-v16-to-v19": (17, 20), "migrate-v17-to-v19": (18, 20), "migrate-v18-to-v19": (19, 20)}
 
 
 def _lane_version(payload: dict) -> int:
@@ -462,7 +471,8 @@ def _settle_takes_fee(lane) -> bool:
 
 
 ROUTE_LANES = ("multihop-swap", "split-swap", "flow-balance", "routed-deposit", "vault-route", "zap-out", "zap-in", "zap-lp",
-               "migrate-v16-to-v17", "migrate-v16-to-v18", "migrate-v17-to-v18")
+               "migrate-v16-to-v17", "migrate-v16-to-v18", "migrate-v17-to-v18",
+               "migrate-v16-to-v19", "migrate-v17-to-v19", "migrate-v18-to-v19")
 
 
 def _snapshot_of(pool) -> dict[str, Any]:
@@ -557,15 +567,27 @@ def _build_lane_route(action: str, payload: dict[str, Any], offer: Offer, height
         sales = [([_lane_pool(entry) for entry in sale["pools"]], [_bytes32(str(a)) for a in sale["path"]], int(sale["amountIn"]))
                  for sale in payload.get("sales", [])]
         deposit_mode = mode if "fee_mode" in rt.routed_deposit.__code__.co_varnames else {}
+        # `add_fee` (api/_forgeResponder.js buildRoutedDepositTransition): the Liquidity tab's
+        # deposit, charged the router's rate on its swapped share only (owner, 2026-11-16;
+        # forge_lp_add_fee). `dev_fee` stays the rate on the whole payout (the Swap tab's zap).
+        # A lane without the swapped-share fee (V14..V17) is built as it always was: no fee.
+        add_recipient, add_bps = _dev_fee({"dev_fee": payload.get("add_fee")})
+        add_mode = ({"add_fee_bps": add_bps, "add_fee_ph": add_recipient}
+                    if add_bps > 0 and add_recipient is not None and fee_bps <= 0
+                    and "add_fee_bps" in rt.routed_deposit.__code__.co_varnames else {})
         result = rt.routed_deposit(target, sales, offer, height,
                                surplus_ph if surplus_ph is not None else target.protocol_ph, fee_bps, fee_ph, preview=preview,
-                               **deposit_mode)
+                               **deposit_mode, **add_mode)
         target_after = next(p for p in result.pools if p.launcher_id == target.launcher_id)
         extra = {"target": _snapshot_of(target_after),
                  "deposits": {asset: str(amount) for asset, amount in result.details["deposits"].items()},
                  "minted": str(result.details["minted"]), "backing": str(result.details["backing"]),
                  "sale_outputs": [str(a) for a in result.details["sale_outputs"]],
-                 "leftover_xch": str(result.details["leftover_xch"])}
+                 "leftover_xch": str(result.details["leftover_xch"]),
+                 # What the router takes of the LP: the fee a preview says to deduct, the take
+                 # a settlement built (the fee, or a hair more inside the surplus band).
+                 "router_fee": str(result.details.get("router_fee_out", 0) if preview
+                                   else result.details.get("router_fee", 0) if add_mode else 0)}
     elif action == "vault-route":
         swap_pool, vault = _lane_pool(payload["swapPool"]), _lane_pool(payload["vault"])
         result = rt.vault_route(swap_pool, _bytes32(str(payload["assetIn"])), vault, offer, height,
@@ -955,17 +977,48 @@ def _v16_pool_named(launcher_hex: str, payload: dict[str, Any]):
     return pool
 
 
+PRE_V19_RECORD_TAGS = ("v14", "v15", "v16", "v17", "v18")
+
+
+def pre_v19_lp_assets(payload: dict[str, Any] | None = None) -> dict[str, str]:
+    """The LP asset ids of every pre-V19 Forge pool this router knows, from the registry records it
+    holds (forge_network.record_path(tag), or `<tag>_record_path` in the payload): lp hex -> label.
+    A record that is absent is skipped -- a router holds only the revisions it serves. The caller
+    may add ids it knows by other means (`pre_v19_lp_asset_ids` in the payload, e.g. the index)."""
+    import json as _json
+    import forge_network as _net
+    out: dict[str, str] = {}
+    payload = payload or {}
+    for tag in PRE_V19_RECORD_TAGS:
+        path = Path(payload.get(f"{tag}_record_path") or _net.record_path(tag))
+        try:
+            record = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 -- not held
+            continue
+        for pool in record.get("pools") or []:
+            lp = str(pool.get("lp_asset_id") or "").lower().removeprefix("0x")
+            if len(lp) == 64:
+                out[lp] = f"{tag.upper()} {pool.get('label') or pool.get('launcher_id', '')[:12]}"
+    for lp in payload.get("pre_v19_lp_asset_ids") or []:
+        lp = str(lp).lower().removeprefix("0x")
+        if len(lp) == 64:
+            out.setdefault(lp, "a pre-V19 pool")
+    return out
+
+
 def _mirror_source_named(launcher_hex: str, payload: dict[str, Any]):
     """The V16 or V17 pool a V18 mirror names (`config.from_pool`): from `config.from_pool_snapshot`
     when the caller sends it (its own lane proves it against its coin; protocol 17 or 18 only),
     else from the V16 record this router holds (`v16_record_path`), then the V17 one
-    (`v17_record_path`). Refused when none has it. The V17 lane keeps `_v16_pool_named`."""
+    (`v17_record_path`). Refused when none has it. The V17 lane keeps `_v16_pool_named`.
+    A V19 mirror (protocol 20) may also name a V18 (19) pool, read from `v18_record_path`."""
     import json as _json
     import forge_network as _net
     snap = (payload.get("config") or {}).get("from_pool_snapshot")
     if isinstance(snap, dict):
         proto = int(snap.get("protocol_version") or 0)
-        if proto not in (17, 18):
+        allowed = (17, 18, 19) if int(payload.get("protocol_version") or 0) >= 20 else (17, 18)
+        if proto not in allowed:
             raise ValueError(f"from_pool_snapshot is a protocol-{proto} pool; a V18 mirror mirrors a V16 (17) or V17 (18) pool")
         pool = _LANES[proto][0].snapshot_to_pool(snap)
     else:
@@ -974,8 +1027,11 @@ def _mirror_source_named(launcher_hex: str, payload: dict[str, Any]):
             import forge_v17_index as idx17
         except ImportError:   # a tree without V17 reads the V16 record only
             idx17 = None
+        idx18 = None
+        if int(payload.get("protocol_version") or 0) >= 20:   # a V19 mirror may name a V18 pool
+            import forge_v18_index as idx18
         pool, tried, held = None, [], 0
-        for tag, idx in (("v16", idx16), ("v17", idx17)):
+        for tag, idx in (("v16", idx16), ("v17", idx17), ("v18", idx18)):
             if idx is None:
                 continue
             path = Path(payload.get(f"{tag}_record_path") or _net.record_path(tag))
@@ -1101,6 +1157,9 @@ def _build_lane_create(action: str, payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"protocol {drv.PROTOCOL_VERSION} has no mirror of a V16 pool; create it on V17")
         named = _mirror_source_named if int(drv.PROTOCOL_VERSION) >= 19 else _v16_pool_named
         cre.check_mirror(config, named(from_pool, payload))
+    if int(drv.PROTOCOL_VERSION) >= 20:
+        # V19 lane rule: never a pool holding pre-V19 Forge LP (forge_v19_create.refuse_pre_v19_lp).
+        knobs["pre_v19_lp"] = pre_v19_lp_assets(payload)
     plan = cre.plan(registry, payload["registry"]["slots"], config, xch, cats,
                      _bytes32(str(payload["recipient_puzzle_hash"])), int(payload.get("network_fee") or 0), **knobs)
     out = {"success": True, "action": action, **cre.plan_json(plan)}

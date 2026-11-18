@@ -53,12 +53,14 @@ except ImportError:
     drv17 = off17 = None
 import forge_v18_driver as drv18  # noqa: E402
 import forge_v18_offer as off18  # noqa: E402
+import forge_v19_driver as drv19  # noqa: E402
+import forge_v19_offer as off19  # noqa: E402
 
 PROTOCOL = 17
 # V16 (17), V17 (18) and V18 (19) are served side by side (owner, 2026-11-11, 2026-11-13). Their
 # collect and dao_fee leaves take the same solutions; each pool is rebuilt and spent by its OWN
 # revision's driver.
-LANES = {17: (drv, off), 18: (drv17, off17), 19: (drv18, off18)}
+LANES = {17: (drv, off), 18: (drv17, off17), 19: (drv18, off18), 20: (drv19, off19)}   # V19 (protocol 20) beside V18
 if drv17 is None:
     del LANES[18]
 PROTOCOLS = tuple(sorted(LANES))

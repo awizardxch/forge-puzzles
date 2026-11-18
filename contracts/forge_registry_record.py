@@ -31,6 +31,8 @@ stdin:  {"action": "check" | "upload", "network": "mainnet", "node_url": "...",
         v17-* is V17, anything else V16.
         check: verifies record_text, or the held file when record_text is absent.
         upload: verifies record_text, merges it into held_path, writes held_path.
+                `registry_change_allowed`: false refuses (NEEDS_TOKEN) an upload that would change
+                which registry the router holds (a rollover, or a first record).
 stdout: {"success": true, "summary": {...}, ...} or {"success": false, "code": ..., "error": ...}
 `node_url` may be omitted to skip the chain checks (tests only; the route always sends one).
 """
@@ -61,7 +63,7 @@ class Refused(Exception):
 
 
 # protocol -> revision tag: the registry driver and index that record is checked with
-REVISIONS = {17: "v16", 18: "v17", 19: "v18"}
+REVISIONS = {17: "v16", 18: "v17", 19: "v18", 20: "v19"}
 
 
 def revision_of(payload: dict[str, Any]) -> str:
@@ -71,7 +73,7 @@ def revision_of(payload: dict[str, Any]) -> str:
             raise Refused("WRONG_REVISION", f"registry records of protocol {sorted(REVISIONS)} only, not {declared}")
         return REVISIONS[int(declared)]
     held = Path(str(payload.get("held_path") or "")).name
-    for tag in ("v18", "v17"):
+    for tag in ("v19", "v18", "v17"):
         if held.startswith(f"{tag}-"):
             return tag
     return "v16"
@@ -150,10 +152,24 @@ def verify(record: dict[str, Any], network: str, node_url: str | None, prefix: s
     }
 
 
-def merge(held: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
-    """The held record and the upload, by the rules in the module docstring."""
+# A record pool's display name and symbol: the only fields an upload moves on a pool the router holds.
+NAME_KEYS = ("emoji", "symbol")
+
+
+def merge(held: dict[str, Any] | None, incoming: dict[str, Any], registry_change_allowed: bool = True) -> dict[str, Any]:
+    """The held record and the upload, by the rules in the module docstring.
+
+    `registry_change_allowed` false (the upload came with a wallet session, not FORGE_ADMIN_TOKEN;
+    external review 2026-11-16): the upload may only update the registry this router already
+    holds. A rollover is the record's own declaration (`retired_registries` naming the held
+    registry), and a first record names whatever registry it likes, so both need the token:
+    otherwise one operator session could point every future site-created pool at another
+    registry, its creation fee and protocol recipient."""
     held_id = _hex((held or {}).get("registry", {}).get("launcher_id"))
     incoming_id = _hex(incoming["registry"]["launcher_id"])
+    if not registry_change_allowed and held_id != incoming_id:
+        what = "rolls over to another registry" if held_id else "would be this router's first registry record"
+        raise Refused("NEEDS_TOKEN", f"this upload {what}; that needs FORGE_ADMIN_TOKEN, not a wallet session")
     if held_id and held_id != incoming_id:
         if not any(_hex(r.get("launcher_id")) == held_id for r in incoming.get("retired_registries") or []):
             raise Refused("REPLACES_REGISTRY", f"this router holds registry {held_id[:16]}..., and the upload does not "
@@ -162,7 +178,17 @@ def merge(held: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, An
     for pool in incoming.get("pools") or []:
         pools[_hex(pool.get("launcher_id"))] = pool
     for pool in (held or {}).get("pools") or []:
-        pools[_hex(pool.get("launcher_id"))] = pool          # the router's own wins: it may be newer
+        key = _hex(pool.get("launcher_id"))
+        upload = pools.get(key)
+        kept = dict(pool)                                     # the router's own wins: it may be newer
+        # ...except for the NAME, which only the deployer moves (deploy-v18-testnet.py rename writes
+        # the chain and the record together): an upload that names a held pool differently carries
+        # the rename, and the index takes it on the next reconcile (api/_indexReconcile.js). Mainnet
+        # 💎 XCH, 2026-11-16: renamed on chain, and two uploads never reached the router's record.
+        for name_key in NAME_KEYS:
+            if upload is not None and str(upload.get(name_key) or "").strip():
+                kept[name_key] = upload[name_key]
+        pools[key] = kept
     retired: dict[str, Any] = {}
     for entry in [*((held or {}).get("retired_registries") or []), *(incoming.get("retired_registries") or [])]:
         retired[_hex(entry.get("launcher_id"))] = entry
@@ -177,14 +203,14 @@ def merge(held: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, An
 
 
 def upload(record_text: str, held_path: Path, network: str, node_url: str | None, prefix: str,
-           revision: str = "v16") -> dict[str, Any]:
+           revision: str = "v16", registry_change_allowed: bool = True) -> dict[str, Any]:
     try:
         incoming = json.loads(record_text)
     except json.JSONDecodeError as exc:
         raise Refused("MALFORMED", f"the record is not JSON: {exc}") from exc
     summary = verify(incoming, network, node_url, prefix, revision)
     held = json.loads(held_path.read_text(encoding="utf-8")) if held_path.is_file() else None
-    merged = merge(held, incoming)
+    merged = merge(held, incoming, registry_change_allowed)
     held_path.parent.mkdir(parents=True, exist_ok=True)
     backup = None
     if held is not None:
@@ -250,7 +276,9 @@ def main() -> int:
         if payload.get("action") == "upload":
             if not held_path or not payload.get("record_text"):
                 raise Refused("BAD_REQUEST", "upload needs record_text and held_path")
-            out = upload(str(payload["record_text"]), held_path, network, node_url, prefix, revision)
+            # Absent means allowed: the route sends False for an upload made with a wallet session.
+            out = upload(str(payload["record_text"]), held_path, network, node_url, prefix, revision,
+                         payload.get("registry_change_allowed") is not False)
             print(json.dumps({"success": True, **out}))
             return 0
         if payload.get("record_text"):

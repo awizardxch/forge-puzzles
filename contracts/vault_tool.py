@@ -2325,8 +2325,8 @@ def cmd_assemble(payload: dict[str, Any], factory: Callable[[str], Node]) -> dic
     # refused at push, never silently dropped. Their programs are caller-supplied CLVM
     # and are parsed as such (untrusted_clvm, U3) by spend_from_json.
     attached = [spend_from_json(entry) for entry in payload.get("attached_spends") or []]
-    if len(attached) > 16:
-        raise MultisigError("at most 16 attached spends")
+    if len(attached) > 128:   # api/multisig-execute.js MAX_ATTACHED_SPENDS
+        raise MultisigError("at most 128 attached spends")
     if attached and plan.summary.get("kind") == "offer":
         raise MultisigError("an offer carries no attached spends")
     spends = spends + attached

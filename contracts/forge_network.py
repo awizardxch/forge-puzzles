@@ -64,17 +64,20 @@ def check_address_network(text: str, what: str = "address") -> None:
 # Mirrors FORGE_CREATE_PROTOCOL_BY_NETWORK / FORGE_CREATE_FALLBACK_BY_NETWORK and createProtocol()
 # in api/_forgeVersion.js (the router declares the protocol on every creation; this is the default
 # for a forge_stdin request that names no revision).
-#   testnet  19 (V18): since 2026-11-14, when the V18 testnet registry 881f66fc was launched.
-#   mainnet  19 (V18) once the mainnet V18 registry's record (v18-mainnet.json) is held, 17 (V16)
-#            until then (owner, 2026-11-14: V18 ships to mainnet beside V16, the audit follows;
-#            no V17 on mainnet). The gate is the record, never a setting: on a router it reaches
-#            the volume only through the admin upload, which checks it against the chain.
+# Both networks target V19 (protocol 20; owner, 2026-11-17) once that network's V19 registry
+# record (v19-<net>.json) is held; until then each falls back down its ladder, the first revision
+# whose record is held winning and the last taken unconditionally -- what it created before V19:
+#   testnet  20 with v19-testnet.json held, else 19 (V18, since 2026-11-14: registry 881f66fc).
+#   mainnet  20 with v19-mainnet.json held, else 19 with v18-mainnet.json held, else 17 (V16;
+#            owner, 2026-11-14: no V17 on mainnet).
+# The gate is the record, never a setting: on a router it reaches the volume only through the
+# admin upload, which checks it against the chain.
 # To change a table: edit BOTH (here and api/_forgeVersion.js) and the pinned expectations in
-# contracts/_test_v18_create_default.py and api/__checks__/createProtocolByNetwork.check.mjs.
-# There is deliberately no environment override.
-CREATE_PROTOCOL_BY_NETWORK = {"mainnet": 19, "testnet11": 19}
-# What a network creates on while its target's record is not held. Testnet has no entry.
-CREATE_FALLBACK_BY_NETWORK = {"mainnet": 17}
+# contracts/_test_v19_create_default.py, contracts/_test_v18_create_default.py and
+# api/__checks__/createProtocolByNetwork.check.mjs. There is deliberately no environment override.
+CREATE_PROTOCOL_BY_NETWORK = {"mainnet": 20, "testnet11": 20}
+# What a network creates on while its target's record is not held, in order (the last unconditionally).
+CREATE_FALLBACK_BY_NETWORK = {"mainnet": [19, 17], "testnet11": [19]}
 
 
 def revision_tag_of(protocol: int) -> str:
@@ -88,9 +91,9 @@ def create_protocol(held=None) -> int:
     `held(revision_tag)` says whether that revision's registry record is held; by default
     record_path() names an existing file (the state volume first, else .awizard/)."""
     network = network_id()
-    target = CREATE_PROTOCOL_BY_NETWORK[network]
-    fallback = CREATE_FALLBACK_BY_NETWORK.get(network)
-    if fallback is None or fallback == target:
-        return target
+    ladder = [CREATE_PROTOCOL_BY_NETWORK[network], *CREATE_FALLBACK_BY_NETWORK.get(network, [])]
     is_held = held if held is not None else (lambda tag: record_path(tag).is_file())
-    return target if is_held(revision_tag_of(target)) else fallback
+    for protocol in ladder[:-1]:
+        if is_held(revision_tag_of(protocol)):
+            return protocol
+    return ladder[-1]

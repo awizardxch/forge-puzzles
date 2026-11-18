@@ -7,11 +7,15 @@ Everything here can move funds. That is the whole point of the split — the
 interface lives in a separate repository, so what is in front of you *is* the
 attack surface and nothing dilutes that claim.
 
-> **Status: unaudited.** V18 (protocol 19, "v2") is live on mainnet: its registry
-> launched on 2026-11-15, before the independent audit, which will be requested on V18
-> ([`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md), CHIP-0062 revisions 14 and 15).
-> V16 (protocol 17, "v1") stays live on mainnet beside it while liquidity providers
-> migrate, and V15 (protocol 16) and V14 (protocol 15) stay live on testnet11, kept,
+> **Status: unaudited.** V19 (protocol 20) is live on testnet11 and is to follow V18 on
+> mainnet as "v2" ([`docs/FORGE_PUZZLE_V19.md`](docs/FORGE_PUZZLE_V19.md), CHIP-0062
+> revision 17): V18 plus two changes from an external review of V18 on 2026-11-16, an
+> unbalanced deposit paying the fees a swap would and a genesis LP supply bounded by the
+> reserves. V18 (protocol 19) is live on mainnet: its registry launched on 2026-11-15, before
+> the independent audit ([`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md)), and its
+> liquidity moves into V19.
+> V16 (protocol 17, "v1") stays live on mainnet beside them,
+> and V15 (protocol 16) and V14 (protocol 15) stay live on testnet11, kept,
 > not retired. V16
 > changes one thing from V15, the burn address of the locked minimum; V15 changed
 > the `coinid` derivations, canonical state atoms and the creation fee. Both build
@@ -30,7 +34,8 @@ attack surface and nothing dilutes that claim.
 
 ```
 contracts/
-  v18/                 the mainnet target (protocol 19), a rue project
+  v19/                 the current revision (protocol 20), a rue project
+  v18/                 the revision live on mainnet (protocol 19), whose liquidity moves to V19
   v16/                 the pool live on mainnet
   v15/                 the previous revision, kept live (no pool drained)
   v14/                 the revision before it, kept live (no pool drained)
@@ -43,8 +48,9 @@ contracts/
 docs/                  protocol documents
 ```
 
-**For V18, start at [`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md)**: what its
-leaves check, its revision fingerprint, how to rebuild it and which suites run it.
+**For V19, start at [`docs/FORGE_PUZZLE_V19.md`](docs/FORGE_PUZZLE_V19.md)**: what it
+changes from V18, its revision fingerprint, how to rebuild it and which suites run it. Then
+[`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md) for what V18's leaves check.
 For the revisions it builds on, start at [`docs/FORGE_PUZZLE_V16.md`](docs/FORGE_PUZZLE_V16.md) (V16 burns the locked minimum to Chia's burn address, `0x000...dead`) and [`docs/FORGE_PUZZLE_V15.md`](docs/FORGE_PUZZLE_V15.md) (what V15 changes and why), then [`docs/FORGE_PUZZLE_V14.md`](docs/FORGE_PUZZLE_V14.md): what the
 fourth and fifth reviews found, what V14 changes, and what was measured rather
 than argued. Then [`docs/FORGE_V14_CLVM_PASS.md`](docs/FORGE_V14_CLVM_PASS.md)
@@ -78,9 +84,10 @@ singleton authorises one at a time. See
 Needs [`rue`](https://github.com/rigidity/rue) 0.8.4 on PATH.
 
 ```bash
+python scripts/build-v19.py     # rebuilds V19 and re-checks the pins
 python scripts/build-v18.py     # rebuilds V18 and re-checks the pins
-python scripts/revision-fingerprint.py --revision contracts/v18   # the V18 fingerprint
-rue build --hex --hash --all .  # in contracts/v18 (or v16), to build in place
+python scripts/revision-fingerprint.py --revision contracts/v19   # see docs/FORGE_PUZZLE_V19.md
+rue build --hex --hash --all .  # in contracts/v19 (or v18, v16), to build in place
 ```
 
 `pins.json` records every upstream puzzle's tree hash **and** its source's
@@ -93,6 +100,9 @@ was bought the hard way: a DID once confirmed on chain and could never be spent,
 because a puzzle was hashed but never executed.
 
 ```bash
+python contracts/_test_v19_integrity.py          # V19: every puzzle recompiled; exit 2 without rue
+python contracts/_test_v19_add_output_fees.py    # V19: an unbalanced deposit pays the fees a swap would
+python contracts/_test_v19_registry_genesis_bounds.py   # V19: the genesis supply bounded by the reserves
 python contracts/_test_v18_integrity.py          # V18: every puzzle recompiled; exit 2 without rue
 python contracts/_test_v18_actions.py            # V18: the leaves, accept and refuse
 python contracts/_test_v18_registry.py           # V18: admission and the genesis floor

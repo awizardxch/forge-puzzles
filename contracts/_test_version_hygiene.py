@@ -141,6 +141,50 @@ ARGUED: dict[tuple[str, str], str] = {
         "the before/after control: every V14 change, carried into V15, V16 and V17, is run against the V13 build too",
 }
 
+# V19 (protocol 20; external review 2026-11-16, findings 08 and 09) is built beside V18. V18 is
+# not retired: its pools stay on chain, removable, and migrate into their V19 twins (owner,
+# 2026-11-17), so its lane ships beside V19's and every V18 crossing below is V19's too. Each
+# V18 suite's argued crossing moves to its V19 port (V18 files are no longer live, so they are not checked).
+LIVE_V18 = ("V18 (protocol 19) is not retired: V19 (protocol 20) is built beside it, V18 pools stay on "
+            "chain, removable, and migrate into their V19 twins (owner, 2026-11-17), so its lane ships "
+            "beside V19's; each pool is spent by its own revision's lane")
+SAME_BUILD_V18 = ("version-agnostic in effect: the helper it uses (p2 solution, validate, the node reader, the "
+                  "price-history reader) is byte-identical in V18 and V19")
+for (_file, _module), _why in list(ARGUED.items()):
+    if "v18" in _file:
+        ARGUED[(_file.replace("v18", "v19"), _module)] = ARGUED.pop((_file, _module))
+ARGUED.update({
+    # the shared lanes carry V18 beside V19
+    ("forge_stdin.py", "forge_v18_offer"): LIVE_V18,
+    ("forge_stdin.py", "forge_v18_route"): LIVE_V18,
+    ("forge_stdin.py", "forge_v18_create"): LIVE_V18,
+    ("forge_stdin.py", "forge_v18_driver"): LIVE_V18,
+    ("forge_stdin.py", "forge_v18_index"): LIVE_V18 + "; config.from_pool reads the V18 pool a V19 mirror names from the V18 record",
+    ("forge_stdin.py", "forge_v17_index"): LIVE_V17 + "; config.from_pool reads the V17 pool a mirror names from the V17 record",
+    ("forge_pool_admin.py", "forge_v18_driver"): LIVE_V18 + "; collect and the DAO-fee lower on a V18 pool",
+    ("forge_pool_admin.py", "forge_v18_offer"): LIVE_V18 + "; collect and the DAO-fee lower on a V18 pool",
+    ("forge_recover.py", "forge_v18_driver"): LIVE_V18 + "; it rebuilds a V18 registry and its pools from chain beside V19's",
+    ("forge_v19_route.py", "forge_v18_driver"): LIVE_V18 + "; migrate_v18_to_v19 burns V18 LP through the V18 pool's own remove, "
+                                                "and a route may spend a V18 pool with its own driver",
+    ("forge_v19_create.py", "forge_v18_offer"): LIVE_V18 + "; mirror_config_from_v18 reads a V18 snapshot with its own lane",
+    ("_test_v19_migrate.py", "forge_v18_driver"): LIVE_V18 + "; the V18 -> V19 migration burns V18 LP",
+    ("_test_v19_migrate.py", "forge_v18_offer"): LIVE_V18 + "; the V18 -> V19 migration burns V18 LP",
+    ("forge_v19_create.py", "forge_v17_offer"): LIVE_V17 + "; mirror_config_from_v17 reads a V17 snapshot with its own lane",
+    ("forge_v19_create.py", "forge_v16_offer"): LIVE_V16 + "; mirror_config_from_v16 reads a V16 snapshot with its own lane",
+    # the V18 -> V19 batch move (owner, 2026-11-17): it removes the owner's LP from V18 pools and,
+    # unpairing nested LP, from V16 pools, each with that pool's own driver and lane
+    ("forge_v19_move.py", "forge_v18_driver"): LIVE_V18 + "; the batch move removes the owner's V18 LP through the V18 pool's own remove",
+    ("forge_v19_move.py", "forge_v18_offer"): LIVE_V18 + "; its settlement puzzles and the pool's H are the V18 lane's",
+    ("forge_v19_move.py", "forge_v16_driver"): LIVE_V16 + "; the batch move unpairs released V16 LP through the V16 pool's own remove",
+    ("forge_v19_move.py", "forge_v16_offer"): LIVE_V16 + "; its settlement puzzles are the V16 lane's",
+    ("_test_v19_no_pre_v19_lp.py", "forge_v16_driver"): LIVE_V16 + "; the lane-rule suite builds a V16 pool whose LP V19 refuses",
+    ("breadcrumb_proof.py", "forge_v18_price_history"): SAME_BUILD_V18,
+    ("cat_supply.py", "forge_v18_price_history"): SAME_BUILD_V18,
+    ("coin_combine.py", "forge_v18_driver"): SAME_BUILD_V18,
+    ("offer_cancel.py", "forge_v18_driver"): SAME_BUILD_V18,
+    ("spacescan_claim.py", "forge_v18_driver"): SAME_BUILD_V18,
+})
+
 IMPORT = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
 VERSIONED = re.compile(r"^(?:_|forge_)?(?:.*?)v(\d+)(?:_|$)")
 
