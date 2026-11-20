@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Resync a V11 pool's snapshot to its on-chain tip by replaying its spends.
+
+A V11 singleton's state is curried into its inner puzzle, so an unspent tip
+cannot be read directly; but every spend between the stale snapshot and the tip
+is on chain with its leaves and solutions. This walks them: while the recorded
+coin is spent, fetch that spend, decode which leaves ran (the action layer's
+solution carries the leaf programs and their solutions), run them on the
+recorded state exactly as the puzzle did, and advance. The rebuilt tip is
+proven the same way `snapshot_to_pool` proves any snapshot: the re-curried inner
+must hash to the live coin's puzzle hash.
+
+Same contract as forge_resync.py, which dispatches here for protocol_version 11:
+
+stdin:  JSON {launcher_id, pool: <stale V11 snapshot>, node_url?}
+stdout: JSON {success, changed, tip_coin_id, snapshot} | {success: false, error, code}
+"""
+from __future__ import annotations
+
+import json
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from chia.types.blockchain_format.program import Program  # noqa: E402
+from chia_rs import Coin  # noqa: E402
+from chia_rs.sized_bytes import bytes32  # noqa: E402
+
+import forge_v20_driver as drv  # noqa: E402
+from untrusted_clvm import run_capped  # noqa: E402
+from forge_v20_driver import replace  # noqa: E402
+from forge_v20_offer import pool_to_snapshot, snapshot_to_pool  # noqa: E402
+
+import forge_network as _forge_network  # noqa: E402
+
+# The node of the network this runs against (FORGE_NETWORK / FORGE_NODE_URL).
+DEFAULT_NODE = _forge_network.node_url()
+MAX_WALK_DEPTH = 64
+
+
+class ResyncError(Exception):
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _strip(value: Any) -> str:
+    text = str(value or "")
+    return text[2:] if text.lower().startswith("0x") else text
+
+
+def _rpc(node_url: str, route: str, payload: dict) -> dict:
+    request = urllib.request.Request(
+        f"{node_url.rstrip('/')}/{route}", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "aWizard-Forge/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read())
+
+
+def _leaf_names(pool: drv.V20Pool) -> dict[bytes, str]:
+    """Uncurried leaf module hash -> leaf name, for the leaves this pool commits to."""
+    return {bytes(prog.uncurry()[0].get_tree_hash()): name for name, prog in pool.leaves.items()}
+
+
+def replay_spend(pool: drv.V20Pool, solution: Program) -> tuple[drv.V20Pool, list[str]]:
+    """Apply one on-chain spend of `pool.coin` (its singleton solution) to `pool`."""
+    names_by_mod = _leaf_names(pool)
+    inner_solution = list(solution.as_iter())[2]
+    puzzles, selectors, solutions = list(inner_solution.as_iter())[:3]
+    # `puzzles` lists each DISTINCT leaf once; `solutions` has one entry per action. Zipping
+    # the two therefore drops every repeat -- a spend that ran `swap` twice replayed as one
+    # swap and produced a state that never existed, which is how the double-settlement spend
+    # on H6 (4,693,721) first read back as a single swap. Each action's leaf is resolved
+    # through its selector instead: `selectors_and_proofs` is in REVERSE execution order, and
+    # the driver's selectors run 2, 5, 11, ... over `puzzles` in order of first use
+    # (forge_v20_driver.spend_actions).
+    #
+    # the action layer picks each leaf by RUNNING its selector with
+    # the revealed `puzzles` as the environment. The driver writes selectors as the paths
+    # 2, 5, 11, ... over a flat list, and this function used to decode them by that
+    # convention -- but the puzzle enforces neither. A selector may be any program
+    # (`(q . leaf)` returns the leaf whatever `puzzles` holds) and `puzzles` any tree.
+    # Consensus accepts such a spend, it creates the very successor the honest spend would,
+    # and a reader that could not decode it left the pool's index on a spent coin for good,
+    # for the price of one permissionless `observe`. So do exactly what the puzzle does: run
+    # the selector, then identify the leaf by its module hash, as below. Nothing about a
+    # solution may be assumed here that the puzzle does not enforce.
+    try:
+        selector_list = [entry.first() for entry in selectors.as_iter()][::-1]
+    except Exception as exc:  # noqa: BLE001 -- an entry that is not a pair cannot have run on chain
+        raise ResyncError("an on-chain spend has a selector entry this pool cannot read", "UNKNOWN_LEAF") from exc
+
+    def puzzle_for_selector(selector: Program) -> Program:
+        try:
+            return run_capped(selector, puzzles, drv.MAX_COST)
+        except Exception as exc:  # noqa: BLE001 -- a selector the action layer could not have run either
+            raise ResyncError("an on-chain spend names a leaf selector this pool cannot resolve", "UNKNOWN_LEAF") from exc
+
+    solution_list = list(solutions.as_iter())
+    if len(selector_list) != len(solution_list):
+        raise ResyncError("an on-chain spend has a selector count its solutions do not match", "UNKNOWN_LEAF")
+    ephemeral, new_state, names, adopts = None, pool.state, [], {}
+    for leaf_prog, leaf_sol in ((puzzle_for_selector(sel), sol) for sel, sol in zip(selector_list, solution_list)):
+        try:
+            mod, _ = leaf_prog.uncurry()
+            name = names_by_mod.get(bytes(mod.get_tree_hash()))
+        except Exception:  # noqa: BLE001 -- the selector returned something that is not a program
+            name = None
+        if name is None:
+            raise ResyncError("an on-chain spend ran a leaf this pool does not commit to", "UNKNOWN_LEAF")
+        names.append(name)
+        # V20: an on-chain leaf solution is `[h, birth, ...]`, and `run_leaf` inserts
+        # `pool.birth` after `h` itself. Passing the chain's solution through unchanged
+        # therefore gives `[h, pool.birth, birth, ...]` -- every later argument shifts, the
+        # replayed state is wrong, and the successor it derives is a coin that never
+        # existed ("tip unknown"). Drop the birth the chain already carries, and take it as
+        # the pool's own: consensus accepted that spend, so the value it asserted IS this
+        # coin's birth height.
+        raw = list(leaf_sol.as_iter())
+        if len(raw) >= 2:
+            pool = replace(pool, birth=int(raw[1].as_int()))
+            raw = [raw[0], *raw[2:]]
+        new_state, _tagged, base, ephemeral = drv.run_leaf(
+            pool, name, raw, ephemeral=ephemeral, state=new_state)
+        new_state = drv.state_to_list(new_state)
+        adopts.update(_adopts(base))
+    if adopts:
+        # V20 (rCAT): a `refund` adopts a replacement for a clawed reserve. The finalizer then
+        # spends, for that reserve, coinid(new_parent, the reserve's own full puzzle hash, the
+        # amount the state records) instead of the recorded coin, and writes THAT coin's id as
+        # the reserve parent of the successor (forge_multi_reserve_finalizer.rue adopt_parents).
+        # Replayed without this, every refund diverged: the successor named the clawed coin, a
+        # pool the chain never created ("tip unknown"; R1-R5 on testnet11, 2026-11-13). The
+        # replacement's own lineage is not needed: `advance` derives each successor reserve's
+        # lineage from the coin this spend consumed.
+        pool = replace(pool, reserves=[
+            replace(r, coin=Coin(adopts[r.index], r.full_hash, r.coin.amount)) if r.index in adopts else r
+            for r in pool.reserves])
+    return pool.advance(new_state), names
+
+
+ADOPT_TAG = -43     # mirrors forge_action_common.rue: (ADOPT_TAG index . new_parent), the refund leaf's marker
+
+
+def _adopts(base_conditions) -> dict:
+    """index -> new parent, for every adopt marker a leaf emitted. The finalizer reads the index
+    as `spelled + 0` (canonical), so this does too; it refuses a marker naming no reserve or a
+    reserve twice, and consensus accepted this spend, so neither occurs here."""
+    out = {}
+    for c in base_conditions:
+        try:
+            if c.first().atom is not None and c.first().as_int() == ADOPT_TAG:
+                out[int(c.rest().first().as_int())] = bytes32(c.rest().rest().as_atom())
+        except Exception as exc:  # noqa: BLE001 -- a marker the finalizer could not have read either
+            raise ResyncError("an on-chain spend carries an adopt marker this pool cannot read", "UNKNOWN_LEAF") from exc
+    return out
+
+
+def resync(payload: dict[str, Any]) -> dict[str, Any]:
+    node_url = str(payload.get("node_url") or DEFAULT_NODE)
+    launcher_id = _strip(payload["launcher_id"]).lower()
+    try:
+        pool = snapshot_to_pool(payload["pool"])
+    except ValueError as exc:
+        raise ResyncError(f"stale snapshot is not an authentic V11 snapshot: {exc}", "SNAPSHOT_INVALID") from exc
+    if pool.launcher_id.hex() != launcher_id:
+        raise ResyncError("Stale snapshot names a different launcher.", "LAUNCHER_MISMATCH")
+
+    steps: list[str] = []
+    for _ in range(MAX_WALK_DEPTH):
+        coin_id = pool.coin.name().hex()
+        record = (_rpc(node_url, "get_coin_record_by_name", {"name": "0x" + coin_id}) or {}).get("coin_record")
+        if not record:
+            raise ResyncError(f"pool coin {coin_id[:12]} is unknown to the node", "TIP_UNKNOWN")
+        if not record.get("spent"):
+            break
+        spend = _rpc(node_url, "get_puzzle_and_solution",
+                     {"coin_id": "0x" + coin_id, "height": int(record["spent_block_index"])})["coin_solution"]
+        solution = Program.from_bytes(bytes.fromhex(_strip(spend["solution"])))
+        pool, names = replay_spend(pool, solution)
+        steps.append("+".join(names))
+    else:
+        if not payload.get("allow_partial"):
+            raise ResyncError(f"more than {MAX_WALK_DEPTH} spends behind the tip; resync in two passes", "WALK_TOO_DEEP")
+        # A pass, not the tip (2026-10-30: a pool sent back to genesis sat 64 spends behind and
+        # every resync gave up, so every trade through it was refused). The coin the walk stopped
+        # on is checked as the tip is: a real coin whose puzzle the replayed state hashes to.
+        # The caller persists it and walks again from there.
+        stop_id = pool.coin.name().hex()
+        stop = (_rpc(node_url, "get_coin_record_by_name", {"name": "0x" + stop_id}) or {}).get("coin_record")
+        if not stop:
+            raise ResyncError("a pass stopped on a coin the node does not know", "TIP_STATE_MISMATCH")
+        if _strip(stop["coin"]["puzzle_hash"]).lower() != pool.coin.puzzle_hash.hex():
+            raise ResyncError("a pass stopped on a coin that does not hash to the replayed state", "TIP_STATE_MISMATCH")
+        pool = replace(pool, birth=int(stop.get("confirmed_block_index") or 0))
+        return {"success": True, "changed": True, "partial": True, "tip_coin_id": stop_id, "steps": steps,
+                "birth": pool.birth, "snapshot": pool_to_snapshot(pool)}
+
+    tip_id = pool.coin.name().hex()
+    live = (_rpc(node_url, "get_coin_record_by_name", {"name": "0x" + tip_id}) or {}).get("coin_record")
+    if not live:
+        raise ResyncError("replayed tip is not a coin the node knows", "TIP_STATE_MISMATCH")
+    if _strip(live["coin"]["puzzle_hash"]).lower() != pool.coin.puzzle_hash.hex():
+        raise ResyncError("replayed tip does not hash to the on-chain puzzle", "TIP_STATE_MISMATCH")
+    # V20: take the tip's birth height from the CHAIN, not from the replay.
+    # `advance()` fills birth in from the state's `last_height`, which is the height the
+    # previous spend CLAIMED -- and a spend confirms a block or more after the height it
+    # claims, so the two are almost never equal. The next spend asserts
+    # ASSERT_MY_BIRTH_HEIGHT against the coin's real confirmed_block_index, so shipping
+    # the replay's guess in the snapshot makes the following swap fail on chain with
+    # ASSERT_MY_BIRTH_HEIGHT_FAILED. The record-keeping path already reads the confirmed
+    # height; this one did not.
+    birth = int(live.get("confirmed_block_index") or 0)
+    if birth <= 0:
+        raise ResyncError("node gave the tip no confirmed height", "TIP_STATE_MISMATCH")
+    pool = replace(pool, birth=birth)
+    return {"success": True, "changed": bool(steps), "tip_coin_id": tip_id, "steps": steps,
+            "birth": birth, "snapshot": pool_to_snapshot(pool)}
+
+
+def main() -> int:
+    try:
+        print(json.dumps(resync(json.loads(sys.stdin.read() or "{}"))))
+        return 0
+    except ResyncError as exc:
+        print(json.dumps({"success": False, "error": str(exc), "code": exc.code}))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        print(json.dumps({"success": False, "error": f"{type(exc).__name__}: {exc}", "code": "RESYNC_ERROR"}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

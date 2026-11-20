@@ -29,12 +29,14 @@ sys.stdout.reconfigure(encoding="utf-8")
 import forge_network  # noqa: E402
 import forge_stdin  # noqa: E402
 
-# V19 (protocol 20, 2026-11-17) is the target on both networks once its record is held; with no v19
-# record held (every case below) each network falls back down its ladder to exactly what this suite
-# pinned before: testnet 19, mainnet 19 with v18-mainnet.json held, else 17. The V19 cases are
-# contracts/_test_v19_create_default.py's.
-EXPECTED = {"mainnet": 20, "testnet11": 20}
-FALLBACK = {"mainnet": [19, 17], "testnet11": [19]}
+# V20 (protocol 21, 2026-11-18) is the target on both networks once its record is held; with no v20
+# record held (every case below) each network falls back down its ladder: testnet 20 (V19; V18 is
+# unserved there), mainnet 19 with v18-mainnet.json held, else 17, exactly as this suite pinned
+# before. The V19 and V20 cases are contracts/_test_v19_create_default.py's and _test_v20_create_default.py's.
+EXPECTED = {"mainnet": 21, "testnet11": 21}
+# mainnet: exactly its pre-V20 ladder (V19 is never a mainnet rung: V18 goes straight to V20);
+# testnet: none -- V20 unconditionally (V18 unserved there since 2026-11-18, V19 since 2026-11-19).
+FALLBACK = {"mainnet": [], "testnet11": []}
 results: list[bool] = []
 
 
@@ -87,10 +89,12 @@ def main() -> int:
     saved = os.environ.get("FORGE_NETWORK")
     try:
         print("the tables:")
-        check("forge_network.CREATE_PROTOCOL_BY_NETWORK is mainnet 20, testnet 20 (V19 once its record is held)",
+        check("forge_network.CREATE_PROTOCOL_BY_NETWORK is mainnet 21, testnet 21 (V20 once its record is held)",
               forge_network.CREATE_PROTOCOL_BY_NETWORK == EXPECTED, str(forge_network.CREATE_PROTOCOL_BY_NETWORK))
-        check("forge_network.CREATE_FALLBACK_BY_NETWORK is mainnet [19, 17] (V18 with v18-mainnet.json, else V16), testnet [19]",
+        check("forge_network.CREATE_FALLBACK_BY_NETWORK is mainnet [] and testnet []: V20 always (V18 unserved on mainnet since 2026-11-19)",
               forge_network.CREATE_FALLBACK_BY_NETWORK == FALLBACK, str(forge_network.CREATE_FALLBACK_BY_NETWORK))
+        check("mainnet never creates V18 (19) or V19 (20): V20 is its only rung",
+              EXPECTED["mainnet"] == 21 and not FALLBACK["mainnet"])
         target, fallback = api_tables()
         check("api/_forgeVersion.js FORGE_CREATE_PROTOCOL_BY_NETWORK says the same", target == EXPECTED, str(target))
         check("api/_forgeVersion.js FORGE_CREATE_FALLBACK_BY_NETWORK says the same", fallback == FALLBACK, str(fallback))
@@ -101,16 +105,16 @@ def main() -> int:
 
         creation = {"action": "prepare-create", "config": {"asset_ids": ["xch", "aa" * 32]}}
         cases = (
-            ("mainnet", "mainnet, no record held", (), 17),
-            ("mainnet", "mainnet, only v16-mainnet.json held", ("v16-mainnet.json",), 17),
-            ("mainnet", "mainnet, a v18-TESTNET record held (the other network's)", ("v18-testnet.json",), 17),
-            ("mainnet", "mainnet, a v17-mainnet.json held (V17 never moves mainnet)", ("v16-mainnet.json", "v17-mainnet.json"), 17),
-            ("mainnet", "mainnet, v18-mainnet.json held", ("v16-mainnet.json", "v18-mainnet.json"), 19),
-            ("MainNet ", "' MainNet ' (normalized), v18-mainnet.json held", ("v18-mainnet.json",), 19),
-            ("testnet11", "testnet11, no record held", (), 19),
-            ("testnet11", "testnet11, v18-testnet.json held", ("v18-testnet.json",), 19),
-            (None, "unset (testnet11)", (), 19),
-            ("bogus", "an unknown name (testnet11)", (), 19),
+            ("mainnet", "mainnet, no record held", (), 21),
+            ("mainnet", "mainnet, only v16-mainnet.json held", ("v16-mainnet.json",), 21),
+            ("mainnet", "mainnet, a v18-TESTNET record held (the other network's)", ("v18-testnet.json",), 21),
+            ("mainnet", "mainnet, a v17-mainnet.json held (V17 never moves mainnet)", ("v16-mainnet.json", "v17-mainnet.json"), 21),
+            ("mainnet", "mainnet, v18-mainnet.json held", ("v16-mainnet.json", "v18-mainnet.json"), 21),
+            ("MainNet ", "' MainNet ' (normalized), v18-mainnet.json held", ("v18-mainnet.json",), 21),
+            ("testnet11", "testnet11, no record held (V20: V18 and V19 are not served on testnet)", (), 21),
+            ("testnet11", "testnet11, v18-testnet.json held (still V20)", ("v18-testnet.json",), 21),
+            (None, "unset (testnet11)", (), 21),
+            ("bogus", "an unknown name (testnet11)", (), 21),
         )
         for network, label, held, want in cases:
             on(network)
@@ -128,9 +132,9 @@ def main() -> int:
 
         on("mainnet")
         print("\nthe gate asks for the target revision's record, by tag:")
-        check("  create_protocol(held) is 19 on mainnet when the v18 record is held",
-              forge_network.create_protocol(lambda tag: tag == "v18") == 19)
-        check("  and 17 when only a v17 record is", forge_network.create_protocol(lambda tag: tag == "v17") == 17)
+        check("  create_protocol(held) is 21 on mainnet when only the v18 record is held: V18 is unserved",
+              forge_network.create_protocol(lambda tag: tag == "v18") == 21)
+        check("  and 21 when only a v17 record is", forge_network.create_protocol(lambda tag: tag == "v17") == 21)
 
         print("\nnon-creation requests are unchanged (a snapshot names its own revision):")
         check("  a protocol-19 snapshot resolves to V18 on mainnet",

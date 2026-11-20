@@ -64,20 +64,22 @@ def check_address_network(text: str, what: str = "address") -> None:
 # Mirrors FORGE_CREATE_PROTOCOL_BY_NETWORK / FORGE_CREATE_FALLBACK_BY_NETWORK and createProtocol()
 # in api/_forgeVersion.js (the router declares the protocol on every creation; this is the default
 # for a forge_stdin request that names no revision).
-# Both networks target V19 (protocol 20; owner, 2026-11-17) once that network's V19 registry
-# record (v19-<net>.json) is held; until then each falls back down its ladder, the first revision
-# whose record is held winning and the last taken unconditionally -- what it created before V19:
-#   testnet  20 with v19-testnet.json held, else 19 (V18, since 2026-11-14: registry 881f66fc).
-#   mainnet  20 with v19-mainnet.json held, else 19 with v18-mainnet.json held, else 17 (V16;
-#            owner, 2026-11-14: no V17 on mainnet).
+# Both networks target V20 (protocol 21; owner, 2026-11-18) once that network's V20 registry
+# record (v20-<net>.json) is held; until then each falls back down its ladder, the first revision
+# whose record is held winning and the last taken unconditionally -- what it created before V20:
+#   testnet  21, unconditionally (V18 and V19 are no longer served on testnet).
+#   mainnet  21 with v20-mainnet.json held, else 19 with v18-mainnet.json held, else 17 (V16;
+#            owner, 2026-11-14: no V17 on mainnet). Mainnet never gets V19: it goes from V18
+#            straight to V20, so 20 is no rung of its ladder.
 # The gate is the record, never a setting: on a router it reaches the volume only through the
 # admin upload, which checks it against the chain.
 # To change a table: edit BOTH (here and api/_forgeVersion.js) and the pinned expectations in
-# contracts/_test_v19_create_default.py, contracts/_test_v18_create_default.py and
-# api/__checks__/createProtocolByNetwork.check.mjs. There is deliberately no environment override.
-CREATE_PROTOCOL_BY_NETWORK = {"mainnet": 20, "testnet11": 20}
+# contracts/_test_v20_create_default.py, contracts/_test_v19_create_default.py,
+# contracts/_test_v18_create_default.py and api/__checks__/createProtocolByNetwork.check.mjs.
+# There is deliberately no environment override.
+CREATE_PROTOCOL_BY_NETWORK = {"mainnet": 21, "testnet11": 21}
 # What a network creates on while its target's record is not held, in order (the last unconditionally).
-CREATE_FALLBACK_BY_NETWORK = {"mainnet": [19, 17], "testnet11": [19]}
+CREATE_FALLBACK_BY_NETWORK = {"mainnet": [], "testnet11": []}
 
 
 def revision_tag_of(protocol: int) -> str:

@@ -55,14 +55,22 @@ import forge_v18_driver as drv18  # noqa: E402
 import forge_v18_offer as off18  # noqa: E402
 import forge_v19_driver as drv19  # noqa: E402
 import forge_v19_offer as off19  # noqa: E402
+try:   # optional while V20 is unpublished (the public repository does not ship it yet)
+    import forge_v20_driver as drv20  # noqa: E402
+    import forge_v20_offer as off20  # noqa: E402
+except ImportError:
+    drv20 = off20 = None
 
 PROTOCOL = 17
 # V16 (17), V17 (18) and V18 (19) are served side by side (owner, 2026-11-11, 2026-11-13). Their
 # collect and dao_fee leaves take the same solutions; each pool is rebuilt and spent by its OWN
 # revision's driver.
-LANES = {17: (drv, off), 18: (drv17, off17), 19: (drv18, off18), 20: (drv19, off19)}   # V19 (protocol 20) beside V18
+LANES = {17: (drv, off), 18: (drv17, off17), 19: (drv18, off18), 20: (drv19, off19),   # V19 (protocol 20) beside V18
+         21: (drv20, off20)}   # V20 (protocol 21) beside V19
 if drv17 is None:
     del LANES[18]
+if drv20 is None:
+    del LANES[21]
 PROTOCOLS = tuple(sorted(LANES))
 
 

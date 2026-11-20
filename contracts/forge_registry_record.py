@@ -63,7 +63,7 @@ class Refused(Exception):
 
 
 # protocol -> revision tag: the registry driver and index that record is checked with
-REVISIONS = {17: "v16", 18: "v17", 19: "v18", 20: "v19"}
+REVISIONS = {17: "v16", 18: "v17", 19: "v18", 20: "v19", 21: "v20"}
 
 
 def revision_of(payload: dict[str, Any]) -> str:
@@ -73,7 +73,7 @@ def revision_of(payload: dict[str, Any]) -> str:
             raise Refused("WRONG_REVISION", f"registry records of protocol {sorted(REVISIONS)} only, not {declared}")
         return REVISIONS[int(declared)]
     held = Path(str(payload.get("held_path") or "")).name
-    for tag in ("v19", "v18", "v17"):
+    for tag in ("v20", "v19", "v18", "v17"):
         if held.startswith(f"{tag}-"):
             return tag
     return "v16"

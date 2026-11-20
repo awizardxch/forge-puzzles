@@ -7,13 +7,14 @@ Everything here can move funds. That is the whole point of the split — the
 interface lives in a separate repository, so what is in front of you *is* the
 attack surface and nothing dilutes that claim.
 
-> **Status: unaudited.** V19 (protocol 20) is live on testnet11 and is to follow V18 on
-> mainnet as "v2" ([`docs/FORGE_PUZZLE_V19.md`](docs/FORGE_PUZZLE_V19.md), CHIP-0062
-> revision 17): V18 plus two changes from an external review of V18 on 2026-11-16, an
-> unbalanced deposit paying the fees a swap would and a genesis LP supply bounded by the
-> reserves. V18 (protocol 19) is live on mainnet: its registry launched on 2026-11-15, before
-> the independent audit ([`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md)), and its
-> liquidity moves into V19.
+> **Status: unaudited.** V20 (protocol 21) is live on mainnet as "v2" and on testnet11
+> ([`docs/FORGE_PUZZLE_V20.md`](docs/FORGE_PUZZLE_V20.md), CHIP-0062 revision 18): its
+> mainnet registry launched on 2026-11-19, before the independent audit, and every V18
+> market's liquidity moved into it. V20 is V19 ([`docs/FORGE_PUZZLE_V19.md`](docs/FORGE_PUZZLE_V19.md):
+> an unbalanced deposit pays the fees a swap would, and the genesis LP supply is bounded by
+> the reserves) plus one assert, that every effective term of an add is positive. V19 never
+> reached mainnet. V18 (protocol 19, [`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md))
+> is no longer served on mainnet now its liquidity has moved.
 > V16 (protocol 17, "v1") stays live on mainnet beside them,
 > and V15 (protocol 16) and V14 (protocol 15) stay live on testnet11, kept,
 > not retired. V16
@@ -34,8 +35,9 @@ attack surface and nothing dilutes that claim.
 
 ```
 contracts/
-  v19/                 the current revision (protocol 20), a rue project
-  v18/                 the revision live on mainnet (protocol 19), whose liquidity moves to V19
+  v20/                 the current revision (protocol 21), live on mainnet, a rue project
+  v19/                 the revision before it (protocol 20), testnet only
+  v18/                 the previous mainnet revision (protocol 19), whose liquidity moved to V20
   v16/                 the pool live on mainnet
   v15/                 the previous revision, kept live (no pool drained)
   v14/                 the revision before it, kept live (no pool drained)
@@ -48,9 +50,10 @@ contracts/
 docs/                  protocol documents
 ```
 
-**For V19, start at [`docs/FORGE_PUZZLE_V19.md`](docs/FORGE_PUZZLE_V19.md)**: what it
-changes from V18, its revision fingerprint, how to rebuild it and which suites run it. Then
-[`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md) for what V18's leaves check.
+**For V20, start at [`docs/FORGE_PUZZLE_V20.md`](docs/FORGE_PUZZLE_V20.md)**: what it
+changes from V19, its registries, its revision fingerprint, how to rebuild it and which
+suites run it. Then [`docs/FORGE_PUZZLE_V19.md`](docs/FORGE_PUZZLE_V19.md) for V19's two
+changes and [`docs/FORGE_PUZZLE_V18.md`](docs/FORGE_PUZZLE_V18.md) for what V18's leaves check.
 For the revisions it builds on, start at [`docs/FORGE_PUZZLE_V16.md`](docs/FORGE_PUZZLE_V16.md) (V16 burns the locked minimum to Chia's burn address, `0x000...dead`) and [`docs/FORGE_PUZZLE_V15.md`](docs/FORGE_PUZZLE_V15.md) (what V15 changes and why), then [`docs/FORGE_PUZZLE_V14.md`](docs/FORGE_PUZZLE_V14.md): what the
 fourth and fifth reviews found, what V14 changes, and what was measured rather
 than argued. Then [`docs/FORGE_V14_CLVM_PASS.md`](docs/FORGE_V14_CLVM_PASS.md)
@@ -84,10 +87,11 @@ singleton authorises one at a time. See
 Needs [`rue`](https://github.com/rigidity/rue) 0.8.4 on PATH.
 
 ```bash
+python scripts/build-v20.py     # rebuilds V20 and re-checks the pins
 python scripts/build-v19.py     # rebuilds V19 and re-checks the pins
 python scripts/build-v18.py     # rebuilds V18 and re-checks the pins
-python scripts/revision-fingerprint.py --revision contracts/v19   # see docs/FORGE_PUZZLE_V19.md
-rue build --hex --hash --all .  # in contracts/v19 (or v18, v16), to build in place
+python scripts/revision-fingerprint.py --revision contracts/v20   # see docs/FORGE_PUZZLE_V20.md
+rue build --hex --hash --all .  # in contracts/v20 (or v19, v18, v16), to build in place
 ```
 
 `pins.json` records every upstream puzzle's tree hash **and** its source's
@@ -100,6 +104,9 @@ was bought the hard way: a DID once confirmed on chain and could never be spent,
 because a puzzle was hashed but never executed.
 
 ```bash
+python contracts/_test_v20_integrity.py          # V20: every puzzle recompiled; exit 2 without rue
+python contracts/_test_v20_curve_mirror.py       # V20: the curve against a mirror, the positive-term refusal included
+python contracts/_test_v20_route_lane.py         # V20: routes across V14 to V20
 python contracts/_test_v19_integrity.py          # V19: every puzzle recompiled; exit 2 without rue
 python contracts/_test_v19_add_output_fees.py    # V19: an unbalanced deposit pays the fees a swap would
 python contracts/_test_v19_registry_genesis_bounds.py   # V19: the genesis supply bounded by the reserves
