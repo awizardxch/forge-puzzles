@@ -81,3 +81,8 @@ V18_LEAF_ORDER = V17_LEAF_ORDER
 # body and the registry's `register` admission, not the leaf set. Its own name so V19 never
 # reads a V18 constant.
 V19_LEAF_ORDER = V18_LEAF_ORDER
+
+# V20 (protocol 21): the same eight leaves in the same order -- V20 changes the curve the `add`
+# leaf runs (an add's effective term must be positive), not the leaf set. Its own name so V20
+# never reads a V19 constant.
+V20_LEAF_ORDER = V19_LEAF_ORDER

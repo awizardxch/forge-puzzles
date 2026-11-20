@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild a V16, V17, V18 or V19 registry's record -- the registry at its tip and every pool it
+"""Rebuild a V16, V17, V18, V19 or V20 registry's record -- the registry at its tip and every pool it
 admitted -- from the chain alone, given nothing but the registry's launcher id.
 
 Why (owner, 2026-10-21): Railway went down while the only fresh copy of the mainnet router's
@@ -76,6 +76,10 @@ except ImportError:
     drv17 = None
 import forge_v18_driver as drv18  # noqa: E402
 import forge_v19_driver as drv19  # noqa: E402
+try:   # optional while V20 is unpublished (the public repository does not ship it yet)
+    import forge_v20_driver as drv20  # noqa: E402
+except ImportError:
+    drv20 = None
 from untrusted_clvm import run_capped  # noqa: E402
 
 NODES = {"mainnet": "https://api.coinset.org", "testnet11": "https://testnet11.api.coinset.org"}
@@ -108,7 +112,7 @@ class Revision:
         """V17-shaped: the ten-field PoolConfig (H list), the pinned dev fee constant, the eight-leaf
         root and issuer proofs. True for V17 AND V18 (V18 = V17 plus one register rule); the
         name is kept from the V17 port. Never use it to pick a module: `_lane` keys those by tag."""
-        return self.tag in ("v17", "v18", "v19")   # V19 (protocol 20): the same shape again
+        return self.tag in ("v17", "v18", "v19", "v20")   # V19 (protocol 20) and V20 (21): the same shape again
 
     def _lane(self, kind: str):
         import importlib
@@ -131,10 +135,13 @@ V16 = Revision("v16", drv, config_fields=9)
 V17 = Revision("v17", drv17, config_fields=10) if drv17 is not None else None
 V18 = Revision("v18", drv18, config_fields=10)     # V17 plus one register rule (2026-11-13): same shape, own leaves
 V19 = Revision("v19", drv19, config_fields=10)     # V18 plus review 2026-11-16 findings 08/09: same shape, own leaves
-REVISIONS = tuple(rev for rev in (V16, V17, V18, V19) if rev is not None)
+V20 = Revision("v20", drv20, config_fields=10) if drv20 is not None else None   # V19 plus a positive effective term on every add: same shape, own leaves
+REVISIONS = tuple(rev for rev in (V16, V17, V18, V19, V20) if rev is not None)
 
 
 def revision_of_pool(pool) -> Revision:
+    if drv20 is not None and isinstance(pool, drv20.V20Pool):
+        return V20
     if isinstance(pool, drv19.V19Pool):
         return V19
     if isinstance(pool, drv18.V18Pool):

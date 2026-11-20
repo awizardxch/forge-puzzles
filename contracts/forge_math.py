@@ -31,6 +31,11 @@ RATIO_SCALE = 1_000_000_000_000
 # in the deposited asset, and every fee of the add is charged on a grossed-up base so an add then
 # a remove never pays more than a swap (add_fee_terms). Older versions are unchanged.
 ADD_OUTPUT_FEE_VERSION = 19
+# Forge V20 (protocol 21): from this math version the curve asserts that every asset's effective
+# term (old + deposit - the add's LP, dev and DAO fees on it) is positive, so an add whose fees on
+# an asset exceed what it deposits of that asset plus the reserve is refused. The mirror refuses
+# the same adds (AddFeesExceedDeposit); every add it accepts is unchanged from version 19.
+POSITIVE_EFFECTIVE_VERSION = 20
 MAX_ASSETS = 10
 # V6 requires two assets, V7 allows one. The puzzle enforces its own floor, so
 # the shared mirror accepts one upward rather than duplicating the module.
@@ -180,7 +185,15 @@ def effective_amounts(
     ratio = min_deposit_ratio(old, deposits)
     if version >= ADD_OUTPUT_FEE_VERSION:
         lp, dev, dao = add_fee_terms(old, deposits, units, fee_bps, protocol_fee_bps, dao_fee_bps)
-        return [r + d - a - b - c for r, d, a, b, c in zip(old, deposits, lp, dev, dao)]
+        effective = [r + d - a - b - c for r, d, a, b, c in zip(old, deposits, lp, dev, dao)]
+        if version >= POSITIVE_EFFECTIVE_VERSION:
+            for i, e in enumerate(effective):
+                if e <= 0:
+                    raise AddFeesExceedDeposit(
+                        f"this add's fees on asset {i} ({lp[i] + dev[i] + dao[i]:,}) exceed what it deposits of that "
+                        f"asset plus the reserve ({old[i] + deposits[i]:,}); the pool refuses it. Deposit less, or "
+                        f"spread the deposit across the pool's assets closer to its ratio.")
+        return effective
     effective = []
     for reserve, deposit, weight in zip(old, deposits, units):
         balanced = (reserve * ratio) // RATIO_SCALE
@@ -194,6 +207,11 @@ def effective_amounts(
         fee = (fee_base * fee_bps * fee_share) // (total_weight * WEIGHT_SCALE)
         effective.append(reserve + balanced + excess - fee)
     return effective
+
+
+class AddFeesExceedDeposit(ValueError):
+    """V20 (math version 20): an add whose fees on some asset exceed what it deposits of that asset
+    plus the reserve. The curve asserts every effective term is positive, so the puzzle refuses it."""
 
 
 class DepositTooSmall(ValueError):

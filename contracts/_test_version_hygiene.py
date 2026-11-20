@@ -185,6 +185,69 @@ ARGUED.update({
     ("spacescan_claim.py", "forge_v18_driver"): SAME_BUILD_V18,
 })
 
+# V20 (protocol 21; an add's effective term must be positive) is built beside V19. V19 is not
+# retired: its testnet pools stay live and move into their V20 twins (owner, 2026-11-18), mainnet
+# moves V18 straight to V20, so the V19 lane ships beside V20's and every V19 crossing above is
+# V20's too. Each V19 file's argued crossing moves to its V20 port (V19 files are no longer live).
+LIVE_V19 = ("V19 (protocol 20) is not retired: V20 (protocol 21) is built beside it, V19 pools stay on "
+            "chain (testnet) and move into their V20 twins (owner, 2026-11-18), so its lane ships beside "
+            "V20's; each pool is spent by its own revision's lane")
+for (_file, _module), _why in list(ARGUED.items()):
+    if "v19" in _file:
+        _new = _file.replace("_v19_", "_v20_").replace("forge_v19_", "forge_v20_").replace("pre_v19", "pre_v20").replace("recover_v19", "recover_v20")
+        ARGUED[(_new, _module)] = ARGUED.pop((_file, _module))
+ARGUED.update({
+    ("_test_recover_v20.py", "forge_v16_driver"): LIVE_V16 + "; the recover suite rebuilds a V16 registry beside V20's",
+    ("_test_recover_v20.py", "forge_v17_driver"): LIVE_V17 + "; the recover suite rebuilds a V17 registry beside V20's",
+    ("_test_v20_rcat_routes.py", "_v14_testkit"): LIVE_SECONDARY + "; an rCAT route may cross a V14 pool",
+    ("_test_v20_rcat_routes.py", "forge_v14_offer"): LIVE_SECONDARY + "; an rCAT route may cross a V14 pool",
+    ("_test_v20_route_lane.py", "_v14_testkit"): LIVE_SECONDARY + "; the cross-revision route suite builds a V14 pool",
+    ("_test_v20_route_lane.py", "forge_v14_offer"): LIVE_SECONDARY + "; the cross-revision route suite builds a V14 pool",
+    ("_test_v20_route_lane.py", "forge_v16_driver"): LIVE_V16 + "; the cross-revision route suite builds a V16 pool",
+    ("_test_v20_route_lane.py", "forge_v16_offer"): LIVE_V16 + "; the cross-revision route suite builds a V16 pool",
+    ("_test_v20_route_lane.py", "forge_v17_driver"): LIVE_V17 + "; the cross-revision route suite builds a V17 pool",
+    ("_test_v20_route_lane.py", "forge_v17_offer"): LIVE_V17 + "; the cross-revision route suite builds a V17 pool",
+    ("_test_v20_create_rcat.py", "forge_v16_driver"): LIVE_V16 + "; the rCAT creation suite mirrors a V16 pool",
+    ("_test_v20_create_rcat.py", "forge_v16_offer"): LIVE_V16 + "; the rCAT creation suite mirrors a V16 pool",
+    ("_test_v20_create_rcat.py", "forge_v17_driver"): LIVE_V17 + "; the rCAT creation suite mirrors a V17 pool",
+    ("_test_v20_create_rcat.py", "forge_v17_offer"): LIVE_V17 + "; the rCAT creation suite mirrors a V17 pool",
+    ("_test_v20_migrate.py", "forge_v16_driver"): LIVE_V16 + "; the V16 -> V20 migration burns V16 LP",
+    ("_test_v20_migrate.py", "forge_v16_offer"): LIVE_V16 + "; the V16 -> V20 migration burns V16 LP",
+    ("_test_v20_migrate.py", "forge_v17_driver"): LIVE_V17 + "; the V17 -> V20 migration burns V17 LP",
+    ("_test_v20_migrate.py", "forge_v17_offer"): LIVE_V17 + "; the V17 -> V20 migration burns V17 LP",
+    ("_test_v20_before_after.py", "_v13_testkit"):
+        "the before/after control: every V14 change, carried into V15 through V20, is run against the V13 build too",
+    ("_test_v20_chip0062_audit.py", "_v11_testkit"): "the CHIP-0062 audit suite replays its V11 baseline beside V20 (unchanged from the V19 port)",
+    ("_test_v20_consensus_timelocks.py", "_v11_testkit"): "the timelock suite replays its V11 baseline beside V20 (unchanged from the V19 port)",
+    ("forge_v20_route.py", "forge_v14_driver"): LIVE_SECONDARY + "; a route may spend a V14 pool with its own driver",
+    ("forge_v20_route.py", "forge_v15_driver"): LIVE_SECONDARY + "; a route may spend a V15 pool with its own driver",
+    ("forge_v20_route.py", "forge_v16_driver"): LIVE_V16 + "; migrate_v16_to_v20, and a route may spend a V16 pool with its own driver",
+    ("forge_v20_route.py", "forge_v17_driver"): LIVE_V17 + "; migrate_v17_to_v20, and a route may spend a V17 pool with its own driver",
+    ("forge_v20_route.py", "forge_v18_driver"): LIVE_V18 + "; migrate_v18_to_v20 burns V18 LP through the V18 pool's own remove, "
+                                                "and a route may spend a V18 pool with its own driver",
+    ("forge_v20_route.py", "forge_v19_driver"): LIVE_V19 + "; migrate_v19_to_v20 burns V19 LP through the V19 pool's own remove, "
+                                                "and a route may spend a V19 pool with its own driver",
+    ("forge_v20_create.py", "forge_v16_offer"): LIVE_V16 + "; mirror_config_from_v16 reads a V16 snapshot with its own lane",
+    ("forge_v20_create.py", "forge_v17_offer"): LIVE_V17 + "; mirror_config_from_v17 reads a V17 snapshot with its own lane",
+    ("forge_v20_create.py", "forge_v18_offer"): LIVE_V18 + "; mirror_config_from_v18 reads a V18 snapshot with its own lane",
+    ("forge_v20_create.py", "forge_v19_offer"): LIVE_V19 + "; mirror_config_from_v19 reads a V19 snapshot with its own lane",
+    # the V18 -> V20 and V19 -> V20 batch move (owner, 2026-11-18)
+    ("forge_v20_move.py", "forge_v19_driver"): LIVE_V19 + "; the batch move removes the owner's V19 LP through the V19 pool's own remove",
+    ("forge_v20_move.py", "forge_v19_offer"): LIVE_V19 + "; its settlement puzzles and the pool's H are the V19 lane's",
+    ("_test_v20_no_pre_v20_lp.py", "forge_v19_driver"): LIVE_V19 + "; the lane-rule suite builds a V19 pool whose LP V20 refuses",
+    ("_test_v20_negative_reserves.py", "forge_v19_driver"): LIVE_V19 + "; the V19 control: the same adds on the V19 build",
+    ("_test_v20_negative_reserves.py", "_v19_testkit"): LIVE_V19 + "; the V19 control: the same adds on the V19 build",
+    # the shared lanes carry V19 beside V20
+    ("forge_stdin.py", "forge_v19_offer"): LIVE_V19,
+    ("forge_stdin.py", "forge_v19_route"): LIVE_V19,
+    ("forge_stdin.py", "forge_v19_create"): LIVE_V19,
+    ("forge_stdin.py", "forge_v19_driver"): LIVE_V19,
+    ("forge_stdin.py", "forge_v19_index"): LIVE_V19 + "; config.from_pool reads the V19 pool a V20 mirror names from the V19 record",
+    ("forge_pool_admin.py", "forge_v19_driver"): LIVE_V19 + "; collect and the DAO-fee lower on a V19 pool",
+    ("forge_pool_admin.py", "forge_v19_offer"): LIVE_V19 + "; collect and the DAO-fee lower on a V19 pool",
+    ("forge_recover.py", "forge_v19_driver"): LIVE_V19 + "; it rebuilds a V19 registry and its pools from chain beside V20's",
+})
+
 IMPORT = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
 VERSIONED = re.compile(r"^(?:_|forge_)?(?:.*?)v(\d+)(?:_|$)")
 

@@ -1,0 +1,60 @@
+// forge_action_refund.rue -- Forge V20 `refund` leaf (rCAT, anyone). Testnet research only; unaudited.
+//
+// CHIP-0038's issuer can take any coin of its revocable CAT through the hidden path, including a
+// pool's reserve. Forge records the exact reserve coin (its parent lives in state and the finalizer
+// derives its id), so once that coin is gone every spend of the pool would name a coin that no
+// longer exists: every asset frozen, withdrawals included. TibetSwap avoids this only because its
+// pair takes reserve ids from the solution; Forge must not (CHIP-0062 review P1, decoy reserves).
+//
+// `refund` is the narrow way back. Anyone may name, for one rCAT reserve, the parent of a
+// replacement coin. The finalizer then addresses that reserve's message to
+//     coinid(new_parent, the reserve's OWN full puzzle hash, the amount the state records)
+// so the only coin that can become the reserve is one at the true layered reserve hash holding
+// exactly the recorded amount -- a refund of the whole reserve. Any other coin never receives the
+// message and the spend fails. State is unchanged: LPs are exactly as before the clawback.
+//
+// What it does not stop: a replacement while the original still exists (whoever funds the
+// replacement pays the full amount; the original stays at the reserve hash, recoverable only by
+// the issuer's hidden path). The pool and its LPs are unaffected either way.
+//
+// Refused for a plain asset (zero H): a plain reserve can never be taken, so it never needs one.
+//
+// solution: h, index, new_parent
+
+import upstream::action::StateTruth;
+import forge_action_common::*;
+
+fn main(
+    CONFIG: PoolConfig,
+    truth: StateTruth,
+    h: Int,
+    birth: Int,
+    index_spelled: Int,
+    new_parent: Bytes32,
+) -> ActionOutput {
+    let p = prologue(CONFIG, truth, h, birth);
+    let n = count_ints(p.state.reserves);
+    // Canonical before any test, as everywhere in V17.
+    let index = index_spelled + 0;
+    assert index >= 0 && index < n;
+    assert nth_bytes(CONFIG.hidden_puzzle_hashes, index) != zero_bytes32();
+    // Exactly 32 bytes; the finalizer's coinid would refuse anything else too.
+    assert is_puzzle_hash(new_parent);
+    assert new_parent != zero_bytes32();
+
+    ActionOutput {
+        state_truth: StateTruth {
+            ephemeral_state: p.height,
+            actual_state: p.state,
+        },
+        conditions: concat(
+            p.conditions,
+            [
+                adopt_marker(index, new_parent),
+                CreatePuzzleAnnouncement {
+                    message: tree_hash(["forge-refund-v20", index, new_parent]),
+                },
+            ],
+        ),
+    }
+}
